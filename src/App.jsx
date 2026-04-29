@@ -100,18 +100,33 @@ const genId = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).
 let zxingPromise = null;
 function loadZXing() {
   if (zxingPromise) return zxingPromise;
-  zxingPromise = new Promise((resolve, reject) => {
-    if (window.ZXingBrowser) return resolve(window.ZXingBrowser);
-    const script = document.createElement("script");
-    script.src = "https://unpkg.com/@zxing/browser@0.1.5/umd/index.min.js";
-    script.async = true;
-    script.onload = () => {
-      if (window.ZXingBrowser) resolve(window.ZXingBrowser);
-      else reject(new Error("ZXing failed to load"));
-    };
-    script.onerror = () => reject(new Error("ZXing CDN unreachable"));
-    document.head.appendChild(script);
-  });
+  // Plusieurs CDN — certains bloqueurs iOS bloquent unpkg
+  const cdns = [
+    "https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js",
+    "https://unpkg.com/@zxing/browser@0.1.5/umd/index.min.js",
+    "https://cdn.skypack.dev/@zxing/browser@0.1.5",
+  ];
+  zxingPromise = (async () => {
+    if (window.ZXingBrowser) return window.ZXingBrowser;
+    let lastErr = null;
+    for (const src of cdns) {
+      try {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement("script");
+          script.src = src;
+          script.async = true;
+          script.onload = () => resolve();
+          script.onerror = () => reject(new Error(`fail ${src}`));
+          document.head.appendChild(script);
+          setTimeout(() => reject(new Error(`timeout ${src}`)), 8000);
+        });
+        if (window.ZXingBrowser) return window.ZXingBrowser;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("ZXing CDN unreachable");
+  })();
   return zxingPromise;
 }
 
@@ -852,32 +867,114 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
   const [manualISBN, setManualISBN] = useState("");
   const [scanning, setScanning] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [diagLogs, setDiagLogs] = useState([]);
   const fired = useRef(false);
+
+  const log = (msg) => {
+    console.log("[scan]", msg);
+    setDiagLogs((logs) => [...logs, `${new Date().toLocaleTimeString()}: ${msg}`]);
+  };
 
   // Démarrage explicite par tap utilisateur (essentiel pour iOS standalone)
   const handleStart = async () => {
     setStarting(true);
     setError(null);
+    setDiagLogs([]);
     fired.current = false;
+    log("Bouton tapé, démarrage…");
     try {
-      const reader = await createBarcodeReader();
-      readerRef.current = reader;
-      if (!videoRef.current) {
+      // Test 1: API getUserMedia disponible ?
+      if (!navigator.mediaDevices?.getUserMedia) {
+        log("❌ navigator.mediaDevices.getUserMedia indisponible");
+        setError("API caméra indisponible — utilisez Safari (pas une autre app)");
         setStarting(false);
         return;
       }
-      await reader.startScanning(videoRef.current, (code) => {
-        if (!/^\d{10,13}$/.test(code)) return;
-        if (fired.current) return;
-        fired.current = true;
-        reader.stop();
-        onScan(code);
-      });
-      setScanning(true);
+      log("✅ API getUserMedia disponible");
+
+      // Test 2: HTTPS ?
+      log(`Protocole: ${location.protocol} (${location.hostname})`);
+
+      // Test 3: Tentative directe getUserMedia AVANT ZXing
+      log("Demande accès caméra…");
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false,
+        });
+        log(`✅ Caméra obtenue, ${stream.getVideoTracks().length} pistes`);
+        const track = stream.getVideoTracks()[0];
+        if (track) log(`   Piste : ${track.label || "(sans label)"} — ${track.readyState}`);
+      } catch (e) {
+        log(`❌ getUserMedia échoue: ${e.name} — ${e.message}`);
+        if (e.name === "NotAllowedError") setError("permission");
+        else setError(`${e.name}: ${e.message}`);
+        setStarting(false);
+        return;
+      }
+
+      // Test 4: Attache à la balise vidéo
+      if (!videoRef.current) {
+        log("❌ <video> introuvable");
+        stream.getTracks().forEach((t) => t.stop());
+        setError("Élément vidéo manquant");
+        setStarting(false);
+        return;
+      }
+      videoRef.current.srcObject = stream;
+      videoRef.current.setAttribute("playsinline", "true");
+      videoRef.current.muted = true;
+      log("Stream attaché à <video>");
+
+      // Test 5: Lecture de la vidéo
+      try {
+        await videoRef.current.play();
+        log(`✅ video.play() OK (${videoRef.current.videoWidth}x${videoRef.current.videoHeight})`);
+      } catch (e) {
+        log(`⚠️ video.play() : ${e.name} — ${e.message}`);
+      }
+
+      // À ce stade, si on voit la caméra c'est gagné. Maintenant ZXing.
+      log("Chargement de ZXing…");
+      let ZX;
+      try {
+        ZX = await loadZXing();
+        log("✅ ZXing chargé");
+      } catch (e) {
+        log(`❌ ZXing échoue: ${e.message}`);
+        setError(`ZXing: ${e.message}`);
+        setStarting(false);
+        return;
+      }
+
+      // Test 6: Démarrer ZXing sur la vidéo déjà active
+      try {
+        const reader = new ZX.BrowserMultiFormatReader();
+        const controls = reader.decodeFromVideoElement(videoRef.current, (result) => {
+          if (result) {
+            const code = result.getText();
+            if (!/^\d{10,13}$/.test(code)) return;
+            if (fired.current) return;
+            fired.current = true;
+            try { controls.stop(); } catch (e) {}
+            try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+            onScan(code);
+          }
+        });
+        readerRef.current = { stop: () => {
+          try { controls.stop(); } catch (e) {}
+          try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+        }};
+        log("✅ ZXing en écoute");
+        setScanning(true);
+      } catch (e) {
+        log(`❌ ZXing decodeFromVideoElement: ${e.message}`);
+        setError(`Décodage: ${e.message}`);
+      }
     } catch (e) {
-      if (e?.name === "NotAllowedError") setError("permission");
-      else if (e?.message === "no-scanner") setError("not-supported");
-      else setError(e?.message || "camera");
+      log(`❌ Erreur globale: ${e.message}`);
+      setError(e?.message || "camera");
     }
     setStarting(false);
   };
@@ -998,6 +1095,28 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
       <p className="text-center mt-4 text-sm" style={{ color: "var(--ink-soft)" }}>
         {scanning ? "Pointez la caméra vers le code-barres au dos du livre" : "Touchez le bouton pour démarrer"}
       </p>
+
+      {/* Panneau de diagnostic — visible si erreur ou tant que ça démarre */}
+      {diagLogs.length > 0 && (
+        <div className="mt-4 p-3 rounded-lg" style={{ background: "#1a1a1a", color: "#9fdc9f" }}>
+          <div className="text-xs mb-2 font-bold" style={{ color: "#fff" }}>Diagnostic :</div>
+          <div className="text-xs font-mono space-y-1" style={{ fontSize: "0.7rem", lineHeight: 1.4 }}>
+            {diagLogs.map((line, i) => (
+              <div key={i} style={{ wordBreak: "break-word" }}>{line}</div>
+            ))}
+          </div>
+          <button
+            onClick={() => {
+              const text = diagLogs.join("\n");
+              if (navigator.clipboard) navigator.clipboard.writeText(text);
+            }}
+            className="mt-2 px-2 py-1 rounded text-xs"
+            style={{ background: "#444", color: "#fff" }}
+          >
+            Copier les logs
+          </button>
+        </div>
+      )}
     </div>
   );
 }
