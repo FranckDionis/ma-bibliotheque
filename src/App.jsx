@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle } from "lucide-react";
+import { BrowserMultiFormatReader } from "@zxing/browser";
 
 // === ADAPTATEUR DE STOCKAGE ===
 // Utilise localStorage du navigateur (les données restent sur l'iPhone, dans le navigateur).
@@ -97,37 +98,11 @@ const genId = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).
 // Charge ZXing dynamiquement depuis CDN une seule fois.
 // ZXing fonctionne dans Safari iOS, contrairement à BarcodeDetector.
 // ============================================================
-let zxingPromise = null;
-function loadZXing() {
-  if (zxingPromise) return zxingPromise;
-  // Plusieurs CDN — certains bloqueurs iOS bloquent unpkg
-  const cdns = [
-    "https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js",
-    "https://unpkg.com/@zxing/browser@0.1.5/umd/index.min.js",
-    "https://cdn.skypack.dev/@zxing/browser@0.1.5",
-  ];
-  zxingPromise = (async () => {
-    if (window.ZXingBrowser) return window.ZXingBrowser;
-    let lastErr = null;
-    for (const src of cdns) {
-      try {
-        await new Promise((resolve, reject) => {
-          const script = document.createElement("script");
-          script.src = src;
-          script.async = true;
-          script.onload = () => resolve();
-          script.onerror = () => reject(new Error(`fail ${src}`));
-          document.head.appendChild(script);
-          setTimeout(() => reject(new Error(`timeout ${src}`)), 8000);
-        });
-        if (window.ZXingBrowser) return window.ZXingBrowser;
-      } catch (e) {
-        lastErr = e;
-      }
-    }
-    throw lastErr || new Error("ZXing CDN unreachable");
-  })();
-  return zxingPromise;
+// ZXing est importé statiquement (bundle inclus dans l'app).
+// Plus aucun chargement réseau, fonctionne avec bloqueurs/VPN.
+// ============================================================
+async function loadZXing() {
+  return { BrowserMultiFormatReader };
 }
 
 /**
@@ -936,11 +911,11 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
       }
 
       // À ce stade, si on voit la caméra c'est gagné. Maintenant ZXing.
-      log("Chargement de ZXing…");
+      log("Initialisation de ZXing (intégré, hors-ligne)…");
       let ZX;
       try {
         ZX = await loadZXing();
-        log("✅ ZXing chargé");
+        log("✅ ZXing prêt");
       } catch (e) {
         log(`❌ ZXing échoue: ${e.message}`);
         setError(`ZXing: ${e.message}`);
