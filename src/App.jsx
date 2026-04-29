@@ -105,6 +105,142 @@ async function loadZXing() {
   return { BrowserMultiFormatReader };
 }
 
+// ============================================================
+// Recherche ISBN multi-source : Google Books → Open Library → BNF
+// Retourne { title, author, cover, publisher, year, source } ou null
+// ============================================================
+
+// Fetch avec timeout pour qu'une source lente ne bloque pas tout
+async function fetchWithTimeout(url, ms = 4000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(id);
+    return res;
+  } catch (e) {
+    clearTimeout(id);
+    throw e;
+  }
+}
+
+// Google Books — excellent sur les livres français, gratuit, sans clé
+async function lookupGoogleBooks(isbn) {
+  try {
+    const res = await fetchWithTimeout(
+      `https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const item = data.items?.[0]?.volumeInfo;
+    if (!item) return null;
+    // Préfère une couverture haute résolution si disponible
+    const cover =
+      item.imageLinks?.extraLarge ||
+      item.imageLinks?.large ||
+      item.imageLinks?.medium ||
+      item.imageLinks?.thumbnail ||
+      item.imageLinks?.smallThumbnail ||
+      "";
+    return {
+      title: item.title || "",
+      author: (item.authors || []).join(", "),
+      cover: cover.replace(/^http:/, "https:"), // force HTTPS
+      publisher: item.publisher || "",
+      year: item.publishedDate || "",
+      source: "Google Books",
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Open Library — bonne pour livres anglo-saxons et anciens
+async function lookupOpenLibrary(isbn) {
+  try {
+    const res = await fetchWithTimeout(
+      `https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const book = data[`ISBN:${isbn}`];
+    if (!book) return null;
+    return {
+      title: book.title || "",
+      author: (book.authors || []).map((a) => a.name).join(", "),
+      cover: book.cover?.large || book.cover?.medium || book.cover?.small || "",
+      publisher: book.publishers?.[0]?.name || "",
+      year: book.publish_date || "",
+      source: "Open Library",
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// BNF SRU — la Bibliothèque nationale de France, exhaustive sur le fonds français
+async function lookupBNF(isbn) {
+  try {
+    const url = `https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=bib.isbn%20adj%20%22${isbn}%22&recordSchema=unimarcxchange&maximumRecords=1`;
+    const res = await fetchWithTimeout(url);
+    if (!res.ok) return null;
+    const xml = await res.text();
+    // Parse le XML UNIMARC pour extraire titre/auteur
+    const doc = new DOMParser().parseFromString(xml, "text/xml");
+    // Champ 200 = titre, sous-champ a = titre principal, sous-champ f = auteur
+    const fields = doc.querySelectorAll("datafield");
+    let title = "", author = "", publisher = "", year = "";
+    fields.forEach((f) => {
+      const tag = f.getAttribute("tag");
+      const sub = (code) => f.querySelector(`subfield[code="${code}"]`)?.textContent || "";
+      if (tag === "200" && !title) {
+        title = sub("a");
+        if (!author) author = sub("f");
+      }
+      if (tag === "210" && !publisher) {
+        publisher = sub("c");
+        year = sub("d");
+      }
+      if (tag === "700" && !author) {
+        author = `${sub("b")} ${sub("a")}`.trim();
+      }
+    });
+    if (!title) return null;
+    return {
+      title: title.trim().replace(/\s*:\s*$/, ""),
+      author: author.trim(),
+      cover: "",
+      publisher: publisher.trim(),
+      year: year.trim(),
+      source: "BnF",
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Cascade : essaye chaque source en parallèle, retourne la première qui répond
+async function lookupISBN(isbn) {
+  // En parallèle pour la rapidité, mais on prend Google d'abord s'il répond
+  const [google, openLib, bnf] = await Promise.all([
+    lookupGoogleBooks(isbn),
+    lookupOpenLibrary(isbn),
+    lookupBNF(isbn),
+  ]);
+  // Priorité : Google (le plus complet sur livres français), Open Library, BnF
+  // Mais si Google n'a pas de couverture et qu'une autre en a une, on l'emprunte
+  let chosen = google || openLib || bnf || null;
+  if (chosen && !chosen.cover) {
+    const altCover = (google?.cover || openLib?.cover || bnf?.cover);
+    if (altCover) chosen.cover = altCover;
+  }
+  // Si Google n'a pas de titre mais qu'on a quand même un autre résultat
+  if (!chosen?.title && (openLib?.title || bnf?.title)) {
+    chosen = openLib || bnf;
+  }
+  return chosen;
+}
+
 /**
  * Crée un lecteur unifié. Méthode A (préférée) : ZXing (universel).
  * Méthode B (fallback) : BarcodeDetector natif (Chrome Android).
@@ -682,20 +818,10 @@ function AddView({ structure, onCancel, onAdd, showToast }) {
     setSearching(true);
     showToast("Recherche du livre…");
     try {
-      // Open Library API - gratuite, pas de clé
-      const res = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`);
-      const data = await res.json();
-      const key = `ISBN:${isbn}`;
-      if (data[key]) {
-        const book = data[key];
-        setScannedData({
-          title: book.title || "",
-          author: book.authors?.map((a) => a.name).join(", ") || "",
-          isbn: isbn,
-          cover: book.cover?.medium || book.cover?.large || "",
-          publisher: book.publishers?.[0]?.name || "",
-          year: book.publish_date || "",
-        });
+      const found = await lookupISBN(isbn);
+      if (found && found.title) {
+        setScannedData({ ...found, isbn });
+        showToast(`Trouvé via ${found.source}`);
         setMode("form");
       } else {
         showToast("Livre non trouvé en ligne, complétez à la main", "error");
@@ -1592,16 +1718,13 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
     setPhase("processing");
     let bookData = { isbn };
     try {
-      const res = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`);
-      const data = await res.json();
-      const key = `ISBN:${isbn}`;
-      if (data[key]) {
-        const book = data[key];
+      const found = await lookupISBN(isbn);
+      if (found && found.title) {
         bookData = {
           isbn,
-          title: book.title || "",
-          author: book.authors?.map((a) => a.name).join(", ") || "",
-          cover: book.cover?.medium || book.cover?.large || "",
+          title: found.title,
+          author: found.author,
+          cover: found.cover,
         };
       }
     } catch (e) { /* hors ligne — on garde juste l'ISBN */ }
