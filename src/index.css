@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  /* Empêche le zoom sur double-tap iOS */
+  touch-action: manipulation;
+}
+
+/* Empêche le rebond élastique iOS */
+html {
+  overscroll-behavior: none;
+}
