@@ -119,6 +119,10 @@ function loadZXing() {
  * Crée un lecteur unifié. Méthode A (préférée) : ZXing (universel).
  * Méthode B (fallback) : BarcodeDetector natif (Chrome Android).
  * Renvoie { startScanning(videoEl, onResult), stop() }.
+ *
+ * Important iOS : on gère nous-mêmes getUserMedia et l'attachement du stream
+ * à la balise <video> avant de passer à ZXing. Cela évite l'écran noir en
+ * mode standalone PWA sur iPhone.
  */
 async function createBarcodeReader() {
   // Tentative ZXing en priorité (fonctionne sur Safari iOS)
@@ -126,24 +130,64 @@ async function createBarcodeReader() {
     const ZX = await loadZXing();
     const reader = new ZX.BrowserMultiFormatReader();
     let controls = null;
+    let stream = null;
     return {
       type: "zxing",
       async startScanning(videoEl, onResult) {
-        // Sélection caméra arrière
-        const devices = await ZX.BrowserMultiFormatReader.listVideoInputDevices();
-        const rear = devices.find((d) => /back|rear|environment/i.test(d.label)) || devices[devices.length - 1];
-        controls = await reader.decodeFromVideoDevice(
-          rear?.deviceId,
-          videoEl,
-          (result, err) => {
-            if (result) onResult(result.getText());
-          }
-        );
+        // 1) Demande l'accès caméra nous-mêmes (déclenchement par interaction utilisateur)
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        });
+
+        // 2) Attache le stream à la balise vidéo et attend qu'elle soit prête
+        videoEl.srcObject = stream;
+        videoEl.setAttribute("playsinline", "true");
+        videoEl.setAttribute("muted", "true");
+        videoEl.muted = true;
+
+        await new Promise((resolve, reject) => {
+          let settled = false;
+          const onReady = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+          const onError = (err) => {
+            if (settled) return;
+            settled = true;
+            reject(err);
+          };
+          videoEl.onloadedmetadata = onReady;
+          videoEl.oncanplay = onReady;
+          videoEl.onerror = onError;
+          // Timeout de sécurité : si rien ne se passe en 4 sec, on abandonne
+          setTimeout(() => onError(new Error("video-timeout")), 4000);
+        });
+
+        try {
+          await videoEl.play();
+        } catch (err) {
+          // iOS peut bloquer play() ; on continue, ZXing essaiera quand même
+        }
+
+        // 3) Lance ZXing sur la balise vidéo déjà active
+        controls = reader.decodeFromVideoElement(videoEl, (result) => {
+          if (result) onResult(result.getText());
+        });
       },
       stop() {
         if (controls) {
           try { controls.stop(); } catch (e) { /* ignore */ }
           controls = null;
+        }
+        if (stream) {
+          try { stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* ignore */ }
+          stream = null;
         }
       },
     };
@@ -162,6 +206,8 @@ async function createBarcodeReader() {
             video: { facingMode: "environment" }, audio: false,
           });
           videoEl.srcObject = stream;
+          videoEl.setAttribute("playsinline", "true");
+          videoEl.muted = true;
           await videoEl.play();
           intervalId = setInterval(async () => {
             try {
@@ -805,41 +851,45 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
   const [error, setError] = useState(null);
   const [manualISBN, setManualISBN] = useState("");
   const [scanning, setScanning] = useState(false);
+  const [starting, setStarting] = useState(false);
   const fired = useRef(false);
 
-  useEffect(() => {
-    let cancelled = false;
-
-    const start = async () => {
-      try {
-        const reader = await createBarcodeReader();
-        if (cancelled) return;
-        readerRef.current = reader;
-        if (!videoRef.current) return;
-        await reader.startScanning(videoRef.current, (code) => {
-          // Filtre : ne garder que les codes type ISBN (10-13 chiffres)
-          if (!/^\d{10,13}$/.test(code)) return;
-          if (fired.current) return;
-          fired.current = true;
-          reader.stop();
-          onScan(code);
-        });
-        setScanning(true);
-      } catch (e) {
-        if (e?.name === "NotAllowedError") setError("permission");
-        else if (e?.message === "no-scanner") setError("not-supported");
-        else setError("camera");
+  // Démarrage explicite par tap utilisateur (essentiel pour iOS standalone)
+  const handleStart = async () => {
+    setStarting(true);
+    setError(null);
+    fired.current = false;
+    try {
+      const reader = await createBarcodeReader();
+      readerRef.current = reader;
+      if (!videoRef.current) {
+        setStarting(false);
+        return;
       }
-    };
+      await reader.startScanning(videoRef.current, (code) => {
+        if (!/^\d{10,13}$/.test(code)) return;
+        if (fired.current) return;
+        fired.current = true;
+        reader.stop();
+        onScan(code);
+      });
+      setScanning(true);
+    } catch (e) {
+      if (e?.name === "NotAllowedError") setError("permission");
+      else if (e?.message === "no-scanner") setError("not-supported");
+      else setError(e?.message || "camera");
+    }
+    setStarting(false);
+  };
 
-    start();
+  // Stop à la sortie
+  useEffect(() => {
     return () => {
-      cancelled = true;
       if (readerRef.current) {
         try { readerRef.current.stop(); } catch (err) { /* ignore */ }
       }
     };
-  }, [onScan]);
+  }, []);
 
   if (error === "not-supported") {
     return (
@@ -874,9 +924,16 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
         <p style={{ color: "var(--accent)", fontWeight: "600", marginBottom: "0.5rem" }}>
           Accès à la caméra refusé
         </p>
-        <p style={{ color: "var(--ink-soft)", fontSize: "0.875rem" }}>
-          Allez dans Réglages iOS → Safari → Caméra pour autoriser l'accès, puis rechargez la page.
+        <p style={{ color: "var(--ink-soft)", fontSize: "0.875rem", marginBottom: "1rem" }}>
+          Allez dans Réglages iOS → Safari → Caméra pour autoriser l'accès, puis fermez et rouvrez l'app.
         </p>
+        <button
+          onClick={handleStart}
+          className="px-4 py-2 rounded-lg font-medium"
+          style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+        >
+          Réessayer
+        </button>
       </div>
     );
   }
@@ -884,13 +941,51 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
   return (
     <div className="relative">
       <div className="relative aspect-[3/4] rounded-xl overflow-hidden bg-black">
-        <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
-        {/* Cadre de scan */}
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <div className="relative w-4/5 h-1/3 border-2 rounded-lg" style={{ borderColor: "var(--gold-light)" }}>
-            <div className="absolute left-0 right-0 h-0.5 scan-line" style={{ background: "var(--gold-light)" }} />
+        <video
+          ref={videoRef}
+          className="w-full h-full object-cover"
+          playsInline
+          muted
+          autoPlay
+          webkit-playsinline="true"
+        />
+
+        {/* Overlay tant que la caméra n'est pas démarrée */}
+        {!scanning && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center"
+            style={{ background: "rgba(74, 35, 10, 0.92)" }}>
+            <Camera className="w-12 h-12 mb-3" style={{ color: "var(--gold-light)" }} />
+            <p className="mb-4" style={{ color: "var(--cream)" }}>
+              Touchez pour démarrer la caméra et scanner le code-barres
+            </p>
+            <button
+              onClick={handleStart}
+              disabled={starting}
+              className="px-6 py-3 rounded-full font-medium disabled:opacity-50 flex items-center gap-2"
+              style={{ background: "var(--gold-light)", color: "var(--leather-dark)" }}
+            >
+              {starting ? (
+                <><Loader2 className="w-5 h-5 animate-spin" /> Démarrage…</>
+              ) : (
+                <><Camera className="w-5 h-5" /> Démarrer la caméra</>
+              )}
+            </button>
+            {error && error !== "permission" && error !== "not-supported" && (
+              <p className="text-xs mt-3" style={{ color: "var(--gold-light)" }}>
+                Erreur : {error}
+              </p>
+            )}
           </div>
-        </div>
+        )}
+
+        {/* Cadre de scan */}
+        {scanning && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="relative w-4/5 h-1/3 border-2 rounded-lg" style={{ borderColor: "var(--gold-light)" }}>
+              <div className="absolute left-0 right-0 h-0.5 scan-line" style={{ background: "var(--gold-light)" }} />
+            </div>
+          </div>
+        )}
         {searching && (
           <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
             <div className="text-center">
@@ -901,7 +996,7 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
         )}
       </div>
       <p className="text-center mt-4 text-sm" style={{ color: "var(--ink-soft)" }}>
-        Pointez la caméra vers le code-barres au dos du livre
+        {scanning ? "Pointez la caméra vers le code-barres au dos du livre" : "Touchez le bouton pour démarrer"}
       </p>
     </div>
   );
@@ -1310,6 +1405,8 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
   const [lastBook, setLastBook] = useState(null);
   const [batchHistory, setBatchHistory] = useState([]); // livres ajoutés dans cette session
   const [showShelfChange, setShowShelfChange] = useState(false);
+  const [cameraStarted, setCameraStarted] = useState(false);
+  const [starting, setStarting] = useState(false);
 
   const videoRef = useRef(null);
   const readerRef = useRef(null);
@@ -1323,8 +1420,40 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
   // Tient phaseRef à jour
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
-  // Démarrage / arrêt du scanner selon la phase
+  // Démarrage explicite de la caméra par tap utilisateur (essentiel pour iOS)
+  const startCamera = async () => {
+    setStarting(true);
+    setError(null);
+    try {
+      const reader = await createBarcodeReader();
+      readerRef.current = reader;
+      if (!videoRef.current) {
+        setStarting(false);
+        return;
+      }
+      await reader.startScanning(videoRef.current, (code) => {
+        if (!/^\d{10,13}$/.test(code)) return;
+        if (phaseRef.current !== "scanning") return;
+        const now = Date.now();
+        if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
+          return;
+        }
+        lastScannedRef.current = { code, time: now };
+        if (navigator.vibrate) navigator.vibrate(50);
+        handleISBNScanned(code);
+      });
+      setCameraStarted(true);
+    } catch (e) {
+      if (e?.name === "NotAllowedError") setError("permission");
+      else if (e?.message === "no-scanner") setError("not-supported");
+      else setError(e?.message || "camera");
+    }
+    setStarting(false);
+  };
+
+  // Stoppe le scanner pendant les phases hors scan, le redémarre au retour
   useEffect(() => {
+    if (!cameraStarted) return;
     if (phase !== "scanning") {
       if (readerRef.current) {
         try { readerRef.current.stop(); } catch (e) { /* ignore */ }
@@ -1332,21 +1461,18 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
       }
       return;
     }
-
+    // Retour en phase scan : redémarre le scanner (l'autorisation caméra est déjà accordée)
     let cancelled = false;
-    const start = async () => {
+    (async () => {
       try {
         const reader = await createBarcodeReader();
         if (cancelled) return;
         readerRef.current = reader;
         if (!videoRef.current) return;
         await reader.startScanning(videoRef.current, (code) => {
-          // Filtre ISBN : 10-13 chiffres
           if (!/^\d{10,13}$/.test(code)) return;
-          // N'agit que si on est encore en phase scan
           if (phaseRef.current !== "scanning") return;
           const now = Date.now();
-          // Anti-rebond : ignorer le même code dans les 3 secondes
           if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
             return;
           }
@@ -1356,12 +1482,9 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
         });
       } catch (e) {
         if (e?.name === "NotAllowedError") setError("permission");
-        else if (e?.message === "no-scanner") setError("not-supported");
-        else setError("camera");
+        else setError(e?.message || "camera");
       }
-    };
-
-    start();
+    })();
     return () => {
       cancelled = true;
       if (readerRef.current) {
@@ -1369,7 +1492,7 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
         readerRef.current = null;
       }
     };
-  }, [phase]);
+  }, [phase, cameraStarted]);
 
   const handleISBNScanned = async (isbn) => {
     setPhase("processing");
@@ -1561,16 +1684,54 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
         </div>
       ) : error === "permission" ? (
         <p className="text-center py-8 px-4" style={{ color: "var(--accent)" }}>
-          Caméra refusée. Réglages iOS → Safari → Caméra, puis rechargez.
+          Caméra refusée. Réglages iOS → Safari → Caméra, puis fermez et rouvrez l'app.
         </p>
       ) : (
         <div className="relative aspect-[4/5] rounded-xl overflow-hidden bg-black mb-4">
-          <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <div className="relative w-4/5 h-1/3 border-2 rounded-lg" style={{ borderColor: "var(--gold-light)" }}>
-              <div className="absolute left-0 right-0 h-0.5 scan-line" style={{ background: "var(--gold-light)" }} />
+          <video
+            ref={videoRef}
+            className="w-full h-full object-cover"
+            playsInline
+            muted
+            autoPlay
+            webkit-playsinline="true"
+          />
+
+          {/* Overlay tant que la caméra n'est pas démarrée */}
+          {!cameraStarted && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center"
+              style={{ background: "rgba(74, 35, 10, 0.92)" }}>
+              <Camera className="w-12 h-12 mb-3" style={{ color: "var(--gold-light)" }} />
+              <p className="mb-4" style={{ color: "var(--cream)" }}>
+                Touchez pour démarrer la caméra et scanner toute l'étagère
+              </p>
+              <button
+                onClick={startCamera}
+                disabled={starting}
+                className="px-6 py-3 rounded-full font-medium disabled:opacity-50 flex items-center gap-2"
+                style={{ background: "var(--gold-light)", color: "var(--leather-dark)" }}
+              >
+                {starting ? (
+                  <><Loader2 className="w-5 h-5 animate-spin" /> Démarrage…</>
+                ) : (
+                  <><Camera className="w-5 h-5" /> Démarrer la caméra</>
+                )}
+              </button>
+              {error && error !== "permission" && error !== "not-supported" && (
+                <p className="text-xs mt-3" style={{ color: "var(--gold-light)" }}>
+                  Erreur : {error}
+                </p>
+              )}
             </div>
-          </div>
+          )}
+
+          {cameraStarted && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <div className="relative w-4/5 h-1/3 border-2 rounded-lg" style={{ borderColor: "var(--gold-light)" }}>
+                <div className="absolute left-0 right-0 h-0.5 scan-line" style={{ background: "var(--gold-light)" }} />
+              </div>
+            </div>
+          )}
 
           {/* Overlay processing */}
           {phase === "processing" && (
@@ -1580,24 +1741,26 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
           )}
 
           {/* Compteur en bas */}
-          <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between">
-            <div className="px-3 py-1.5 rounded-full text-sm font-medium" style={{
-              background: "rgba(0,0,0,0.6)",
-              color: "var(--cream)",
-              backdropFilter: "blur(8px)",
-            }}>
-              {batchHistory.length} {batchHistory.length > 1 ? "livres scannés" : "livre scanné"}
+          {cameraStarted && (
+            <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between">
+              <div className="px-3 py-1.5 rounded-full text-sm font-medium" style={{
+                background: "rgba(0,0,0,0.6)",
+                color: "var(--cream)",
+                backdropFilter: "blur(8px)",
+              }}>
+                {batchHistory.length} {batchHistory.length > 1 ? "livres scannés" : "livre scanné"}
+              </div>
+              {lastBook && (
+                <button
+                  onClick={undoLast}
+                  className="px-3 py-1.5 rounded-full text-xs font-medium"
+                  style={{ background: "rgba(0,0,0,0.6)", color: "var(--cream)" }}
+                >
+                  Annuler dernier
+                </button>
+              )}
             </div>
-            {lastBook && (
-              <button
-                onClick={undoLast}
-                className="px-3 py-1.5 rounded-full text-xs font-medium"
-                style={{ background: "rgba(0,0,0,0.6)", color: "var(--cream)" }}
-              >
-                Annuler dernier
-              </button>
-            )}
-          </div>
+          )}
         </div>
       )}
 
