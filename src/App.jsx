@@ -107,11 +107,11 @@ async function loadZXing() {
 
 // ============================================================
 // Recherche ISBN multi-source : Google Books → Open Library → BNF
-// Retourne { title, author, cover, publisher, year, source } ou null
+// Retourne { title, author, cover, publisher, year, source, debug } ou null
 // ============================================================
 
 // Fetch avec timeout pour qu'une source lente ne bloque pas tout
-async function fetchWithTimeout(url, ms = 4000) {
+async function fetchWithTimeout(url, ms = 5000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   try {
@@ -124,35 +124,47 @@ async function fetchWithTimeout(url, ms = 4000) {
   }
 }
 
+// Améliore une URL de couverture Google Books
+// Google renvoie souvent zoom=1 ; en passant à zoom=0 ou en supprimant edge=curl, on a plus grand
+function upgradeGoogleCover(url) {
+  if (!url) return "";
+  return url
+    .replace(/^http:/, "https:")
+    .replace(/&edge=curl/, "")
+    .replace(/zoom=\d/, "zoom=0");
+}
+
 // Google Books — excellent sur les livres français, gratuit, sans clé
 async function lookupGoogleBooks(isbn) {
-  try {
-    const res = await fetchWithTimeout(
-      `https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    const item = data.items?.[0]?.volumeInfo;
-    if (!item) return null;
-    // Préfère une couverture haute résolution si disponible
-    const cover =
-      item.imageLinks?.extraLarge ||
-      item.imageLinks?.large ||
-      item.imageLinks?.medium ||
-      item.imageLinks?.thumbnail ||
-      item.imageLinks?.smallThumbnail ||
-      "";
-    return {
-      title: item.title || "",
-      author: (item.authors || []).join(", "),
-      cover: cover.replace(/^http:/, "https:"), // force HTTPS
-      publisher: item.publisher || "",
-      year: item.publishedDate || "",
-      source: "Google Books",
-    };
-  } catch (e) {
-    return null;
+  // On essaie deux requêtes : isbn:NNNN (strict) puis NNNN simple (plus permissif)
+  for (const q of [`isbn:${isbn}`, isbn]) {
+    try {
+      const res = await fetchWithTimeout(
+        `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=1`
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      const item = data.items?.[0]?.volumeInfo;
+      if (!item || !item.title) continue;
+      const cover = upgradeGoogleCover(
+        item.imageLinks?.extraLarge ||
+        item.imageLinks?.large ||
+        item.imageLinks?.medium ||
+        item.imageLinks?.thumbnail ||
+        item.imageLinks?.smallThumbnail ||
+        ""
+      );
+      return {
+        title: item.title || "",
+        author: (item.authors || []).join(", "),
+        cover,
+        publisher: item.publisher || "",
+        year: item.publishedDate || "",
+        source: "Google Books",
+      };
+    } catch (e) { /* essai suivant */ }
   }
+  return null;
 }
 
 // Open Library — bonne pour livres anglo-saxons et anciens
@@ -178,16 +190,37 @@ async function lookupOpenLibrary(isbn) {
   }
 }
 
+// Couverture Open Library directe (souvent dispo même quand metadata absente)
+function openLibraryCoverUrl(isbn) {
+  return `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`;
+}
+
+// Vérifie si la couverture Open Library existe (Open Library renvoie une image
+// 1x1 transparente quand le livre n'est pas trouvé — on teste la taille)
+async function probeOpenLibraryCover(isbn) {
+  try {
+    const res = await fetchWithTimeout(
+      `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg?default=false`,
+      3000
+    );
+    if (res.ok) {
+      const blob = await res.blob();
+      // Une vraie couverture pèse > 1 Ko, l'image fallback en fait < 100
+      if (blob.size > 1000) return openLibraryCoverUrl(isbn);
+    }
+  } catch (e) { /* ignore */ }
+  return "";
+}
+
 // BNF SRU — la Bibliothèque nationale de France, exhaustive sur le fonds français
+// ATTENTION : sujette à des problèmes CORS — peut échouer en navigateur
 async function lookupBNF(isbn) {
   try {
     const url = `https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=bib.isbn%20adj%20%22${isbn}%22&recordSchema=unimarcxchange&maximumRecords=1`;
     const res = await fetchWithTimeout(url);
     if (!res.ok) return null;
     const xml = await res.text();
-    // Parse le XML UNIMARC pour extraire titre/auteur
     const doc = new DOMParser().parseFromString(xml, "text/xml");
-    // Champ 200 = titre, sous-champ a = titre principal, sous-champ f = auteur
     const fields = doc.querySelectorAll("datafield");
     let title = "", author = "", publisher = "", year = "";
     fields.forEach((f) => {
@@ -219,25 +252,41 @@ async function lookupBNF(isbn) {
   }
 }
 
-// Cascade : essaye chaque source en parallèle, retourne la première qui répond
+// Cascade : essaye chaque source en parallèle, retourne le meilleur résultat
 async function lookupISBN(isbn) {
-  // En parallèle pour la rapidité, mais on prend Google d'abord s'il répond
-  const [google, openLib, bnf] = await Promise.all([
+  const [google, openLib, bnf, olCover] = await Promise.all([
     lookupGoogleBooks(isbn),
     lookupOpenLibrary(isbn),
     lookupBNF(isbn),
+    probeOpenLibraryCover(isbn),
   ]);
-  // Priorité : Google (le plus complet sur livres français), Open Library, BnF
-  // Mais si Google n'a pas de couverture et qu'une autre en a une, on l'emprunte
-  let chosen = google || openLib || bnf || null;
-  if (chosen && !chosen.cover) {
-    const altCover = (google?.cover || openLib?.cover || bnf?.cover);
-    if (altCover) chosen.cover = altCover;
+
+  const debug = {
+    google: google ? `OK (${google.title?.slice(0, 40)})` : "rien",
+    openLibrary: openLib ? `OK (${openLib.title?.slice(0, 40)})` : "rien",
+    bnf: bnf ? `OK (${bnf.title?.slice(0, 40)})` : "rien",
+    olCoverDirect: olCover ? "image trouvée" : "non",
+  };
+
+  // Préférence : Google (le plus complet sur livres français), Open Library, BnF
+  let chosen = google || openLib || bnf;
+  if (!chosen) {
+    // Aucune source n'a de metadata mais on a peut-être une couverture
+    if (olCover) {
+      return { title: "", author: "", cover: olCover, publisher: "", year: "", source: "Open Library (couverture seule)", debug };
+    }
+    return { title: "", author: "", cover: "", source: null, debug };
   }
-  // Si Google n'a pas de titre mais qu'on a quand même un autre résultat
-  if (!chosen?.title && (openLib?.title || bnf?.title)) {
-    chosen = openLib || bnf;
+  // Si la source choisie n'a pas de couverture, emprunter
+  if (!chosen.cover) {
+    chosen.cover =
+      google?.cover ||
+      openLib?.cover ||
+      bnf?.cover ||
+      olCover ||
+      "";
   }
+  chosen.debug = debug;
   return chosen;
 }
 
@@ -823,9 +872,14 @@ function AddView({ structure, onCancel, onAdd, showToast }) {
         setScannedData({ ...found, isbn });
         showToast(`Trouvé via ${found.source}`);
         setMode("form");
+      } else if (found && found.cover) {
+        // On a au moins une couverture
+        setScannedData({ isbn, cover: found.cover, _debug: found.debug });
+        showToast("Couverture trouvée — complétez le titre", "error");
+        setMode("form");
       } else {
-        showToast("Livre non trouvé en ligne, complétez à la main", "error");
-        setScannedData({ isbn });
+        setScannedData({ isbn, _debug: found?.debug });
+        showToast("Livre non trouvé, complétez à la main", "error");
         setMode("form");
       }
     } catch (e) {
@@ -1275,6 +1329,9 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
   const [etagere, setEtagere] = useState(initial.etagere || "1");
   const [position, setPosition] = useState(initial.position || "1");
   const [notes, setNotes] = useState(initial.notes || "");
+  const [retrying, setRetrying] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
+  const [debugInfo, setDebugInfo] = useState(initial._debug || null);
 
   const handleCoverUpload = (e) => {
     const file = e.target.files?.[0];
@@ -1282,6 +1339,19 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
     const reader = new FileReader();
     reader.onload = (ev) => setCover(ev.target.result);
     reader.readAsDataURL(file);
+  };
+
+  const handleRetryLookup = async () => {
+    if (!isbn.trim()) return;
+    setRetrying(true);
+    try {
+      const found = await lookupISBN(isbn.trim());
+      setDebugInfo(found?.debug || null);
+      if (found?.title && !title) setTitle(found.title);
+      if (found?.author && !author) setAuthor(found.author);
+      if (found?.cover && !cover) setCover(found.cover);
+    } catch (e) { /* ignore */ }
+    setRetrying(false);
   };
 
   const submit = () => {
@@ -1320,6 +1390,54 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
           <input type="file" accept="image/*" onChange={handleCoverUpload} className="hidden" />
         </label>
       </div>
+
+      {/* Aide quand le titre n'a pas été trouvé automatiquement */}
+      {isbn && !title && (
+        <div className="rounded-lg p-3 space-y-2" style={{ background: "var(--parchment)" }}>
+          <p className="text-sm" style={{ color: "var(--ink)" }}>
+            Livre non trouvé automatiquement pour l'ISBN <strong>{isbn}</strong>.
+          </p>
+          <div className="flex gap-2 flex-wrap">
+            <a
+              href={`https://www.google.com/search?q=${encodeURIComponent(isbn)}+livre`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-3 py-2 rounded-lg text-sm font-medium inline-flex items-center gap-1.5"
+              style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+            >
+              <Search className="w-4 h-4" /> Chercher sur Google
+            </a>
+            <button
+              onClick={handleRetryLookup}
+              disabled={retrying}
+              className="px-3 py-2 rounded-lg text-sm font-medium inline-flex items-center gap-1.5 disabled:opacity-50"
+              style={{ background: "var(--leather)", color: "var(--cream)" }}
+            >
+              {retrying ? <><Loader2 className="w-4 h-4 animate-spin" /> Recherche…</> : <><RotateCcw className="w-4 h-4" /> Réessayer</>}
+            </button>
+            {debugInfo && (
+              <button
+                onClick={() => setShowDebug((v) => !v)}
+                className="px-3 py-2 rounded-lg text-sm font-medium border"
+                style={{ borderColor: "var(--leather)", color: "var(--leather-dark)" }}
+              >
+                {showDebug ? "Masquer détails" : "Détails sources"}
+              </button>
+            )}
+          </div>
+          <p className="text-xs" style={{ color: "var(--ink-soft)" }}>
+            Conseil : copiez le titre/auteur de la fiche Google et collez-les dans les champs ci-dessous.
+          </p>
+          {showDebug && debugInfo && (
+            <div className="text-xs font-mono p-2 rounded" style={{ background: "#1a1a1a", color: "#9fdc9f" }}>
+              <div>Google Books: {debugInfo.google}</div>
+              <div>Open Library: {debugInfo.openLibrary}</div>
+              <div>BnF: {debugInfo.bnf}</div>
+              <div>Couverture OL directe: {debugInfo.olCoverDirect}</div>
+            </div>
+          )}
+        </div>
+      )}
 
       <Field label="Titre *">
         <input
