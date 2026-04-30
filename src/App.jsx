@@ -195,21 +195,46 @@ function openLibraryCoverUrl(isbn) {
   return `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`;
 }
 
-// Vérifie si la couverture Open Library existe (Open Library renvoie une image
-// 1x1 transparente quand le livre n'est pas trouvé — on teste la taille)
-async function probeOpenLibraryCover(isbn) {
-  try {
-    const res = await fetchWithTimeout(
-      `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg?default=false`,
-      3000
-    );
-    if (res.ok) {
-      const blob = await res.blob();
-      // Une vraie couverture pèse > 1 Ko, l'image fallback en fait < 100
-      if (blob.size > 1000) return openLibraryCoverUrl(isbn);
-    }
-  } catch (e) { /* ignore */ }
+// Vérifie qu'une URL d'image se charge effectivement.
+// Plus fiable qu'un fetch+blob car évite les soucis CORS sur les binaires.
+function probeImageUrl(url, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    if (!url) return resolve(false);
+    const img = new Image();
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      resolve(ok);
+    };
+    img.onload = () => {
+      // Open Library renvoie une image 1x1 quand non trouvé sans ?default=false
+      // donc on filtre les images trop petites
+      if (img.naturalWidth > 10 && img.naturalHeight > 10) finish(true);
+      else finish(false);
+    };
+    img.onerror = () => finish(false);
+    setTimeout(() => finish(false), timeoutMs);
+    img.src = url;
+  });
+}
+
+// Cherche une couverture pour un ISBN en essayant plusieurs sources.
+// Renvoie l'URL utilisable ou "" si aucune ne fonctionne.
+async function findCoverFor(isbn) {
+  const candidates = [
+    `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg?default=false`,
+    `https://covers.openlibrary.org/b/isbn/${isbn}-M.jpg?default=false`,
+  ];
+  for (const url of candidates) {
+    if (await probeImageUrl(url)) return url;
+  }
   return "";
+}
+
+// Ancienne fonction conservée pour compatibilité — utilise la nouvelle
+async function probeOpenLibraryCover(isbn) {
+  return findCoverFor(isbn);
 }
 
 // BNF SRU — la Bibliothèque nationale de France, exhaustive sur le fonds français
@@ -413,6 +438,10 @@ export default function App() {
   const [selectedBook, setSelectedBook] = useState(null);
   const [toast, setToast] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  // État de progression de la re-recherche en arrière-plan
+  // null = inactif, sinon { current, total, found }
+  const [enrichProgress, setEnrichProgress] = useState(null);
+  const enrichCancelRef = useRef(false);
 
   // Charge livres + layout + structure depuis le storage persistant au démarrage
   useEffect(() => {
@@ -594,6 +623,76 @@ export default function App() {
     }
   };
 
+  // === RE-RECHERCHE DES LIVRES INCOMPLETS ===
+  // Identifie les livres avec ISBN valide mais titre/auteur/couverture manquant,
+  // et lance une lookup pour chacun. Met à jour au fil de l'eau.
+  const isLikelyBookISBN = (isbn) => {
+    if (!isbn || typeof isbn !== "string") return false;
+    const clean = isbn.replace(/\D/g, "");
+    // ISBN-13 valide commence par 978 ou 979
+    if (clean.length === 13 && (clean.startsWith("978") || clean.startsWith("979"))) return true;
+    // ISBN-10 (toléré) — 10 chiffres
+    if (clean.length === 10) return true;
+    return false;
+  };
+
+  const findIncompleteBooks = (booksList) => {
+    return booksList.filter((b) => {
+      if (!isLikelyBookISBN(b.isbn)) return false;
+      // Incomplet si manque au moins un des 3 champs essentiels
+      return !b.title || !b.author || !b.cover;
+    });
+  };
+
+  const handleEnrichIncomplete = async () => {
+    const candidates = findIncompleteBooks(books);
+    if (candidates.length === 0) {
+      showToast("Tous les livres avec ISBN valide sont déjà complets");
+      return;
+    }
+    enrichCancelRef.current = false;
+    setEnrichProgress({ current: 0, total: candidates.length, found: 0, updated: 0 });
+    let found = 0;
+    let updated = 0;
+    for (let i = 0; i < candidates.length; i++) {
+      if (enrichCancelRef.current) break;
+      const book = candidates[i];
+      try {
+        const result = await lookupISBN(book.isbn);
+        if (result && (result.title || result.cover)) {
+          found++;
+          // Ne remplace QUE les champs manquants — préserve les éditions manuelles
+          const updates = {};
+          if (!book.title && result.title) updates.title = result.title;
+          if (!book.author && result.author) updates.author = result.author;
+          if (!book.cover && result.cover) updates.cover = result.cover;
+          if (Object.keys(updates).length > 0) {
+            updated++;
+            setBooks((prev) => {
+              const next = prev.map((b) => (b.id === book.id ? { ...b, ...updates } : b));
+              window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+              return next;
+            });
+          }
+        }
+      } catch (e) { /* ignore une lookup en échec */ }
+      setEnrichProgress({ current: i + 1, total: candidates.length, found, updated });
+      // Petit délai entre requêtes pour ne pas saturer les API gratuites
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    const wasCancelled = enrichCancelRef.current;
+    setEnrichProgress(null);
+    if (wasCancelled) {
+      showToast(`Annulé — ${updated} livre${updated > 1 ? "s" : ""} mis à jour`);
+    } else {
+      showToast(`Terminé — ${updated} livre${updated > 1 ? "s" : ""} enrichi${updated > 1 ? "s" : ""} sur ${candidates.length}`);
+    }
+  };
+
+  const handleCancelEnrich = () => {
+    enrichCancelRef.current = true;
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center" style={{ background: "var(--cream)" }}>
@@ -759,8 +858,31 @@ export default function App() {
           structure={structure}
           onExport={handleExport}
           onImport={handleImport}
+          onEnrichIncomplete={handleEnrichIncomplete}
+          onCancelEnrich={handleCancelEnrich}
+          enrichProgress={enrichProgress}
+          incompleteCount={findIncompleteBooks(books).length}
           onClose={() => setShowSettings(false)}
         />
+      )}
+
+      {/* Mini barre flottante quand enrichissement tourne en arrière-plan */}
+      {enrichProgress && !showSettings && (
+        <button
+          onClick={() => setShowSettings(true)}
+          className="fixed left-3 right-3 z-40 rounded-full px-4 py-2 shadow-lg flex items-center gap-2 text-sm"
+          style={{
+            bottom: "calc(env(safe-area-inset-bottom, 0px) + 6rem)",
+            background: "var(--leather-dark)",
+            color: "var(--cream)",
+          }}
+        >
+          <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" />
+          <span className="flex-1 text-left">
+            Recherche {enrichProgress.current}/{enrichProgress.total} · {enrichProgress.updated} maj
+          </span>
+          <ChevronRight className="w-4 h-4" />
+        </button>
       )}
 
       {/* Toast */}
@@ -1223,7 +1345,7 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
         const controls = reader.decodeFromVideoElement(videoRef.current, (result) => {
           if (result) {
             const code = result.getText();
-            if (!/^\d{10,13}$/.test(code)) return;
+            if (!/^(97[89]\d{10}|\d{10})$/.test(code)) return;
             if (fired.current) return;
             fired.current = true;
             try { controls.stop(); } catch (e) {}
@@ -1884,7 +2006,7 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
         return;
       }
       await reader.startScanning(videoRef.current, (code) => {
-        if (!/^\d{10,13}$/.test(code)) return;
+        if (!/^(97[89]\d{10}|\d{10})$/.test(code)) return;
         if (phaseRef.current === "paused") return;
         const now = Date.now();
         if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
@@ -1929,7 +2051,7 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
         readerRef.current = reader;
         if (!videoRef.current) return;
         await reader.startScanning(videoRef.current, (code) => {
-          if (!/^\d{10,13}$/.test(code)) return;
+          if (!/^(97[89]\d{10}|\d{10})$/.test(code)) return;
           if (phaseRef.current === "paused") return;
           const now = Date.now();
           if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
@@ -3404,8 +3526,18 @@ function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit }) {
   );
 }
 
-// === MODALE PARAMÈTRES (export/import) ===
-function SettingsModal({ books, structure, onExport, onImport, onClose }) {
+// === MODALE PARAMÈTRES (export/import/enrichissement) ===
+function SettingsModal({
+  books,
+  structure,
+  onExport,
+  onImport,
+  onEnrichIncomplete,
+  onCancelEnrich,
+  enrichProgress,
+  incompleteCount,
+  onClose,
+}) {
   const fileRef = useRef(null);
   const stats = {
     total: books.length,
@@ -3413,12 +3545,14 @@ function SettingsModal({ books, structure, onExport, onImport, onClose }) {
     withCover: books.filter((b) => b.cover).length,
     withoutTitle: books.filter((b) => !b.title).length,
   };
+  // Pendant l'enrichissement, on empêche la fermeture par clic extérieur
+  const isRunning = !!enrichProgress;
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-3"
       style={{ background: "rgba(0,0,0,0.5)" }}
-      onClick={(e) => e.target === e.currentTarget && onClose()}
+      onClick={(e) => e.target === e.currentTarget && !isRunning && onClose()}
     >
       <div className="w-full max-w-md rounded-2xl p-5 max-h-[90vh] overflow-y-auto"
         style={{ background: "var(--cream)" }}>
@@ -3460,6 +3594,70 @@ function SettingsModal({ books, structure, onExport, onImport, onClose }) {
               <strong>{structure.pieces.length} / {structure.bibliotheques.length} / {structure.etageres.length}</strong>
             </div>
           </div>
+        </div>
+
+        {/* Re-recherche des livres incomplets */}
+        <div className="mb-4">
+          <h4 className="text-sm font-bold mb-2" style={{ color: "var(--leather-dark)", fontFamily: "var(--font-display)" }}>
+            Compléter les livres incomplets
+          </h4>
+          <p className="text-xs mb-2" style={{ color: "var(--ink-soft)" }}>
+            Relance la recherche en ligne pour les livres qui ont un ISBN mais à qui il manque le titre, l'auteur ou la couverture. Utile après une mise à jour des sources de données.
+          </p>
+
+          {!enrichProgress && (
+            <>
+              <button
+                onClick={onEnrichIncomplete}
+                disabled={incompleteCount === 0}
+                className="w-full py-3 rounded-lg font-medium flex items-center justify-center gap-2 disabled:opacity-50"
+                style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+              >
+                <RotateCcw className="w-5 h-5" />
+                {incompleteCount === 0
+                  ? "Aucun livre à compléter"
+                  : `Re-rechercher (${incompleteCount} livre${incompleteCount > 1 ? "s" : ""})`}
+              </button>
+              {incompleteCount > 0 && (
+                <p className="text-xs mt-1.5" style={{ color: "var(--ink-soft)" }}>
+                  Les champs déjà remplis seront préservés. Compter ~5 secondes par livre.
+                </p>
+              )}
+            </>
+          )}
+
+          {enrichProgress && (
+            <div className="space-y-2">
+              <div className="flex justify-between text-sm" style={{ color: "var(--ink)" }}>
+                <span>
+                  {enrichProgress.current} / {enrichProgress.total}
+                </span>
+                <span style={{ color: "var(--leather-dark)", fontWeight: 600 }}>
+                  {enrichProgress.updated} mis à jour
+                </span>
+              </div>
+              {/* Barre de progression */}
+              <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: "var(--parchment)" }}>
+                <div
+                  className="h-full transition-all"
+                  style={{
+                    width: `${(enrichProgress.current / enrichProgress.total) * 100}%`,
+                    background: "linear-gradient(90deg, var(--gold) 0%, var(--gold-light) 100%)",
+                  }}
+                />
+              </div>
+              <button
+                onClick={onCancelEnrich}
+                className="w-full py-2 rounded-lg font-medium border-2 text-sm"
+                style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
+              >
+                Arrêter
+              </button>
+              <p className="text-xs text-center" style={{ color: "var(--ink-soft)" }}>
+                Vous pouvez fermer cette fenêtre, le travail continue en arrière-plan.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Export */}
