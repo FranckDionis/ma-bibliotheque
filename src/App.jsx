@@ -195,9 +195,23 @@ function openLibraryCoverUrl(isbn) {
   return `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`;
 }
 
+// Convertit ISBN-13 (978...) en ISBN-10 (utile pour Amazon)
+function isbn13ToIsbn10(isbn13) {
+  const clean = isbn13.replace(/\D/g, "");
+  if (clean.length !== 13 || !clean.startsWith("978")) return null;
+  const core = clean.substring(3, 12); // 9 chiffres
+  let sum = 0;
+  for (let i = 0; i < 9; i++) {
+    sum += parseInt(core[i], 10) * (10 - i);
+  }
+  let check = (11 - (sum % 11)) % 11;
+  const checkChar = check === 10 ? "X" : check.toString();
+  return core + checkChar;
+}
+
 // Vérifie qu'une URL d'image se charge effectivement.
 // Plus fiable qu'un fetch+blob car évite les soucis CORS sur les binaires.
-function probeImageUrl(url, timeoutMs = 4000) {
+function probeImageUrl(url, timeoutMs = 4000, minSize = 60) {
   return new Promise((resolve) => {
     if (!url) return resolve(false);
     const img = new Image();
@@ -209,8 +223,9 @@ function probeImageUrl(url, timeoutMs = 4000) {
     };
     img.onload = () => {
       // Open Library renvoie une image 1x1 quand non trouvé sans ?default=false
-      // donc on filtre les images trop petites
-      if (img.naturalWidth > 10 && img.naturalHeight > 10) finish(true);
+      // Amazon renvoie une image ~43x60 quand "no image available"
+      // On filtre selon une taille minimale raisonnable pour une vraie couverture
+      if (img.naturalWidth >= minSize && img.naturalHeight >= minSize) finish(true);
       else finish(false);
     };
     img.onerror = () => finish(false);
@@ -219,17 +234,57 @@ function probeImageUrl(url, timeoutMs = 4000) {
   });
 }
 
-// Cherche une couverture pour un ISBN en essayant plusieurs sources.
-// Renvoie l'URL utilisable ou "" si aucune ne fonctionne.
+// Cherche une couverture pour un ISBN en essayant plusieurs sources EN PARALLÈLE.
+// Renvoie la première URL qui charge une image valide (>= 60px), ou "" sinon.
 async function findCoverFor(isbn) {
+  const cleanIsbn = isbn.replace(/\D/g, "");
+  const isbn10 = cleanIsbn.length === 13 ? isbn13ToIsbn10(cleanIsbn) : (cleanIsbn.length === 10 ? cleanIsbn : null);
+
+  // Liste des candidats, par ordre de qualité d'image attendue
   const candidates = [
-    `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg?default=false`,
-    `https://covers.openlibrary.org/b/isbn/${isbn}-M.jpg?default=false`,
+    // Open Library — gratuit, souvent peu fourni en livres FR mais fiable
+    `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-L.jpg?default=false`,
+    // Google Books "content" via vid — fonctionne souvent même quand l'API JSON ne renvoie rien
+    `https://books.google.com/books/content?vid=ISBN${cleanIsbn}&printsec=frontcover&img=1&zoom=1`,
+    `https://books.google.com/books/content?vid=ISBN${cleanIsbn}&printsec=frontcover&img=1&zoom=0`,
+    // Open Library taille moyenne (fallback)
+    `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-M.jpg?default=false`,
   ];
-  for (const url of candidates) {
-    if (await probeImageUrl(url)) return url;
+
+  // Amazon : excellent pour le fonds FR, nécessite ISBN-10
+  if (isbn10) {
+    // Variantes — Amazon a plusieurs sous-domaines/CDN
+    candidates.push(
+      `https://images-na.ssl-images-amazon.com/images/P/${isbn10}.01._SCLZZZZZZZ_.jpg`,
+      `https://images-na.ssl-images-amazon.com/images/P/${isbn10}.jpg`,
+      `https://m.media-amazon.com/images/P/${isbn10}.jpg`,
+    );
   }
-  return "";
+
+  // On lance tout en parallèle et on prend le premier OK
+  const probes = candidates.map(async (url) => {
+    const ok = await probeImageUrl(url, 5000, 60);
+    return ok ? url : null;
+  });
+
+  // Promise.any-like : retourne le premier non-null
+  // (Promise.any natif filtre les rejets, ici on a des null donc on fait à la main)
+  return new Promise((resolve) => {
+    let pending = probes.length;
+    let resolved = false;
+    probes.forEach((p) => {
+      p.then((url) => {
+        if (resolved) return;
+        if (url) {
+          resolved = true;
+          resolve(url);
+        } else if (--pending === 0) {
+          resolved = true;
+          resolve("");
+        }
+      });
+    });
+  });
 }
 
 // Ancienne fonction conservée pour compatibilité — utilise la nouvelle
@@ -279,36 +334,37 @@ async function lookupBNF(isbn) {
 
 // Cascade : essaye chaque source en parallèle, retourne le meilleur résultat
 async function lookupISBN(isbn) {
-  const [google, openLib, bnf, olCover] = await Promise.all([
+  const [google, openLib, bnf, fallbackCover] = await Promise.all([
     lookupGoogleBooks(isbn),
     lookupOpenLibrary(isbn),
     lookupBNF(isbn),
-    probeOpenLibraryCover(isbn),
+    findCoverFor(isbn),
   ]);
 
   const debug = {
     google: google ? `OK (${google.title?.slice(0, 40)})` : "rien",
     openLibrary: openLib ? `OK (${openLib.title?.slice(0, 40)})` : "rien",
     bnf: bnf ? `OK (${bnf.title?.slice(0, 40)})` : "rien",
-    olCoverDirect: olCover ? "image trouvée" : "non",
+    coverFallback: fallbackCover ? `image trouvée (${fallbackCover.includes("amazon") ? "Amazon" : fallbackCover.includes("googleusercontent") || fallbackCover.includes("books.google") ? "Google" : "Open Library"})` : "aucune",
   };
 
   // Préférence : Google (le plus complet sur livres français), Open Library, BnF
   let chosen = google || openLib || bnf;
   if (!chosen) {
     // Aucune source n'a de metadata mais on a peut-être une couverture
-    if (olCover) {
-      return { title: "", author: "", cover: olCover, publisher: "", year: "", source: "Open Library (couverture seule)", debug };
+    if (fallbackCover) {
+      return { title: "", author: "", cover: fallbackCover, publisher: "", year: "", source: "Couverture seule", debug };
     }
     return { title: "", author: "", cover: "", source: null, debug };
   }
-  // Si la source choisie n'a pas de couverture, emprunter
+  // Si la source choisie n'a pas de couverture, ou si on a une meilleure source
+  // (ex: Google Books donne une thumbnail mini, Amazon donne du grand)
   if (!chosen.cover) {
     chosen.cover =
       google?.cover ||
       openLib?.cover ||
       bnf?.cover ||
-      olCover ||
+      fallbackCover ||
       "";
   }
   chosen.debug = debug;
@@ -1669,7 +1725,7 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
               <div>Google Books: {debugInfo.google}</div>
               <div>Open Library: {debugInfo.openLibrary}</div>
               <div>BnF: {debugInfo.bnf}</div>
-              <div>Couverture OL directe: {debugInfo.olCoverDirect}</div>
+              <div>Couverture (toutes sources): {debugInfo.coverFallback}</div>
             </div>
           )}
         </div>
