@@ -487,7 +487,13 @@ export default function App() {
       id: Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6),
       addedAt: new Date().toISOString(),
     };
-    await saveBooks([newBook, ...books]);
+    // Utilise le pattern fonctionnel pour éviter les closures périmées
+    // quand plusieurs addBook s'enchaînent rapidement (mode batch)
+    setBooks((prev) => {
+      const next = [newBook, ...prev];
+      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
     if (!options.silent) {
       showToast("Livre ajouté à votre bibliothèque");
       setView("home");
@@ -496,7 +502,11 @@ export default function App() {
   };
 
   const updateBook = async (id, updates) => {
-    await saveBooks(books.map((b) => (b.id === id ? { ...b, ...updates } : b)));
+    setBooks((prev) => {
+      const next = prev.map((b) => (b.id === id ? { ...b, ...updates } : b));
+      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
     showToast("Livre mis à jour");
   };
 
@@ -506,14 +516,17 @@ export default function App() {
       const next = prev.map((b) =>
         b._placeholderId === placeholderId ? { ...b, ...updates } : b
       );
-      // Sauvegarde async
       window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
       return next;
     });
   };
 
   const deleteBook = async (id) => {
-    await saveBooks(books.filter((b) => b.id !== id));
+    setBooks((prev) => {
+      const next = prev.filter((b) => b.id !== id);
+      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
     showToast("Livre supprimé");
     setView("home");
   };
@@ -644,9 +657,11 @@ export default function App() {
       `}</style>
 
       {/* Header */}
-      <header className="sticky top-0 z-30 px-5 py-4 border-b" style={{
+      <header className="sticky top-0 z-30 px-5 border-b" style={{
         background: "linear-gradient(180deg, var(--leather-dark) 0%, var(--leather) 100%)",
         borderColor: "var(--gold)",
+        paddingTop: "calc(env(safe-area-inset-top, 0px) + 1rem)",
+        paddingBottom: "1rem",
       }}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -766,6 +781,7 @@ export default function App() {
         <nav className="fixed bottom-0 left-0 right-0 z-20 border-t shadow-lg" style={{
           background: "var(--cream)",
           borderColor: "var(--parchment)",
+          paddingBottom: "env(safe-area-inset-bottom, 0px)",
         }}>
           <div className="flex items-center justify-around py-3 px-2">
             <NavButton
