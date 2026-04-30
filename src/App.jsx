@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle } from "lucide-react";
+import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload } from "lucide-react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
 
 // === ADAPTATEUR DE STOCKAGE ===
@@ -412,6 +412,7 @@ export default function App() {
   const [filterBib, setFilterBib] = useState("all");
   const [selectedBook, setSelectedBook] = useState(null);
   const [toast, setToast] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
 
   // Charge livres + layout + structure depuis le storage persistant au démarrage
   useEffect(() => {
@@ -480,20 +481,35 @@ export default function App() {
     setTimeout(() => setToast(null), 2500);
   };
 
-  const addBook = async (book) => {
+  const addBook = async (book, options = {}) => {
     const newBook = {
       ...book,
-      id: Date.now().toString(),
+      id: Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6),
       addedAt: new Date().toISOString(),
     };
     await saveBooks([newBook, ...books]);
-    showToast("Livre ajouté à votre bibliothèque");
-    setView("home");
+    if (!options.silent) {
+      showToast("Livre ajouté à votre bibliothèque");
+      setView("home");
+    }
+    return newBook;
   };
 
   const updateBook = async (id, updates) => {
     await saveBooks(books.map((b) => (b.id === id ? { ...b, ...updates } : b)));
     showToast("Livre mis à jour");
+  };
+
+  // Mise à jour en mode batch (pas de toast, par placeholder ID)
+  const enrichBookByPlaceholder = async (placeholderId, updates) => {
+    setBooks((prev) => {
+      const next = prev.map((b) =>
+        b._placeholderId === placeholderId ? { ...b, ...updates } : b
+      );
+      // Sauvegarde async
+      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
   };
 
   const deleteBook = async (id) => {
@@ -510,6 +526,60 @@ export default function App() {
     const matchBib = filterBib === "all" || b.bibliotheque === filterBib;
     return matchSearch && matchBib;
   });
+
+  // === EXPORT / IMPORT ===
+  const handleExport = () => {
+    const data = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      books,
+      structure,
+      layout,
+      stats: {
+        booksCount: books.length,
+        booksWithTitle: books.filter((b) => b.title).length,
+        booksWithCover: books.filter((b) => b.cover).length,
+        piecesCount: structure.pieces.length,
+        bibliothequesCount: structure.bibliotheques.length,
+        etageresCount: structure.etageres.length,
+      },
+    };
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const date = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `ma-bibliotheque-${date}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(`Sauvegarde : ${books.length} livres exportés`);
+  };
+
+  const handleImport = async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      if (!data.books || !Array.isArray(data.books)) {
+        showToast("Fichier invalide", "error");
+        return;
+      }
+      // Confirmation simple via window.confirm
+      const summary = `Importer ${data.books.length} livres et ${data.structure?.bibliotheques?.length || 0} bibliothèques ?\n\nCela REMPLACERA toutes les données actuelles.`;
+      if (!window.confirm(summary)) return;
+
+      await saveBooks(data.books);
+      if (data.structure) await saveStructure(data.structure);
+      if (data.layout) await saveLayout(data.layout);
+      showToast(`${data.books.length} livres importés`);
+      setShowSettings(false);
+    } catch (e) {
+      showToast(`Erreur : ${e.message}`, "error");
+    }
+  };
 
   if (loading) {
     return (
@@ -558,6 +628,11 @@ export default function App() {
           0%, 100% { top: 10%; }
           50% { top: 90%; }
         }
+        @keyframes flashFade {
+          0% { opacity: 0; }
+          30% { opacity: 1; }
+          100% { opacity: 0; }
+        }
         input, select, textarea {
           font-family: var(--font-body);
           -webkit-appearance: none;
@@ -586,8 +661,18 @@ export default function App() {
               Ma Bibliothèque
             </h1>
           </div>
-          <div className="text-xs" style={{ color: "var(--gold-light)", fontFamily: "var(--font-display)" }}>
-            {books.length} {books.length > 1 ? "livres" : "livre"}
+          <div className="flex items-center gap-3">
+            <div className="text-xs" style={{ color: "var(--gold-light)", fontFamily: "var(--font-display)" }}>
+              {books.length} {books.length > 1 ? "livres" : "livre"}
+            </div>
+            <button
+              onClick={() => setShowSettings(true)}
+              className="p-1.5 rounded-lg"
+              style={{ background: "rgba(212, 167, 44, 0.15)", color: "var(--gold-light)" }}
+              aria-label="Paramètres"
+            >
+              <Settings className="w-5 h-5" />
+            </button>
           </div>
         </div>
       </header>
@@ -625,6 +710,7 @@ export default function App() {
             structure={structure}
             onCancel={() => setView("home")}
             onAdd={addBook}
+            onEnrichBook={enrichBookByPlaceholder}
             showToast={showToast}
           />
         )}
@@ -650,6 +736,17 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* Modale Paramètres */}
+      {showSettings && (
+        <SettingsModal
+          books={books}
+          structure={structure}
+          onExport={handleExport}
+          onImport={handleImport}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
 
       {/* Toast */}
       {toast && (
@@ -857,7 +954,7 @@ function BookCard({ book, structure, onClick, index }) {
 }
 
 // === VUE AJOUT ===
-function AddView({ structure, onCancel, onAdd, showToast }) {
+function AddView({ structure, onCancel, onAdd, onEnrichBook, showToast }) {
   const [mode, setMode] = useState("choice"); // choice, barcode, cover, manual, form, batch-setup, batch-scan
   const [scannedData, setScannedData] = useState(null);
   const [searching, setSearching] = useState(false);
@@ -944,7 +1041,8 @@ function AddView({ structure, onCancel, onAdd, showToast }) {
         <BatchScanner
           structure={structure}
           setup={batchSetup}
-          onAddBook={onAdd}
+          onAddBook={(book) => onAdd(book, { silent: true })}
+          onEnrichBook={onEnrichBook}
           onChangeShelf={(newSetup) => setBatchSetup(newSetup)}
           onFinish={() => setMode("choice")}
           showToast={showToast}
@@ -1737,7 +1835,7 @@ function BatchSetup({ structure, onCancel, onStart }) {
 }
 
 // === SCANNER EN SÉRIE ===
-function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, showToast }) {
+function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf, onFinish, showToast }) {
   const [currentSetup, setCurrentSetup] = useState(setup);
   const [phase, setPhase] = useState("scanning"); // scanning, processing, confirming, paused
   const [lastBook, setLastBook] = useState(null);
@@ -1771,7 +1869,7 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
       }
       await reader.startScanning(videoRef.current, (code) => {
         if (!/^\d{10,13}$/.test(code)) return;
-        if (phaseRef.current !== "scanning") return;
+        if (phaseRef.current === "paused") return;
         const now = Date.now();
         if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
           return;
@@ -1789,17 +1887,24 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
     setStarting(false);
   };
 
-  // Stoppe le scanner pendant les phases hors scan, le redémarre au retour
+  // Filtre dans le callback : on accepte les scans en phase "scanning" OU "flash"
+  // (flash = juste un feedback visuel court, pas un blocage)
+  // Mais on ne tient pas compte de ça dans cet effet : la caméra reste allumée
+  // dans tous ces états.
+
+  // Stoppe le scanner SEULEMENT pour les phases vraiment bloquantes (modale, pause)
   useEffect(() => {
     if (!cameraStarted) return;
-    if (phase !== "scanning") {
+    if (phase === "paused") {
       if (readerRef.current) {
         try { readerRef.current.stop(); } catch (e) { /* ignore */ }
         readerRef.current = null;
       }
       return;
     }
-    // Retour en phase scan : redémarre le scanner (l'autorisation caméra est déjà accordée)
+    // Si on a déjà un reader actif, on le laisse tourner — pas de redémarrage inutile
+    if (readerRef.current) return;
+    // Sinon on redémarre (cas du retour depuis "paused")
     let cancelled = false;
     (async () => {
       try {
@@ -1809,7 +1914,7 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
         if (!videoRef.current) return;
         await reader.startScanning(videoRef.current, (code) => {
           if (!/^\d{10,13}$/.test(code)) return;
-          if (phaseRef.current !== "scanning") return;
+          if (phaseRef.current === "paused") return;
           const now = Date.now();
           if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
             return;
@@ -1833,36 +1938,66 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
   }, [phase, cameraStarted]);
 
   const handleISBNScanned = async (isbn) => {
-    setPhase("processing");
-    let bookData = { isbn };
-    try {
-      const found = await lookupISBN(isbn);
-      if (found && found.title) {
-        bookData = {
-          isbn,
-          title: found.title,
-          author: found.author,
-          cover: found.cover,
-        };
-      }
-    } catch (e) { /* hors ligne — on garde juste l'ISBN */ }
+    // Mode continu : on ajoute IMMÉDIATEMENT le livre avec l'ISBN seul,
+    // puis on enrichit en arrière-plan. La caméra reste active.
+    const placeholderId = Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6);
+    const placeholderPosition = currentSetup.position;
+    const placeholderBib = currentSetup.bibliotheque;
+    const placeholderEtagere = currentSetup.etagere;
 
-    // Ajout immédiat avec l'emplacement courant
-    const finalBook = {
-      ...bookData,
-      bibliotheque: currentSetup.bibliotheque,
-      etagere: currentSetup.etagere,
-      position: currentSetup.position,
+    // Petit feedback flash brief sans bloquer
+    setPhase("flash");
+    setTimeout(() => {
+      // Si on est encore en "flash" (pas un autre scan entretemps), retour à scanning
+      setPhase((p) => (p === "flash" ? "scanning" : p));
+    }, 300);
+
+    // Ajout placeholder immédiat
+    const placeholder = {
+      _placeholderId: placeholderId,
+      isbn,
+      title: "",
+      author: "",
+      cover: "",
+      bibliotheque: placeholderBib,
+      etagere: placeholderEtagere,
+      position: placeholderPosition,
       notes: "",
     };
-    await onAddBook(finalBook);
-
-    setLastBook(finalBook);
-    setBatchHistory((h) => [finalBook, ...h]);
-    // Incrémente la position pour le prochain livre
+    await onAddBook(placeholder);
+    setLastBook(placeholder);
+    setBatchHistory((h) => [placeholder, ...h]);
     setCurrentSetup((s) => ({ ...s, position: s.position + 1 }));
-    // Retour au scan après un court délai pour laisser voir le feedback
-    setTimeout(() => setPhase("scanning"), 800);
+
+    // Lookup en arrière-plan — le livre sera mis à jour quand le résultat arrive
+    (async () => {
+      try {
+        const found = await lookupISBN(isbn);
+        if (found && (found.title || found.cover)) {
+          // Met à jour le placeholder via une fonction utilitaire injectée par le parent
+          if (typeof onEnrichBook === "function") {
+            onEnrichBook(placeholderId, {
+              title: found.title || "",
+              author: found.author || "",
+              cover: found.cover || "",
+            });
+          }
+          // Met aussi à jour notre vue locale
+          setLastBook((curr) =>
+            curr?._placeholderId === placeholderId
+              ? { ...curr, title: found.title || "", author: found.author || "", cover: found.cover || "" }
+              : curr
+          );
+          setBatchHistory((h) =>
+            h.map((b) =>
+              b._placeholderId === placeholderId
+                ? { ...b, title: found.title || "", author: found.author || "", cover: found.cover || "" }
+                : b
+            )
+          );
+        }
+      } catch (e) { /* ignore */ }
+    })();
   };
 
   const handleManualISBN = () => {
@@ -2068,10 +2203,16 @@ function BatchScanner({ structure, setup, onAddBook, onChangeShelf, onFinish, sh
             </div>
           )}
 
-          {/* Overlay processing */}
-          {phase === "processing" && (
-            <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
-              <Loader2 className="w-10 h-10 animate-spin" style={{ color: "var(--gold-light)" }} />
+          {/* Flash de confirmation après chaque scan — court, ne bloque pas la vue */}
+          {phase === "flash" && (
+            <div className="absolute inset-0 pointer-events-none flex items-center justify-center"
+              style={{
+                background: "rgba(180, 220, 100, 0.25)",
+                animation: "flashFade 300ms ease-out",
+              }}>
+              <div className="rounded-full p-4" style={{ background: "rgba(74, 35, 10, 0.85)" }}>
+                <Check className="w-10 h-10" style={{ color: "var(--gold-light)" }} />
+              </div>
             </div>
           )}
 
@@ -3242,6 +3383,119 @@ function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit }) {
             ))}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// === MODALE PARAMÈTRES (export/import) ===
+function SettingsModal({ books, structure, onExport, onImport, onClose }) {
+  const fileRef = useRef(null);
+  const stats = {
+    total: books.length,
+    withTitle: books.filter((b) => b.title).length,
+    withCover: books.filter((b) => b.cover).length,
+    withoutTitle: books.filter((b) => !b.title).length,
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-3"
+      style={{ background: "rgba(0,0,0,0.5)" }}
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <div className="w-full max-w-md rounded-2xl p-5 max-h-[90vh] overflow-y-auto"
+        style={{ background: "var(--cream)" }}>
+        <div className="flex items-center justify-between mb-4">
+          <h3 style={{ fontFamily: "var(--font-display)", fontSize: "1.4rem", color: "var(--ink)" }}>
+            Paramètres
+          </h3>
+          <button onClick={onClose} className="p-1" style={{ color: "var(--ink-soft)" }}>
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Statistiques */}
+        <div className="rounded-lg p-3 mb-4" style={{ background: "var(--parchment)" }}>
+          <h4 className="text-sm font-bold mb-2" style={{ color: "var(--leather-dark)", fontFamily: "var(--font-display)" }}>
+            Statistiques
+          </h4>
+          <div className="text-sm space-y-1" style={{ color: "var(--ink)" }}>
+            <div className="flex justify-between">
+              <span>Total de livres</span>
+              <strong>{stats.total}</strong>
+            </div>
+            <div className="flex justify-between">
+              <span>Avec titre/auteur</span>
+              <strong>{stats.withTitle} ({stats.total > 0 ? Math.round(stats.withTitle / stats.total * 100) : 0}%)</strong>
+            </div>
+            <div className="flex justify-between">
+              <span>Avec couverture</span>
+              <strong>{stats.withCover} ({stats.total > 0 ? Math.round(stats.withCover / stats.total * 100) : 0}%)</strong>
+            </div>
+            {stats.withoutTitle > 0 && (
+              <div className="flex justify-between" style={{ color: "var(--accent)" }}>
+                <span>Sans titre (à compléter)</span>
+                <strong>{stats.withoutTitle}</strong>
+              </div>
+            )}
+            <div className="flex justify-between pt-1 mt-1 border-t" style={{ borderColor: "rgba(0,0,0,0.1)" }}>
+              <span>Pièces / Bibliothèques / Étagères</span>
+              <strong>{structure.pieces.length} / {structure.bibliotheques.length} / {structure.etageres.length}</strong>
+            </div>
+          </div>
+        </div>
+
+        {/* Export */}
+        <div className="mb-4">
+          <h4 className="text-sm font-bold mb-2" style={{ color: "var(--leather-dark)", fontFamily: "var(--font-display)" }}>
+            Sauvegarde
+          </h4>
+          <p className="text-xs mb-2" style={{ color: "var(--ink-soft)" }}>
+            Télécharge un fichier JSON avec tous vos livres, bibliothèques et la disposition. À conserver dans iCloud Drive ou par email.
+          </p>
+          <button
+            onClick={onExport}
+            disabled={books.length === 0}
+            className="w-full py-3 rounded-lg font-medium flex items-center justify-center gap-2 disabled:opacity-50"
+            style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+          >
+            <Download className="w-5 h-5" /> Exporter ma bibliothèque
+          </button>
+        </div>
+
+        {/* Import */}
+        <div className="mb-4">
+          <h4 className="text-sm font-bold mb-2" style={{ color: "var(--leather-dark)", fontFamily: "var(--font-display)" }}>
+            Restaurer
+          </h4>
+          <p className="text-xs mb-2" style={{ color: "var(--ink-soft)" }}>
+            Charge un fichier JSON précédemment exporté. <strong>Remplace</strong> les données actuelles.
+          </p>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/json,.json"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) onImport(file);
+              e.target.value = "";
+            }}
+            className="hidden"
+          />
+          <button
+            onClick={() => fileRef.current?.click()}
+            className="w-full py-3 rounded-lg font-medium border-2 flex items-center justify-center gap-2"
+            style={{ borderColor: "var(--leather)", color: "var(--leather-dark)" }}
+          >
+            <Upload className="w-5 h-5" /> Importer une sauvegarde
+          </button>
+        </div>
+
+        {/* Astuce */}
+        <div className="rounded-lg p-3 text-xs" style={{ background: "rgba(212, 167, 44, 0.15)", color: "var(--ink)" }}>
+          💡 <strong>Astuce</strong> : exportez régulièrement, surtout après une grande session de scan. Le fichier reste petit (typiquement 100-500 Ko pour quelques centaines de livres).
+        </div>
       </div>
     </div>
   );
