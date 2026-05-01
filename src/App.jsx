@@ -2,6 +2,12 @@ import React, { useState, useEffect, useRef } from "react";
 import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload, LogOut, Cloud, CloudOff } from "lucide-react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
 import { supabase, isSupabaseConfigured } from "./supabase";
+import {
+  insertBooksBulk,
+  saveStructureRemote,
+  saveLayoutRemote,
+  fetchBooks as fetchBooksRemote,
+} from "./db";
 import AuthScreen from "./AuthScreen";
 
 // === ADAPTATEUR DE STOCKAGE ===
@@ -815,6 +821,54 @@ export default function App() {
     }
   };
 
+  // === MIGRATION VERS SUPABASE ===
+  // Copie les livres locaux + structure + layout vers la base partagée.
+  // Ne supprime PAS les données locales — c'est une copie de sécurité.
+  const [migrating, setMigrating] = useState(null); // null | { current, total }
+
+  const handleMigrateToCloud = async () => {
+    if (!isSupabaseConfigured || !authState || authState === "skipped") {
+      showToast("Connectez-vous d'abord pour migrer", "error");
+      return;
+    }
+    if (books.length === 0) {
+      showToast("Aucun livre local à migrer", "error");
+      return;
+    }
+    // Vérifier si la base contient déjà des livres pour éviter les doublons
+    let existing = [];
+    try {
+      existing = await fetchBooksRemote();
+    } catch (e) {
+      showToast(`Erreur de lecture distante : ${e.message}`, "error");
+      return;
+    }
+    // Confirmation explicite
+    let msg = `Migrer ${books.length} livre${books.length > 1 ? "s" : ""} et ${structure.bibliotheques.length} bibliothèque${structure.bibliotheques.length > 1 ? "s" : ""} vers la base partagée ?`;
+    if (existing.length > 0) {
+      msg += `\n\n⚠️ La base contient déjà ${existing.length} livre${existing.length > 1 ? "s" : ""}. Vos livres seront AJOUTÉS (risque de doublons).`;
+    }
+    msg += "\n\nVos livres locaux seront conservés.";
+    if (!window.confirm(msg)) return;
+
+    try {
+      setMigrating({ current: 0, total: books.length });
+      // 1. Pousse la structure (pièces, bibliothèques, étagères)
+      await saveStructureRemote(structure);
+      // 2. Pousse le layout
+      await saveLayoutRemote(layout);
+      // 3. Pousse les livres par lots avec progression
+      await insertBooksBulk(books, (current, total) => {
+        setMigrating({ current, total });
+      });
+      setMigrating(null);
+      showToast(`✅ ${books.length} livres migrés vers la base partagée`);
+    } catch (e) {
+      setMigrating(null);
+      showToast(`Erreur de migration : ${e.message}`, "error");
+    }
+  };
+
   // === RE-RECHERCHE DES LIVRES INCOMPLETS ===
   // Identifie les livres avec ISBN valide mais titre/auteur/couverture manquant,
   // et lance une lookup pour chacun. Met à jour au fil de l'eau.
@@ -1157,6 +1211,8 @@ export default function App() {
           authState={authState}
           isSupabaseConfigured={isSupabaseConfigured}
           onSignOut={handleSignOut}
+          onMigrateToCloud={handleMigrateToCloud}
+          migrating={migrating}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -4134,6 +4190,8 @@ function SettingsModal({
   authState,
   isSupabaseConfigured,
   onSignOut,
+  onMigrateToCloud,
+  migrating,
   onClose,
 }) {
   const fileRef = useRef(null);
@@ -4177,11 +4235,47 @@ function SettingsModal({
                 </p>
                 <button
                   onClick={onSignOut}
-                  className="w-full py-2 rounded-lg text-sm font-medium border-2 flex items-center justify-center gap-1.5"
+                  className="w-full py-2 rounded-lg text-sm font-medium border-2 flex items-center justify-center gap-1.5 mb-2"
                   style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
                 >
                   <LogOut className="w-4 h-4" /> Se déconnecter
                 </button>
+
+                {/* Bouton de migration des livres locaux vers la base partagée */}
+                {books.length > 0 && (
+                  <div className="pt-2 border-t" style={{ borderColor: "var(--gold)" }}>
+                    {migrating ? (
+                      <div className="space-y-2">
+                        <div className="text-xs flex justify-between" style={{ color: "var(--ink)" }}>
+                          <span>Migration en cours…</span>
+                          <span><strong>{migrating.current}</strong> / {migrating.total}</span>
+                        </div>
+                        <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: "var(--parchment)" }}>
+                          <div
+                            className="h-full transition-all"
+                            style={{
+                              width: `${(migrating.current / migrating.total) * 100}%`,
+                              background: "linear-gradient(90deg, var(--gold) 0%, var(--gold-light) 100%)",
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="text-xs mb-2" style={{ color: "var(--ink)" }}>
+                          Vous avez <strong>{books.length} livre{books.length > 1 ? "s" : ""}</strong> stocké{books.length > 1 ? "s" : ""} sur cet appareil. Migrez-les vers la base partagée pour qu'ils soient accessibles à toute la famille.
+                        </p>
+                        <button
+                          onClick={onMigrateToCloud}
+                          className="w-full py-2 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5"
+                          style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+                        >
+                          <Upload className="w-4 h-4" /> Migrer mes livres vers la base partagée
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
               </>
             ) : (
               <p className="text-xs" style={{ color: "var(--ink)" }}>
