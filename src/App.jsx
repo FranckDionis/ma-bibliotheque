@@ -140,11 +140,12 @@ async function lookupGoogleBooks(isbn) {
   for (const q of [`isbn:${isbn}`, isbn]) {
     try {
       const res = await fetchWithTimeout(
-        `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=1`
+        `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=1&langRestrict=fr`
       );
       if (!res.ok) continue;
       const data = await res.json();
-      const item = data.items?.[0]?.volumeInfo;
+      const itemRoot = data.items?.[0];
+      const item = itemRoot?.volumeInfo;
       if (!item || !item.title) continue;
       const cover = upgradeGoogleCover(
         item.imageLinks?.extraLarge ||
@@ -154,12 +155,28 @@ async function lookupGoogleBooks(isbn) {
         item.imageLinks?.smallThumbnail ||
         ""
       );
+      // Mappe la langue Google vers un libellé lisible
+      const langMap = { fr: "Français", en: "Anglais", es: "Espagnol", de: "Allemand", it: "Italien", pt: "Portugais", nl: "Néerlandais", ru: "Russe", ja: "Japonais", zh: "Chinois", ar: "Arabe" };
       return {
         title: item.title || "",
+        subtitle: item.subtitle || "",
         author: (item.authors || []).join(", "),
         cover,
         publisher: item.publisher || "",
         year: item.publishedDate || "",
+        // === NOUVEAUX CHAMPS ===
+        pages: item.pageCount || 0,
+        language: langMap[item.language] || item.language || "",
+        description: item.description || "",
+        categories: (item.categories || []).join(", "),
+        rating: item.averageRating || 0,
+        ratingsCount: item.ratingsCount || 0,
+        infoLink: item.infoLink || itemRoot?.selfLink || "",
+        // Format physique : Google Books ne le donne pas directement, on en déduit depuis le format si possible
+        format: "",
+        // Dimensions : Google ne les fournit pas dans volumeInfo standard
+        dimensions: "",
+        weight: "",
         source: "Google Books",
       };
     } catch (e) { /* essai suivant */ }
@@ -168,21 +185,74 @@ async function lookupGoogleBooks(isbn) {
 }
 
 // Open Library — bonne pour livres anglo-saxons et anciens
+// On utilise jscmd=data pour les métadonnées de base + jscmd=details pour le complément
 async function lookupOpenLibrary(isbn) {
   try {
-    const res = await fetchWithTimeout(
-      `https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
+    // jscmd=data : info synthétisée (titre, auteur, etc.)
+    // jscmd=details : record bibliographique brut (pagination, physical format, dimensions...)
+    const [resData, resDetails] = await Promise.all([
+      fetchWithTimeout(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`),
+      fetchWithTimeout(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=details`),
+    ]);
+    const data = resData.ok ? await resData.json() : {};
+    const detailsData = resDetails.ok ? await resDetails.json() : {};
     const book = data[`ISBN:${isbn}`];
-    if (!book) return null;
+    const details = detailsData[`ISBN:${isbn}`]?.details || {};
+    if (!book && !details.title) return null;
+    const main = book || {};
+
+    // Description : peut être string ou {value: string} dans details
+    let description = "";
+    if (typeof details.description === "string") description = details.description;
+    else if (details.description?.value) description = details.description.value;
+    if (!description && main.notes) {
+      description = typeof main.notes === "string" ? main.notes : (main.notes.value || "");
+    }
+
+    // Catégories / sujets
+    const categories = (main.subjects || details.subjects || [])
+      .slice(0, 6)
+      .map((s) => typeof s === "string" ? s : s.name)
+      .filter(Boolean)
+      .join(", ");
+
+    // Pages
+    const pages = details.number_of_pages || main.number_of_pages || 0;
+
+    // Format physique
+    const format = details.physical_format || main.physical_format || "";
+
+    // Dimensions
+    const dimensions = details.physical_dimensions || "";
+    const weight = details.weight || "";
+
+    // Langue
+    const langMap = { fre: "Français", fra: "Français", eng: "Anglais", spa: "Espagnol", ger: "Allemand", deu: "Allemand", ita: "Italien" };
+    let language = "";
+    if (Array.isArray(details.languages) && details.languages.length > 0) {
+      const lkey = details.languages[0]?.key || "";
+      const code = lkey.replace("/languages/", "");
+      language = langMap[code] || code;
+    }
+
     return {
-      title: book.title || "",
-      author: (book.authors || []).map((a) => a.name).join(", "),
-      cover: book.cover?.large || book.cover?.medium || book.cover?.small || "",
-      publisher: book.publishers?.[0]?.name || "",
-      year: book.publish_date || "",
+      title: main.title || details.title || "",
+      subtitle: main.subtitle || details.subtitle || "",
+      author: (main.authors || []).map((a) => a.name).filter(Boolean).join(", "),
+      cover: main.cover?.large || main.cover?.medium || main.cover?.small || "",
+      publisher: main.publishers?.[0]?.name || (Array.isArray(details.publishers) ? details.publishers[0] : "") || "",
+      year: main.publish_date || details.publish_date || "",
+      // === NOUVEAUX CHAMPS ===
+      pages,
+      language,
+      description,
+      categories,
+      rating: 0, // Open Library n'a pas de notes
+      ratingsCount: 0,
+      infoLink: main.url || (details.key ? `https://openlibrary.org${details.key}` : ""),
+      format,
+      dimensions,
+      weight,
       source: "Open Library",
     };
   } catch (e) {
@@ -371,7 +441,22 @@ async function lookupISBN(isbn) {
     return { title: "", author: "", cover: "", source: null, debug };
   }
 
+  // FUSION DES CHAMPS ENRICHIS : prend la première valeur non vide entre Google et Open Library.
+  // Google a souvent description et rating ; Open Library a souvent pages, format, dimensions.
+  const pick = (...vals) => vals.find((v) => v !== undefined && v !== null && v !== "" && v !== 0) ?? "";
+
   chosen.cover = bestCover;
+  chosen.subtitle = pick(google?.subtitle, openLib?.subtitle, "");
+  chosen.pages = pick(openLib?.pages, google?.pages, 0) || 0;
+  chosen.language = pick(google?.language, openLib?.language, "");
+  chosen.description = pick(google?.description, openLib?.description, "");
+  chosen.categories = pick(google?.categories, openLib?.categories, "");
+  chosen.rating = pick(google?.rating, 0) || 0;
+  chosen.ratingsCount = pick(google?.ratingsCount, 0) || 0;
+  chosen.infoLink = pick(google?.infoLink, openLib?.infoLink, "");
+  chosen.format = pick(openLib?.format, google?.format, "");
+  chosen.dimensions = pick(openLib?.dimensions, "");
+  chosen.weight = pick(openLib?.weight, "");
   chosen.debug = debug;
   return chosen;
 }
@@ -700,8 +785,10 @@ export default function App() {
   const findIncompleteBooks = (booksList) => {
     return booksList.filter((b) => {
       if (!isLikelyBookISBN(b.isbn)) return false;
-      // Incomplet si manque au moins un des 3 champs essentiels
-      return !b.title || !b.author || !b.cover;
+      // Incomplet si manque un champ essentiel OU un champ enrichi
+      // (description, pages, langue, catégories — les plus utiles à enrichir)
+      return !b.title || !b.author || !b.cover ||
+             !b.description || !b.pages || !b.language || !b.categories;
     });
   };
 
@@ -733,9 +820,23 @@ export default function App() {
         if (result && (result.title || result.cover)) {
           found++;
           const updates = {};
+          // Ne remplace QUE les champs vides — préserve les éditions manuelles
           if (!book.title && result.title) updates.title = result.title;
           if (!book.author && result.author) updates.author = result.author;
           if (!book.cover && result.cover) updates.cover = result.cover;
+          if (!book.subtitle && result.subtitle) updates.subtitle = result.subtitle;
+          if (!book.pages && result.pages) updates.pages = result.pages;
+          if (!book.language && result.language) updates.language = result.language;
+          if (!book.description && result.description) updates.description = result.description;
+          if (!book.categories && result.categories) updates.categories = result.categories;
+          if (!book.rating && result.rating) updates.rating = result.rating;
+          if (!book.ratingsCount && result.ratingsCount) updates.ratingsCount = result.ratingsCount;
+          if (!book.infoLink && result.infoLink) updates.infoLink = result.infoLink;
+          if (!book.format && result.format) updates.format = result.format;
+          if (!book.dimensions && result.dimensions) updates.dimensions = result.dimensions;
+          if (!book.weight && result.weight) updates.weight = result.weight;
+          if (!book.publisher && result.publisher) updates.publisher = result.publisher;
+          if (!book.year && result.year) updates.year = result.year;
           if (Object.keys(updates).length > 0) {
             updated++;
             setBooks((prev) => {
@@ -1696,6 +1797,21 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
   const [retrying, setRetrying] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
   const [debugInfo, setDebugInfo] = useState(initial._debug || null);
+  // === NOUVEAUX CHAMPS ENRICHIS ===
+  const [subtitle, setSubtitle] = useState(initial.subtitle || "");
+  const [pages, setPages] = useState(initial.pages || "");
+  const [language, setLanguage] = useState(initial.language || "");
+  const [description, setDescription] = useState(initial.description || "");
+  const [categories, setCategories] = useState(initial.categories || "");
+  const [rating, setRating] = useState(initial.rating || 0);
+  const [ratingsCount, setRatingsCount] = useState(initial.ratingsCount || 0);
+  const [infoLink, setInfoLink] = useState(initial.infoLink || "");
+  const [format, setFormat] = useState(initial.format || "");
+  const [dimensions, setDimensions] = useState(initial.dimensions || "");
+  const [weight, setWeight] = useState(initial.weight || "");
+  const [publisher, setPublisher] = useState(initial.publisher || "");
+  const [year, setYear] = useState(initial.year || "");
+  const [showMore, setShowMore] = useState(false);
 
   const handleCoverUpload = (e) => {
     const file = e.target.files?.[0];
@@ -1711,9 +1827,23 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
     try {
       const found = await lookupISBN(isbn.trim());
       setDebugInfo(found?.debug || null);
+      // Ne remplace que si vide localement
       if (found?.title && !title) setTitle(found.title);
       if (found?.author && !author) setAuthor(found.author);
       if (found?.cover && !cover) setCover(found.cover);
+      if (found?.subtitle && !subtitle) setSubtitle(found.subtitle);
+      if (found?.pages && !pages) setPages(found.pages);
+      if (found?.language && !language) setLanguage(found.language);
+      if (found?.description && !description) setDescription(found.description);
+      if (found?.categories && !categories) setCategories(found.categories);
+      if (found?.rating && !rating) setRating(found.rating);
+      if (found?.ratingsCount && !ratingsCount) setRatingsCount(found.ratingsCount);
+      if (found?.infoLink && !infoLink) setInfoLink(found.infoLink);
+      if (found?.format && !format) setFormat(found.format);
+      if (found?.dimensions && !dimensions) setDimensions(found.dimensions);
+      if (found?.weight && !weight) setWeight(found.weight);
+      if (found?.publisher && !publisher) setPublisher(found.publisher);
+      if (found?.year && !year) setYear(found.year);
     } catch (e) { /* ignore */ }
     setRetrying(false);
   };
@@ -1729,6 +1859,20 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
       etagere: parseInt(etagere) || 1,
       position: parseInt(position) || 1,
       notes: notes.trim(),
+      // Champs enrichis (préservés)
+      subtitle: subtitle.trim(),
+      pages: parseInt(pages) || 0,
+      language: language.trim(),
+      description: description.trim(),
+      categories: categories.trim(),
+      rating: parseFloat(rating) || 0,
+      ratingsCount: parseInt(ratingsCount) || 0,
+      infoLink: infoLink.trim(),
+      format: format.trim(),
+      dimensions: dimensions.trim(),
+      weight: weight.trim(),
+      publisher: publisher.trim(),
+      year: year.trim(),
     });
   };
 
@@ -1908,6 +2052,153 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
         </Field>
       </div>
 
+      {/* === SECTION DÉTAILS DÉPLIABLE === */}
+      <div className="border-t pt-3" style={{ borderColor: "var(--parchment)" }}>
+        <button
+          type="button"
+          onClick={() => setShowMore(!showMore)}
+          className="flex items-center justify-between w-full text-left"
+          style={{ color: "var(--leather-dark)" }}
+        >
+          <span className="font-semibold flex items-center gap-2" style={{ fontFamily: "var(--font-display)" }}>
+            <BookOpen className="w-4 h-4" /> Détails du livre
+          </span>
+          <ChevronRight className={`w-5 h-5 transition-transform ${showMore ? "rotate-90" : ""}`} />
+        </button>
+      </div>
+
+      {showMore && (
+        <div className="space-y-3 pl-1">
+          <Field label="Sous-titre">
+            <input
+              value={subtitle}
+              onChange={(e) => setSubtitle(e.target.value)}
+              placeholder="Le sous-titre du livre"
+              className="w-full p-3 rounded-lg border-2 outline-none"
+              style={{ borderColor: "var(--parchment)" }}
+            />
+          </Field>
+
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Pages">
+              <input
+                type="number"
+                value={pages}
+                onChange={(e) => setPages(e.target.value)}
+                placeholder="320"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+            <Field label="Langue">
+              <input
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+                placeholder="Français"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Éditeur">
+              <input
+                value={publisher}
+                onChange={(e) => setPublisher(e.target.value)}
+                placeholder="Gallimard…"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+            <Field label="Année">
+              <input
+                value={year}
+                onChange={(e) => setYear(e.target.value)}
+                placeholder="2020"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+          </div>
+
+          <Field label="Format">
+            <input
+              value={format}
+              onChange={(e) => setFormat(e.target.value)}
+              placeholder="Broché, Poche, Relié…"
+              className="w-full p-3 rounded-lg border-2 outline-none"
+              style={{ borderColor: "var(--parchment)" }}
+            />
+          </Field>
+
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Dimensions">
+              <input
+                value={dimensions}
+                onChange={(e) => setDimensions(e.target.value)}
+                placeholder="20 x 13 cm"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+            <Field label="Poids">
+              <input
+                value={weight}
+                onChange={(e) => setWeight(e.target.value)}
+                placeholder="350 g"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+          </div>
+
+          <Field label="Catégorie / Genre">
+            <input
+              value={categories}
+              onChange={(e) => setCategories(e.target.value)}
+              placeholder="Roman, Science-fiction…"
+              className="w-full p-3 rounded-lg border-2 outline-none"
+              style={{ borderColor: "var(--parchment)" }}
+            />
+          </Field>
+
+          <Field label="Résumé">
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Quelques mots sur le contenu du livre…"
+              rows={4}
+              className="w-full p-3 rounded-lg border-2 outline-none resize-none"
+              style={{ borderColor: "var(--parchment)" }}
+            />
+          </Field>
+
+          {(rating > 0 || ratingsCount > 0) && (
+            <div className="rounded-lg p-3" style={{ background: "var(--parchment)" }}>
+              <div className="text-sm flex items-center justify-between" style={{ color: "var(--ink)" }}>
+                <span>Note Google Books</span>
+                <span style={{ fontFamily: "var(--font-display)", fontWeight: 600 }}>
+                  ⭐ {rating?.toFixed(1)} / 5 ({ratingsCount} avis)
+                </span>
+              </div>
+            </div>
+          )}
+
+          {infoLink && (
+            <a
+              href={infoLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block py-2 px-3 rounded-lg text-sm text-center"
+              style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+            >
+              📖 Voir la fiche complète en ligne
+            </a>
+          )}
+        </div>
+      )}
+
       <Field label="Notes (optionnel)">
         <textarea
           value={notes}
@@ -1969,21 +2260,95 @@ function DetailView({ book, structure, onBack, onEdit, onDelete }) {
         <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)", lineHeight: 1.2 }}>
           {book.title}
         </h2>
+        {book.subtitle && (
+          <p className="text-sm mt-1" style={{ color: "var(--ink-soft)" }}>
+            {book.subtitle}
+          </p>
+        )}
         {book.author && (
           <p className="text-base mt-1 italic" style={{ color: "var(--ink-soft)" }}>
             {book.author}
           </p>
         )}
+        {book.rating > 0 && (
+          <div className="text-sm mt-2 inline-flex items-center gap-1 px-3 py-1 rounded-full"
+            style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}>
+            ⭐ {book.rating.toFixed(1)} / 5
+            {book.ratingsCount > 0 && <span style={{ opacity: 0.7 }}>({book.ratingsCount} avis)</span>}
+          </div>
+        )}
+        {book.categories && (
+          <div className="mt-3 flex flex-wrap justify-center gap-1.5">
+            {book.categories.split(/[,/]/).map((c, i) => c.trim() && (
+              <span key={i} className="px-2 py-0.5 rounded-full text-xs" style={{ background: "var(--parchment)", color: "var(--ink-soft)" }}>
+                {c.trim()}
+              </span>
+            ))}
+          </div>
+        )}
       </div>
 
-      <div className="space-y-3 p-4 rounded-xl" style={{ background: "white", border: "1px solid var(--parchment)" }}>
+      {/* Résumé */}
+      {book.description && (
+        <div className="rounded-xl p-4 mb-4" style={{ background: "white", border: "1px solid var(--parchment)" }}>
+          <h3 className="text-sm font-bold mb-2" style={{ fontFamily: "var(--font-display)", color: "var(--leather-dark)" }}>
+            Résumé
+          </h3>
+          <p className="text-sm leading-relaxed" style={{ color: "var(--ink)", whiteSpace: "pre-wrap" }}>
+            {book.description}
+          </p>
+        </div>
+      )}
+
+      {/* Emplacement */}
+      <div className="space-y-3 p-4 rounded-xl mb-4" style={{ background: "white", border: "1px solid var(--parchment)" }}>
+        <h3 className="text-sm font-bold" style={{ fontFamily: "var(--font-display)", color: "var(--leather-dark)" }}>
+          Emplacement
+        </h3>
         <DetailRow label="Bibliothèque" value={bib?.nom} />
         <DetailRow label="Pièce" value={piece?.nom} />
         <DetailRow label="Étagère" value={book.etagere} suffix=" (du haut)" />
         <DetailRow label="Position" value={book.position} suffix=" (depuis la gauche)" />
-        {book.isbn && <DetailRow label="ISBN" value={book.isbn} />}
-        {book.notes && <DetailRow label="Notes" value={book.notes} />}
       </div>
+
+      {/* Détails bibliographiques */}
+      {(book.pages || book.language || book.format || book.publisher || book.year || book.dimensions || book.weight || book.isbn) && (
+        <div className="space-y-3 p-4 rounded-xl mb-4" style={{ background: "white", border: "1px solid var(--parchment)" }}>
+          <h3 className="text-sm font-bold" style={{ fontFamily: "var(--font-display)", color: "var(--leather-dark)" }}>
+            Détails
+          </h3>
+          {book.pages > 0 && <DetailRow label="Pages" value={book.pages} />}
+          {book.language && <DetailRow label="Langue" value={book.language} />}
+          {book.format && <DetailRow label="Format" value={book.format} />}
+          {book.publisher && <DetailRow label="Éditeur" value={book.publisher} />}
+          {book.year && <DetailRow label="Année" value={book.year} />}
+          {book.dimensions && <DetailRow label="Dimensions" value={book.dimensions} />}
+          {book.weight && <DetailRow label="Poids" value={book.weight} />}
+          {book.isbn && <DetailRow label="ISBN" value={book.isbn} />}
+        </div>
+      )}
+
+      {book.notes && (
+        <div className="space-y-3 p-4 rounded-xl mb-4" style={{ background: "white", border: "1px solid var(--parchment)" }}>
+          <h3 className="text-sm font-bold" style={{ fontFamily: "var(--font-display)", color: "var(--leather-dark)" }}>
+            Notes personnelles
+          </h3>
+          <p className="text-sm" style={{ color: "var(--ink)", whiteSpace: "pre-wrap" }}>{book.notes}</p>
+        </div>
+      )}
+
+      {/* Lien externe */}
+      {book.infoLink && (
+        <a
+          href={book.infoLink}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="block w-full py-3 rounded-xl text-center font-medium mb-4"
+          style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+        >
+          📖 Voir la fiche complète en ligne
+        </a>
+      )}
 
       <div className="flex gap-3 mt-6">
         <button
@@ -2265,26 +2630,34 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
       try {
         const found = await lookupISBN(isbn);
         if (found && (found.title || found.cover)) {
+          const enrichedFields = {
+            title: found.title || "",
+            author: found.author || "",
+            cover: found.cover || "",
+            subtitle: found.subtitle || "",
+            pages: found.pages || 0,
+            language: found.language || "",
+            description: found.description || "",
+            categories: found.categories || "",
+            rating: found.rating || 0,
+            ratingsCount: found.ratingsCount || 0,
+            infoLink: found.infoLink || "",
+            format: found.format || "",
+            dimensions: found.dimensions || "",
+            weight: found.weight || "",
+            publisher: found.publisher || "",
+            year: found.year || "",
+          };
           // Met à jour le placeholder via une fonction utilitaire injectée par le parent
           if (typeof onEnrichBook === "function") {
-            onEnrichBook(placeholderId, {
-              title: found.title || "",
-              author: found.author || "",
-              cover: found.cover || "",
-            });
+            onEnrichBook(placeholderId, enrichedFields);
           }
           // Met aussi à jour notre vue locale
           setLastBook((curr) =>
-            curr?._placeholderId === placeholderId
-              ? { ...curr, title: found.title || "", author: found.author || "", cover: found.cover || "" }
-              : curr
+            curr?._placeholderId === placeholderId ? { ...curr, ...enrichedFields } : curr
           );
           setBatchHistory((h) =>
-            h.map((b) =>
-              b._placeholderId === placeholderId
-                ? { ...b, title: found.title || "", author: found.author || "", cover: found.cover || "" }
-                : b
-            )
+            h.map((b) => b._placeholderId === placeholderId ? { ...b, ...enrichedFields } : b)
           );
         }
       } catch (e) { /* ignore */ }
