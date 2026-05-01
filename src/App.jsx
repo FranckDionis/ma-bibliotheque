@@ -240,51 +240,49 @@ async function findCoverFor(isbn) {
   const cleanIsbn = isbn.replace(/\D/g, "");
   const isbn10 = cleanIsbn.length === 13 ? isbn13ToIsbn10(cleanIsbn) : (cleanIsbn.length === 10 ? cleanIsbn : null);
 
-  // Liste des candidats, par ordre de qualité d'image attendue
-  const candidates = [
-    // Open Library — gratuit, souvent peu fourni en livres FR mais fiable
-    `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-L.jpg?default=false`,
-    // Google Books "content" via vid — fonctionne souvent même quand l'API JSON ne renvoie rien
-    `https://books.google.com/books/content?vid=ISBN${cleanIsbn}&printsec=frontcover&img=1&zoom=1`,
-    `https://books.google.com/books/content?vid=ISBN${cleanIsbn}&printsec=frontcover&img=1&zoom=0`,
-    // Open Library taille moyenne (fallback)
-    `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-M.jpg?default=false`,
-  ];
+  // SOURCES ORDONNÉES PAR FIABILITÉ (de la plus fiable à la moins).
+  // On essaie en SÉQUENCE et on prend la première qui marche.
+  // Justification : Google Books "vid:ISBN" renvoie souvent un placeholder gris OU
+  // une image d'une autre édition portant des mots-clés similaires (couvertures
+  // mélangées). On l'a donc retiré ici. Seul Google Books via l'API JSON
+  // (lookupGoogleBooks) est conservé, car il identifie un volume précis.
+  const sources = [];
 
-  // Amazon : excellent pour le fonds FR, nécessite ISBN-10
+  // 1) Open Library — fiable, l'image correspond strictement à l'ISBN
+  sources.push({
+    name: "Open Library",
+    url: `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-L.jpg?default=false`,
+  });
+
+  // 2) Amazon ISBN-10 — excellent sur le fonds FR, image strictement liée à l'ISBN
   if (isbn10) {
-    // Variantes — Amazon a plusieurs sous-domaines/CDN
-    candidates.push(
-      `https://images-na.ssl-images-amazon.com/images/P/${isbn10}.01._SCLZZZZZZZ_.jpg`,
-      `https://images-na.ssl-images-amazon.com/images/P/${isbn10}.jpg`,
-      `https://m.media-amazon.com/images/P/${isbn10}.jpg`,
-    );
+    sources.push({
+      name: "Amazon (large)",
+      url: `https://images-na.ssl-images-amazon.com/images/P/${isbn10}.01._SCLZZZZZZZ_.jpg`,
+    });
+    sources.push({
+      name: "Amazon (default)",
+      url: `https://images-na.ssl-images-amazon.com/images/P/${isbn10}.jpg`,
+    });
+    sources.push({
+      name: "Amazon (m.media)",
+      url: `https://m.media-amazon.com/images/P/${isbn10}.jpg`,
+    });
   }
 
-  // On lance tout en parallèle et on prend le premier OK
-  const probes = candidates.map(async (url) => {
-    const ok = await probeImageUrl(url, 5000, 60);
-    return ok ? url : null;
+  // 3) Open Library taille M (fallback si la L n'est pas dispo)
+  sources.push({
+    name: "Open Library (M)",
+    url: `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-M.jpg?default=false`,
   });
 
-  // Promise.any-like : retourne le premier non-null
-  // (Promise.any natif filtre les rejets, ici on a des null donc on fait à la main)
-  return new Promise((resolve) => {
-    let pending = probes.length;
-    let resolved = false;
-    probes.forEach((p) => {
-      p.then((url) => {
-        if (resolved) return;
-        if (url) {
-          resolved = true;
-          resolve(url);
-        } else if (--pending === 0) {
-          resolved = true;
-          resolve("");
-        }
-      });
-    });
-  });
+  // Test séquentiel : on prend la première qui charge une vraie image
+  for (const s of sources) {
+    if (await probeImageUrl(s.url, 4000, 80)) {
+      return s.url;
+    }
+  }
+  return "";
 }
 
 // Ancienne fonction conservée pour compatibilité — utilise la nouvelle
@@ -345,28 +343,35 @@ async function lookupISBN(isbn) {
     google: google ? `OK (${google.title?.slice(0, 40)})` : "rien",
     openLibrary: openLib ? `OK (${openLib.title?.slice(0, 40)})` : "rien",
     bnf: bnf ? `OK (${bnf.title?.slice(0, 40)})` : "rien",
-    coverFallback: fallbackCover ? `image trouvée (${fallbackCover.includes("amazon") ? "Amazon" : fallbackCover.includes("googleusercontent") || fallbackCover.includes("books.google") ? "Google" : "Open Library"})` : "aucune",
+    coverFallback: fallbackCover ? `image trouvée (${fallbackCover.includes("amazon") ? "Amazon" : "Open Library"})` : "aucune",
   };
 
-  // Préférence : Google (le plus complet sur livres français), Open Library, BnF
+  // Choix du titre/auteur : Google > Open Library > BnF
   let chosen = google || openLib || bnf;
+
+  // CHOIX DE LA COUVERTURE — stratégie révisée :
+  // Les couvertures Google Books sont souvent incohérentes (image d'une autre
+  // édition, ou placeholder gris). On privilégie donc les sources qui lient
+  // strictement l'image à l'ISBN demandé (Open Library, Amazon).
+  // Google Books n'est utilisé qu'en dernier recours.
+  const reliableCover = fallbackCover; // Open Library ou Amazon, vérifié par probeImageUrl
+  const googleCover = google?.cover || ""; // Google Books JSON (peut être incohérent)
+
+  let bestCover = reliableCover || googleCover || openLib?.cover || "";
+
   if (!chosen) {
-    // Aucune source n'a de metadata mais on a peut-être une couverture
-    if (fallbackCover) {
-      return { title: "", author: "", cover: fallbackCover, publisher: "", year: "", source: "Couverture seule", debug };
+    // Aucune métadonnée mais peut-être une couverture
+    if (bestCover) {
+      return {
+        title: "", author: "", cover: bestCover, publisher: "", year: "",
+        source: reliableCover ? "Couverture seule" : "Couverture Google (à vérifier)",
+        debug,
+      };
     }
     return { title: "", author: "", cover: "", source: null, debug };
   }
-  // Si la source choisie n'a pas de couverture, ou si on a une meilleure source
-  // (ex: Google Books donne une thumbnail mini, Amazon donne du grand)
-  if (!chosen.cover) {
-    chosen.cover =
-      google?.cover ||
-      openLib?.cover ||
-      bnf?.cover ||
-      fallbackCover ||
-      "";
-  }
+
+  chosen.cover = bestCover;
   chosen.debug = debug;
   return chosen;
 }
@@ -700,6 +705,16 @@ export default function App() {
     });
   };
 
+  // Détecte les livres dont la couverture vient de Google Books (fiabilité douteuse)
+  // L'URL contient "books.google" ou "googleusercontent" en général.
+  const findBooksWithGoogleCover = (booksList) => {
+    return booksList.filter((b) => {
+      if (!isLikelyBookISBN(b.isbn)) return false;
+      const cov = b.cover || "";
+      return cov.includes("books.google") || cov.includes("googleusercontent");
+    });
+  };
+
   const handleEnrichIncomplete = async () => {
     const candidates = findIncompleteBooks(books);
     if (candidates.length === 0) {
@@ -707,7 +722,7 @@ export default function App() {
       return;
     }
     enrichCancelRef.current = false;
-    setEnrichProgress({ current: 0, total: candidates.length, found: 0, updated: 0 });
+    setEnrichProgress({ current: 0, total: candidates.length, found: 0, updated: 0, mode: "incomplete" });
     let found = 0;
     let updated = 0;
     for (let i = 0; i < candidates.length; i++) {
@@ -717,7 +732,6 @@ export default function App() {
         const result = await lookupISBN(book.isbn);
         if (result && (result.title || result.cover)) {
           found++;
-          // Ne remplace QUE les champs manquants — préserve les éditions manuelles
           const updates = {};
           if (!book.title && result.title) updates.title = result.title;
           if (!book.author && result.author) updates.author = result.author;
@@ -731,9 +745,8 @@ export default function App() {
             });
           }
         }
-      } catch (e) { /* ignore une lookup en échec */ }
-      setEnrichProgress({ current: i + 1, total: candidates.length, found, updated });
-      // Petit délai entre requêtes pour ne pas saturer les API gratuites
+      } catch (e) { /* ignore */ }
+      setEnrichProgress({ current: i + 1, total: candidates.length, found, updated, mode: "incomplete" });
       await new Promise((r) => setTimeout(r, 200));
     }
     const wasCancelled = enrichCancelRef.current;
@@ -743,6 +756,62 @@ export default function App() {
     } else {
       showToast(`Terminé — ${updated} livre${updated > 1 ? "s" : ""} enrichi${updated > 1 ? "s" : ""} sur ${candidates.length}`);
     }
+  };
+
+  // Remplace les couvertures Google Books par des sources plus fiables
+  // (Open Library, Amazon). Ne touche pas si aucune source fiable n'est trouvée.
+  const handleReplaceGoogleCovers = async () => {
+    const candidates = findBooksWithGoogleCover(books);
+    if (candidates.length === 0) {
+      showToast("Aucune couverture Google Books à remplacer");
+      return;
+    }
+    enrichCancelRef.current = false;
+    setEnrichProgress({ current: 0, total: candidates.length, found: 0, updated: 0, mode: "covers" });
+    let updated = 0;
+    let removed = 0;
+    for (let i = 0; i < candidates.length; i++) {
+      if (enrichCancelRef.current) break;
+      const book = candidates[i];
+      try {
+        // findCoverFor ne renvoie QUE Open Library ou Amazon (pas Google)
+        const newCover = await findCoverFor(book.isbn);
+        if (newCover) {
+          updated++;
+          setBooks((prev) => {
+            const next = prev.map((b) => (b.id === book.id ? { ...b, cover: newCover } : b));
+            window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+            return next;
+          });
+        }
+      } catch (e) { /* ignore */ }
+      setEnrichProgress({ current: i + 1, total: candidates.length, found: updated, updated, mode: "covers" });
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    const wasCancelled = enrichCancelRef.current;
+    setEnrichProgress(null);
+    if (wasCancelled) {
+      showToast(`Annulé — ${updated} couverture${updated > 1 ? "s" : ""} remplacée${updated > 1 ? "s" : ""}`);
+    } else {
+      showToast(`Terminé — ${updated} couverture${updated > 1 ? "s" : ""} remplacée${updated > 1 ? "s" : ""} sur ${candidates.length}`);
+    }
+  };
+
+  // Supprime les couvertures Google Books pour repartir de zéro
+  const handleClearGoogleCovers = async () => {
+    const candidates = findBooksWithGoogleCover(books);
+    if (candidates.length === 0) {
+      showToast("Aucune couverture Google Books à supprimer");
+      return;
+    }
+    if (!window.confirm(`Supprimer les ${candidates.length} couverture${candidates.length > 1 ? "s" : ""} Google Books ?\n\nVous pourrez ensuite utiliser "Re-rechercher les livres incomplets" pour les remplacer par Open Library ou Amazon.`)) return;
+    setBooks((prev) => {
+      const ids = new Set(candidates.map((b) => b.id));
+      const next = prev.map((b) => (ids.has(b.id) ? { ...b, cover: "" } : b));
+      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
+    showToast(`${candidates.length} couverture${candidates.length > 1 ? "s" : ""} supprimée${candidates.length > 1 ? "s" : ""}`);
   };
 
   const handleCancelEnrich = () => {
@@ -915,9 +984,12 @@ export default function App() {
           onExport={handleExport}
           onImport={handleImport}
           onEnrichIncomplete={handleEnrichIncomplete}
+          onReplaceGoogleCovers={handleReplaceGoogleCovers}
+          onClearGoogleCovers={handleClearGoogleCovers}
           onCancelEnrich={handleCancelEnrich}
           enrichProgress={enrichProgress}
           incompleteCount={findIncompleteBooks(books).length}
+          googleCoverCount={findBooksWithGoogleCover(books).length}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -3589,9 +3661,12 @@ function SettingsModal({
   onExport,
   onImport,
   onEnrichIncomplete,
+  onReplaceGoogleCovers,
+  onClearGoogleCovers,
   onCancelEnrich,
   enrichProgress,
   incompleteCount,
+  googleCoverCount,
   onClose,
 }) {
   const fileRef = useRef(null);
@@ -3715,6 +3790,36 @@ function SettingsModal({
             </div>
           )}
         </div>
+
+        {/* Section Couvertures Google Books douteuses */}
+        {!enrichProgress && googleCoverCount > 0 && (
+          <div className="mb-4 p-3 rounded-lg" style={{ background: "rgba(212, 167, 44, 0.15)", border: "1px solid var(--gold)" }}>
+            <h4 className="text-sm font-bold mb-1" style={{ color: "var(--leather-dark)", fontFamily: "var(--font-display)" }}>
+              ⚠️ Couvertures Google Books
+            </h4>
+            <p className="text-xs mb-3" style={{ color: "var(--ink)" }}>
+              {googleCoverCount} livre{googleCoverCount > 1 ? "s ont" : " a"} une couverture provenant de Google Books. Ces images sont parfois incohérentes (édition différente, voire mauvais livre). Vous pouvez les remplacer par des sources plus fiables (Open Library, Amazon).
+            </p>
+            <div className="space-y-2">
+              <button
+                onClick={onReplaceGoogleCovers}
+                className="w-full py-2.5 rounded-lg font-medium text-sm flex items-center justify-center gap-1.5"
+                style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+              >
+                <RotateCcw className="w-4 h-4" />
+                Remplacer par sources fiables ({googleCoverCount})
+              </button>
+              <button
+                onClick={onClearGoogleCovers}
+                className="w-full py-2 rounded-lg font-medium text-xs flex items-center justify-center gap-1.5 border-2"
+                style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Supprimer toutes les couvertures Google
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Export */}
         <div className="mb-4">
