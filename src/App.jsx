@@ -1748,11 +1748,36 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
             <BookOpen className="w-8 h-8" style={{ color: "var(--leather)" }} />
           )}
         </div>
-        <label className="flex-1 py-2 px-3 rounded-lg border-2 text-sm text-center cursor-pointer"
-          style={{ borderColor: "var(--parchment)", color: "var(--leather)" }}>
-          <Camera className="w-4 h-4 inline mr-1" /> {cover ? "Changer la couverture" : "Ajouter une photo"}
-          <input type="file" accept="image/*" onChange={handleCoverUpload} className="hidden" />
-        </label>
+        <div className="flex-1 space-y-1.5">
+          <label className="block py-2 px-3 rounded-lg border-2 text-sm text-center cursor-pointer"
+            style={{ borderColor: "var(--parchment)", color: "var(--leather)" }}>
+            <Camera className="w-4 h-4 inline mr-1" /> {cover ? "Changer la couverture" : "Ajouter une photo"}
+            <input type="file" accept="image/*" onChange={handleCoverUpload} className="hidden" />
+          </label>
+          {cover && (
+            <button
+              type="button"
+              onClick={() => setCover("")}
+              className="w-full py-2 px-3 rounded-lg border-2 text-xs text-center"
+              style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
+            >
+              <Trash2 className="w-3.5 h-3.5 inline mr-1" /> Supprimer la couverture
+            </button>
+          )}
+          {(title || isbn) && (
+            <a
+              href={`https://www.google.com/search?tbm=isch&q=${encodeURIComponent(
+                title ? `${title} ${author || ""} couverture livre` : `ISBN ${isbn} couverture`
+              )}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block py-2 px-3 rounded-lg text-xs text-center"
+              style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+            >
+              <Search className="w-3.5 h-3.5 inline mr-1" /> Chercher l'image sur Google
+            </a>
+          )}
+        </div>
       </div>
 
       {/* Aide quand le titre n'a pas été trouvé automatiquement */}
