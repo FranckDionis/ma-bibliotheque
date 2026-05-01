@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload } from "lucide-react";
+import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload, LogOut, Cloud, CloudOff } from "lucide-react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
+import { supabase, isSupabaseConfigured } from "./supabase";
+import AuthScreen from "./AuthScreen";
 
 // === ADAPTATEUR DE STOCKAGE ===
 // Utilise localStorage du navigateur (les données restent sur l'iPhone, dans le navigateur).
@@ -589,6 +591,50 @@ export default function App() {
   const [enrichProgress, setEnrichProgress] = useState(null);
   const enrichCancelRef = useRef(false);
 
+  // === ÉTAT D'AUTHENTIFICATION ===
+  // null = pas encore vérifié | { user, session } = connecté | "skipped" = mode local choisi
+  const [authState, setAuthState] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+
+  // Vérifie la session au démarrage
+  useEffect(() => {
+    if (!isSupabaseConfigured) {
+      // Pas de Supabase configuré → mode local direct
+      setAuthState("skipped");
+      setAuthChecked(true);
+      return;
+    }
+    let mounted = true;
+    (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!mounted) return;
+      if (session) {
+        setAuthState({ session, user: session.user });
+      }
+      setAuthChecked(true);
+    })();
+    // Écoute les changements (déconnexion auto, refresh token...)
+    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!mounted) return;
+      if (session) {
+        setAuthState({ session, user: session.user });
+      } else if (event === "SIGNED_OUT") {
+        setAuthState(null);
+      }
+    });
+    return () => {
+      mounted = false;
+      listener?.subscription?.unsubscribe();
+    };
+  }, []);
+
+  const handleSignOut = async () => {
+    if (!isSupabaseConfigured) return;
+    await supabase.auth.signOut();
+    setAuthState(null);
+    setShowSettings(false);
+  };
+
   // Charge livres + layout + structure depuis le storage persistant au démarrage
   useEffect(() => {
     (async () => {
@@ -919,11 +965,23 @@ export default function App() {
     enrichCancelRef.current = true;
   };
 
-  if (loading) {
+  if (loading || !authChecked) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: "var(--cream)" }}>
-        <Loader2 className="w-8 h-8 animate-spin" style={{ color: "var(--leather)" }} />
+      <div className="min-h-screen flex items-center justify-center" style={{ background: "#f4ecd8" }}>
+        <Loader2 className="w-8 h-8 animate-spin" style={{ color: "#6b3410" }} />
       </div>
+    );
+  }
+
+  // Gate d'authentification : si Supabase est configuré et qu'aucune session
+  // n'est active, on affiche l'écran de connexion. L'utilisateur peut aussi
+  // choisir de "continuer sans compte" — ce qui le bascule en mode local.
+  if (isSupabaseConfigured && authState === null) {
+    return (
+      <AuthScreen
+        onAuthSuccess={(session) => setAuthState({ session, user: session.user })}
+        onSkip={() => setAuthState("skipped")}
+      />
     );
   }
 
@@ -1002,8 +1060,13 @@ export default function App() {
             </h1>
           </div>
           <div className="flex items-center gap-3">
-            <div className="text-xs" style={{ color: "var(--gold-light)", fontFamily: "var(--font-display)" }}>
-              {books.length} {books.length > 1 ? "livres" : "livre"}
+            <div className="text-xs flex items-center gap-1.5" style={{ color: "var(--gold-light)", fontFamily: "var(--font-display)" }}>
+              {isSupabaseConfigured && authState && authState !== "skipped" ? (
+                <Cloud className="w-3.5 h-3.5" title="Connecté à la base partagée" />
+              ) : (
+                <CloudOff className="w-3.5 h-3.5" title="Mode local" />
+              )}
+              <span>{books.length} {books.length > 1 ? "livres" : "livre"}</span>
             </div>
             <button
               onClick={() => setShowSettings(true)}
@@ -1091,6 +1154,9 @@ export default function App() {
           enrichProgress={enrichProgress}
           incompleteCount={findIncompleteBooks(books).length}
           googleCoverCount={findBooksWithGoogleCover(books).length}
+          authState={authState}
+          isSupabaseConfigured={isSupabaseConfigured}
+          onSignOut={handleSignOut}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -4065,6 +4131,9 @@ function SettingsModal({
   enrichProgress,
   incompleteCount,
   googleCoverCount,
+  authState,
+  isSupabaseConfigured,
+  onSignOut,
   onClose,
 }) {
   const fileRef = useRef(null);
@@ -4093,6 +4162,34 @@ function SettingsModal({
             <X className="w-5 h-5" />
           </button>
         </div>
+
+        {/* Compte / Connexion */}
+        {isSupabaseConfigured && (
+          <div className="rounded-lg p-3 mb-4" style={{ background: "rgba(212, 167, 44, 0.12)", border: "1px solid var(--gold)" }}>
+            <h4 className="text-sm font-bold mb-1.5 flex items-center gap-1.5" style={{ color: "var(--leather-dark)", fontFamily: "var(--font-display)" }}>
+              {authState && authState !== "skipped" ? <Cloud className="w-4 h-4" /> : <CloudOff className="w-4 h-4" />}
+              Compte
+            </h4>
+            {authState && authState !== "skipped" ? (
+              <>
+                <p className="text-xs mb-2" style={{ color: "var(--ink)" }}>
+                  Connecté à la base partagée en tant que <strong>{authState.user?.email}</strong>
+                </p>
+                <button
+                  onClick={onSignOut}
+                  className="w-full py-2 rounded-lg text-sm font-medium border-2 flex items-center justify-center gap-1.5"
+                  style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
+                >
+                  <LogOut className="w-4 h-4" /> Se déconnecter
+                </button>
+              </>
+            ) : (
+              <p className="text-xs" style={{ color: "var(--ink)" }}>
+                Mode local — vos données restent sur cet appareil. Pour partager avec la famille, déconnectez-vous puis créez un compte au prochain démarrage.
+              </p>
+            )}
+          </div>
+        )}
 
         {/* Statistiques */}
         <div className="rounded-lg p-3 mb-4" style={{ background: "var(--parchment)" }}>
