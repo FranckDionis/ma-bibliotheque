@@ -122,8 +122,39 @@ export function guessTypeFromBarcode(barcode) {
 }
 
 // ============================================================
-// CONFIGURATION D'AFFICHAGE PAR TYPE
+// RECONNAISSANCE DES REVUES PAR ISSN / PRÉFIXE EAN
 // ============================================================
+// Les revues françaises ont des codes-barres EAN-13 commençant par 977 (préfixe
+// ISSN). Les 7 chiffres suivants forment l'ISSN. Les 3 derniers identifient le
+// numéro spécifique. Pour les jeunesse souvent l'EAN garde un préfixe stable
+// par publication, ce qui permet de reconnaître la revue.
+
+// On extrait l'ISSN d'un code-barres ISSN
+export function extractIssnFromBarcode(barcode) {
+  const clean = (barcode || "").replace(/\D/g, "");
+  if (clean.length !== 13 || !clean.startsWith("977")) return null;
+  // Position 3-9 = 7 chiffres ISSN (sans la clé)
+  return clean.substring(3, 10);
+}
+
+// Cherche dans la base des revues connues si on en reconnaît une via son ISSN
+// ou une partie stable du code-barres. Renvoie l'objet magazine ou null.
+export function recognizeMagazine(barcode) {
+  const issn = extractIssnFromBarcode(barcode);
+  if (!issn) return null;
+
+  // Compare avec les ISSN connus (préfixes courts pour tolérance)
+  for (const mag of KNOWN_MAGAZINES) {
+    if (mag.issnPrefix) {
+      // Format normalisé "0244-3805" → "02443805"
+      const normalizedIssn = mag.issnPrefix.replace(/\D/g, "");
+      if (normalizedIssn && issn.startsWith(normalizedIssn.substring(0, 7))) {
+        return mag;
+      }
+    }
+  }
+  return null;
+}
 // Détermine quels champs afficher dans le formulaire et la fiche détail
 // selon le type d'objet.
 
