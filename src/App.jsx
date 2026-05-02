@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload, LogOut, Cloud, CloudOff } from "lucide-react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
+import { BarcodeFormat, DecodeHintType } from "@zxing/library";
 import { supabase, isSupabaseConfigured } from "./supabase";
 import {
   insertBooksBulk,
@@ -120,6 +121,26 @@ const genId = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).
 // ============================================================
 async function loadZXing() {
   return { BrowserMultiFormatReader };
+}
+
+// Crée un reader ZXing configuré pour les formats de codes-barres produit.
+// On précise explicitement les formats pour que ZXing soit plus rapide et plus
+// fiable sur iOS, notamment pour UPC-A (codes nord-américains 12 chiffres
+// utilisés sur les boîtes Nintendo Switch).
+function createConfiguredReader() {
+  const hints = new Map();
+  const formats = [
+    BarcodeFormat.EAN_13,    // Livres (978/979), revues, jeux européens
+    BarcodeFormat.EAN_8,     // Petits codes
+    BarcodeFormat.UPC_A,     // Jeux Nintendo US, produits américains
+    BarcodeFormat.UPC_E,     // Variante compacte UPC
+    BarcodeFormat.CODE_128,  // Au cas où certaines boîtes en utilisent
+    BarcodeFormat.CODE_39,
+  ];
+  hints.set(DecodeHintType.POSSIBLE_FORMATS, formats);
+  // TRY_HARDER : ZXing prend un peu plus de CPU mais lit mieux les codes mal cadrés
+  hints.set(DecodeHintType.TRY_HARDER, true);
+  return new BrowserMultiFormatReader(hints);
 }
 
 // ============================================================
@@ -491,7 +512,7 @@ async function createBarcodeReader() {
   // Tentative ZXing en priorité (fonctionne sur Safari iOS)
   try {
     const ZX = await loadZXing();
-    const reader = new ZX.BrowserMultiFormatReader();
+    const reader = createConfiguredReader();
     let controls = null;
     let stream = null;
     return {
@@ -2105,12 +2126,12 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
 
       // Test 6: Démarrer ZXing sur la vidéo déjà active
       try {
-        const reader = new ZX.BrowserMultiFormatReader();
+        const reader = createConfiguredReader();
         const controls = reader.decodeFromVideoElement(videoRef.current, (result) => {
           if (result) {
             const code = result.getText();
-            // Accepte tout EAN-13 (livre, revue, jeu, produit) ou ISBN-10
-            if (!/^(\d{13}|\d{10})$/.test(code)) return;
+            // Accepte tout EAN-13, EAN-12 (UPC-A), EAN-11 ou ISBN-10
+            if (!/^\d{10,13}$/.test(code)) return;
             if (fired.current) return;
             fired.current = true;
             try { controls.stop(); } catch (e) {}
@@ -2529,22 +2550,33 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
         </div>
       )}
 
-      {/* Indicateur de type sélectionné (lecture seule, le type vient de la sélection initiale) */}
-      <div className="flex items-center gap-2 px-3 py-2 rounded-lg" style={{ background: "var(--parchment)" }}>
-        <span style={{ fontSize: "1.2rem" }}>{ITEM_TYPES[type]?.emoji}</span>
-        <span className="text-sm font-medium" style={{ color: "var(--leather-dark)" }}>
-          {ITEM_TYPES[type]?.label}
-        </span>
-        {type !== "livre" && (
-          <button
-            type="button"
-            onClick={() => setType("livre")}
-            className="ml-auto text-xs px-2 py-1 rounded"
-            style={{ background: "white", color: "var(--leather)" }}
-          >
-            Changer
-          </button>
-        )}
+      {/* Sélecteur de type — modifiable à tout moment */}
+      <div className="space-y-1.5">
+        <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>
+          Type d'objet
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          {ITEM_TYPES_LIST.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => {
+                setType(t.id);
+                // Pré-remplit la plateforme pour les jeux Switch
+                if (t.id === "jeu-switch" && !platform) setPlatform("Nintendo Switch");
+              }}
+              className="p-2 rounded-lg border-2 flex items-center gap-2 text-left transition-all"
+              style={{
+                background: type === t.id ? t.color : "white",
+                borderColor: type === t.id ? t.color : "var(--parchment)",
+                color: type === t.id ? "var(--cream)" : "var(--ink)",
+              }}
+            >
+              <span style={{ fontSize: "1.1rem" }}>{t.emoji}</span>
+              <span className="text-xs font-medium leading-tight">{t.label}</span>
+            </button>
+          ))}
+        </div>
       </div>
 
       <Field label={`${fields.titleLabel} *`}>
@@ -3331,8 +3363,8 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
         return;
       }
       await reader.startScanning(videoRef.current, (code) => {
-        // Accepte tout EAN-13 (livre, revue, jeu, produit) ou ISBN-10
-        if (!/^(\d{13}|\d{10})$/.test(code)) return;
+        // Accepte tout EAN-13, UPC-A (12 chiffres), ou ISBN-10
+        if (!/^\d{10,13}$/.test(code)) return;
         if (phaseRef.current === "paused") return;
         const now = Date.now();
         if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
@@ -3377,8 +3409,8 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
         readerRef.current = reader;
         if (!videoRef.current) return;
         await reader.startScanning(videoRef.current, (code) => {
-          // Accepte tout EAN-13 (livre, revue, jeu, produit) ou ISBN-10
-          if (!/^(\d{13}|\d{10})$/.test(code)) return;
+          // Accepte tout EAN-13, UPC-A (12 chiffres), ou ISBN-10
+          if (!/^\d{10,13}$/.test(code)) return;
           if (phaseRef.current === "paused") return;
           const now = Date.now();
           if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
