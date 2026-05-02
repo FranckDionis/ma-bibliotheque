@@ -17,6 +17,7 @@ import {
   subscribeToLayout,
 } from "./db";
 import AuthScreen from "./AuthScreen";
+import { ITEM_TYPES, ITEM_TYPES_LIST, guessTypeFromBarcode, FIELDS_BY_TYPE } from "./itemTypes";
 
 // === ADAPTATEUR DE STOCKAGE ===
 // Utilise localStorage du navigateur (les données restent sur l'iPhone, dans le navigateur).
@@ -649,6 +650,12 @@ export default function App() {
     setShowSettings(false);
   };
 
+  // Drapeau qui dit "je suis en train d'écrire structure ou layout, ignore les
+  // événements realtime pendant ce temps". Évite que le realtime écrase notre
+  // propre changement avec une version périmée.
+  const writingStructureRef = useRef(false);
+  const writingLayoutRef = useRef(false);
+
   // === MODE ACTIF ===
   // isCloudMode = true si l'utilisateur est connecté et que Supabase est disponible.
   // Toutes les fonctions de données vérifient ce booléen pour décider d'utiliser
@@ -743,6 +750,7 @@ export default function App() {
     });
 
     const structSub = subscribeToStructure(async () => {
+      if (writingStructureRef.current) return; // notre propre écriture, on ignore
       try {
         const fresh = await fetchStructureRemote();
         if (fresh) setStructure(fresh);
@@ -750,6 +758,7 @@ export default function App() {
     });
 
     const layoutSub = subscribeToLayout(async () => {
+      if (writingLayoutRef.current) return; // notre propre écriture, on ignore
       try {
         const fresh = await fetchLayoutRemote();
         if (fresh) {
@@ -771,10 +780,14 @@ export default function App() {
   const saveLayout = async (newLayout) => {
     setLayout(newLayout);
     if (isCloudMode) {
+      writingLayoutRef.current = true;
       try {
         await saveLayoutRemote(newLayout);
       } catch (e) {
         showToast("Erreur de sauvegarde de la disposition", "error");
+      } finally {
+        // Petit délai pour laisser passer l'écho realtime de notre propre écriture
+        setTimeout(() => { writingLayoutRef.current = false; }, 1500);
       }
     } else {
       try {
@@ -788,10 +801,14 @@ export default function App() {
   const saveStructure = async (newStructure) => {
     setStructure(newStructure);
     if (isCloudMode) {
+      writingStructureRef.current = true;
       try {
         await saveStructureRemote(newStructure);
       } catch (e) {
         showToast("Erreur de sauvegarde de la structure", "error");
+      } finally {
+        // Petit délai pour laisser passer l'écho realtime de notre propre écriture
+        setTimeout(() => { writingStructureRef.current = false; }, 1500);
       }
     } else {
       try {
@@ -1672,29 +1689,33 @@ function AddView({ structure, onCancel, onAdd, onEnrichBook, showToast }) {
   const [scannedData, setScannedData] = useState(null);
   const [searching, setSearching] = useState(false);
   const [batchSetup, setBatchSetup] = useState(null);
+  const [selectedType, setSelectedType] = useState("livre");
 
   const handleISBNFound = async (isbn) => {
     setSearching(true);
-    showToast("Recherche du livre…");
+    showToast("Recherche…");
+    // Devine le type d'objet d'après le format du code-barres
+    const detectedType = guessTypeFromBarcode(isbn);
     try {
       const found = await lookupISBN(isbn);
+      const baseData = { isbn, type: detectedType };
       if (found && found.title) {
-        setScannedData({ ...found, isbn });
+        setScannedData({ ...found, ...baseData });
         showToast(`Trouvé via ${found.source}`);
         setMode("form");
       } else if (found && found.cover) {
-        // On a au moins une couverture
-        setScannedData({ isbn, cover: found.cover, _debug: found.debug });
+        setScannedData({ ...baseData, cover: found.cover, _debug: found.debug });
         showToast("Couverture trouvée — complétez le titre", "error");
         setMode("form");
       } else {
-        setScannedData({ isbn, _debug: found?.debug });
-        showToast("Livre non trouvé, complétez à la main", "error");
+        setScannedData({ ...baseData, _debug: found?.debug });
+        const typeLabel = ITEM_TYPES[detectedType]?.label || "Objet";
+        showToast(`${typeLabel} non trouvé, complétez à la main`, "error");
         setMode("form");
       }
     } catch (e) {
       showToast("Connexion impossible, saisie manuelle", "error");
-      setScannedData({ isbn });
+      setScannedData({ isbn, type: detectedType });
       setMode("form");
     }
     setSearching(false);
@@ -1708,34 +1729,110 @@ function AddView({ structure, onCancel, onAdd, onEnrichBook, showToast }) {
 
       {mode === "choice" && (
         <div className="space-y-3 pt-4">
-          <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)", marginBottom: "1.5rem" }}>
-            Ajouter un livre
+          <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)", marginBottom: "0.5rem" }}>
+            Ajouter un objet
           </h2>
-          <ChoiceCard
-            icon={<Zap className="w-6 h-6" />}
-            title="Scan rapide en série"
-            desc="Toute une étagère d'un coup, de gauche à droite"
-            onClick={() => setMode("batch-setup")}
-            highlight
-          />
-          <ChoiceCard
-            icon={<ScanLine className="w-6 h-6" />}
-            title="Scanner le code-barres"
-            desc="Un seul livre via son ISBN"
-            onClick={() => setMode("barcode")}
-          />
-          <ChoiceCard
-            icon={<Camera className="w-6 h-6" />}
-            title="Photo de la couverture"
-            desc="Prenez la couverture en photo"
-            onClick={() => setMode("cover")}
-          />
-          <ChoiceCard
-            icon={<Edit2 className="w-6 h-6" />}
-            title="Saisie manuelle"
-            desc="Entrez les informations à la main"
-            onClick={() => { setScannedData({}); setMode("form"); }}
-          />
+
+          {/* Sélecteur de type */}
+          <div className="grid grid-cols-2 gap-2 mb-4">
+            {ITEM_TYPES_LIST.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => setSelectedType(t.id)}
+                className="p-3 rounded-xl border-2 flex items-center gap-2 text-left transition-all"
+                style={{
+                  background: selectedType === t.id ? t.color : "white",
+                  borderColor: selectedType === t.id ? t.color : "var(--parchment)",
+                  color: selectedType === t.id ? "var(--cream)" : "var(--ink)",
+                }}
+              >
+                <span style={{ fontSize: "1.4rem" }}>{t.emoji}</span>
+                <span className="text-sm font-medium leading-tight">{t.label}</span>
+              </button>
+            ))}
+          </div>
+
+          {/* Options d'ajout — varient selon le type sélectionné */}
+          {selectedType === "livre" && (
+            <>
+              <ChoiceCard
+                icon={<Zap className="w-6 h-6" />}
+                title="Scan rapide en série"
+                desc="Toute une étagère d'un coup, de gauche à droite"
+                onClick={() => setMode("batch-setup")}
+                highlight
+              />
+              <ChoiceCard
+                icon={<ScanLine className="w-6 h-6" />}
+                title="Scanner le code-barres"
+                desc="Un seul livre via son ISBN"
+                onClick={() => setMode("barcode")}
+              />
+              <ChoiceCard
+                icon={<Camera className="w-6 h-6" />}
+                title="Photo de la couverture"
+                desc="Prenez la couverture en photo"
+                onClick={() => setMode("cover")}
+              />
+              <ChoiceCard
+                icon={<Edit2 className="w-6 h-6" />}
+                title="Saisie manuelle"
+                desc="Entrez les informations à la main"
+                onClick={() => { setScannedData({ type: "livre" }); setMode("form"); }}
+              />
+            </>
+          )}
+
+          {selectedType === "revue" && (
+            <>
+              <ChoiceCard
+                icon={<ScanLine className="w-6 h-6" />}
+                title="Scanner le code-barres"
+                desc="L'app reconnaît la revue, vous saisissez le n°"
+                onClick={() => setMode("barcode")}
+              />
+              <ChoiceCard
+                icon={<Camera className="w-6 h-6" />}
+                title="Photo de la couverture"
+                desc="Photographiez la une"
+                onClick={() => setMode("cover")}
+              />
+              <ChoiceCard
+                icon={<Edit2 className="w-6 h-6" />}
+                title="Saisie manuelle"
+                desc="Tapez le titre, le numéro, la date"
+                onClick={() => { setScannedData({ type: "revue" }); setMode("form"); }}
+              />
+            </>
+          )}
+
+          {(selectedType === "jeu-societe" || selectedType === "jeu-switch") && (
+            <>
+              <ChoiceCard
+                icon={<ScanLine className="w-6 h-6" />}
+                title="Scanner le code-barres"
+                desc="Sur la boîte du jeu — souvent reconnu"
+                onClick={() => setMode("barcode")}
+              />
+              <ChoiceCard
+                icon={<Camera className="w-6 h-6" />}
+                title="Photo de la boîte"
+                desc="Prenez la couverture en photo"
+                onClick={() => setMode("cover")}
+              />
+              <ChoiceCard
+                icon={<Edit2 className="w-6 h-6" />}
+                title="Saisie manuelle"
+                desc="Nom du jeu, nombre de joueurs, durée…"
+                onClick={() => {
+                  const initial = { type: selectedType };
+                  if (selectedType === "jeu-switch") initial.platform = "Nintendo Switch";
+                  setScannedData(initial);
+                  setMode("form");
+                }}
+              />
+            </>
+          )}
         </div>
       )}
 
@@ -3357,90 +3454,107 @@ function LibraryView({ books, structure, saveStructure, saveBooks, layout, saveL
   }, {});
 
   // === ACTIONS CRUD ===
+  // On utilise un "mutator" qui prend l'état actuel et retourne le nouvel état.
+  // Cela garantit qu'on travaille toujours sur la version la plus récente,
+  // même si plusieurs opérations s'enchaînent rapidement.
+  const mutateStructure = (mutator) => {
+    // Calcule le nouvel état à partir de la dernière prop reçue.
+    // Note : structure est la prop, donc à jour à chaque render.
+    return saveStructure(mutator(structure));
+  };
+
   const savePiece = async (piece) => {
-    let newPieces;
-    if (piece.id) {
-      // Modification
-      newPieces = structure.pieces.map((p) => (p.id === piece.id ? piece : p));
-    } else {
-      // Création
-      const newPiece = { ...piece, id: genId("piece") };
-      newPieces = [...structure.pieces, newPiece];
-    }
-    await saveStructure({ ...structure, pieces: newPieces });
+    await mutateStructure((curr) => {
+      let newPieces;
+      if (piece.id) {
+        newPieces = curr.pieces.map((p) => (p.id === piece.id ? piece : p));
+      } else {
+        const newPiece = { ...piece, id: genId("piece") };
+        newPieces = [...curr.pieces, newPiece];
+      }
+      return { ...curr, pieces: newPieces };
+    });
     setEditingPiece(null);
     showToast(piece.id ? "Pièce modifiée" : "Pièce ajoutée");
   };
 
   const deletePiece = async (pieceId) => {
-    // Trouver les bibliothèques de cette pièce
     const bibsToRemove = structure.bibliotheques.filter((b) => b.pieceId === pieceId).map((b) => b.id);
-    const newPieces = structure.pieces.filter((p) => p.id !== pieceId);
-    const newBibs = structure.bibliotheques.filter((b) => b.pieceId !== pieceId);
-    const newEtageres = structure.etageres.filter((e) => !bibsToRemove.includes(e.bibId));
-    // Détacher les livres de ces bibliothèques (orphelins -> bibliotheque vide)
+    await mutateStructure((curr) => ({
+      pieces: curr.pieces.filter((p) => p.id !== pieceId),
+      bibliotheques: curr.bibliotheques.filter((b) => b.pieceId !== pieceId),
+      etageres: curr.etageres.filter((e) => !bibsToRemove.includes(e.bibId)),
+    }));
+    // Détacher les livres de ces bibliothèques
     const newBooks = books.map((bk) =>
       bibsToRemove.includes(bk.bibliotheque) ? { ...bk, bibliotheque: "" } : bk
     );
-    await saveStructure({ pieces: newPieces, bibliotheques: newBibs, etageres: newEtageres });
     await saveBooks(newBooks);
     setConfirmDelete(null);
     showToast("Pièce supprimée");
   };
 
   const saveBib = async (bib) => {
-    let newBibs, newEtageres = structure.etageres;
-    if (bib.id) {
-      newBibs = structure.bibliotheques.map((b) => (b.id === bib.id ? bib : b));
-    } else {
-      const newBib = { ...bib, id: genId("bib") };
-      newBibs = [...structure.bibliotheques, newBib];
-      // Créer 4 étagères par défaut
-      const newEt = [1, 2, 3, 4].map((n) => ({
-        id: `${newBib.id}-e${n}`,
-        bibId: newBib.id,
-        num: n,
-        nom: "",
-      }));
-      newEtageres = [...structure.etageres, ...newEt];
-    }
-    await saveStructure({ ...structure, bibliotheques: newBibs, etageres: newEtageres });
+    let newId = null;
+    await mutateStructure((curr) => {
+      let newBibs, newEtageres = curr.etageres;
+      if (bib.id) {
+        newBibs = curr.bibliotheques.map((b) => (b.id === bib.id ? bib : b));
+      } else {
+        const newBib = { ...bib, id: genId("bib") };
+        newId = newBib.id;
+        newBibs = [...curr.bibliotheques, newBib];
+        const newEt = [1, 2, 3, 4].map((n) => ({
+          id: `${newBib.id}-e${n}`,
+          bibId: newBib.id,
+          num: n,
+          nom: "",
+        }));
+        newEtageres = [...curr.etageres, ...newEt];
+      }
+      return { ...curr, bibliotheques: newBibs, etageres: newEtageres };
+    });
     setEditingBib(null);
     showToast(bib.id ? "Bibliothèque modifiée" : "Bibliothèque ajoutée");
   };
 
   const deleteBib = async (bibId) => {
-    const newBibs = structure.bibliotheques.filter((b) => b.id !== bibId);
-    const newEtageres = structure.etageres.filter((e) => e.bibId !== bibId);
+    await mutateStructure((curr) => ({
+      ...curr,
+      bibliotheques: curr.bibliotheques.filter((b) => b.id !== bibId),
+      etageres: curr.etageres.filter((e) => e.bibId !== bibId),
+    }));
     const newBooks = books.map((bk) =>
       bk.bibliotheque === bibId ? { ...bk, bibliotheque: "" } : bk
     );
-    await saveStructure({ ...structure, bibliotheques: newBibs, etageres: newEtageres });
     await saveBooks(newBooks);
     setConfirmDelete(null);
     showToast("Bibliothèque supprimée");
   };
 
   const saveShelf = async (shelf) => {
-    let newEtageres;
-    if (shelf.id) {
-      newEtageres = structure.etageres.map((e) => (e.id === shelf.id ? shelf : e));
-    } else {
-      const newShelf = { ...shelf, id: genId("etag") };
-      newEtageres = [...structure.etageres, newShelf];
-    }
-    await saveStructure({ ...structure, etageres: newEtageres });
+    await mutateStructure((curr) => {
+      let newEtageres;
+      if (shelf.id) {
+        newEtageres = curr.etageres.map((e) => (e.id === shelf.id ? shelf : e));
+      } else {
+        const newShelf = { ...shelf, id: genId("etag") };
+        newEtageres = [...curr.etageres, newShelf];
+      }
+      return { ...curr, etageres: newEtageres };
+    });
     setEditingShelf(null);
     showToast(shelf.id ? "Étagère modifiée" : "Étagère ajoutée");
   };
 
   const deleteShelf = async (shelf) => {
-    const newEtageres = structure.etageres.filter((e) => e.id !== shelf.id);
-    // Détacher les livres de cette étagère
+    await mutateStructure((curr) => ({
+      ...curr,
+      etageres: curr.etageres.filter((e) => e.id !== shelf.id),
+    }));
     const newBooks = books.map((bk) =>
       (bk.bibliotheque === shelf.bibId && bk.etagere === shelf.num) ? { ...bk, etagere: 0 } : bk
     );
-    await saveStructure({ ...structure, etageres: newEtageres });
     await saveBooks(newBooks);
     setConfirmDelete(null);
     showToast("Étagère supprimée");
