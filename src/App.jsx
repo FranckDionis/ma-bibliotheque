@@ -2109,7 +2109,8 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
         const controls = reader.decodeFromVideoElement(videoRef.current, (result) => {
           if (result) {
             const code = result.getText();
-            if (!/^(97[89]\d{10}|\d{10})$/.test(code)) return;
+            // Accepte tout EAN-13 (livre, revue, jeu, produit) ou ISBN-10
+            if (!/^(\d{13}|\d{10})$/.test(code)) return;
             if (fired.current) return;
             fired.current = true;
             try { controls.stop(); } catch (e) {}
@@ -3330,7 +3331,8 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
         return;
       }
       await reader.startScanning(videoRef.current, (code) => {
-        if (!/^(97[89]\d{10}|\d{10})$/.test(code)) return;
+        // Accepte tout EAN-13 (livre, revue, jeu, produit) ou ISBN-10
+        if (!/^(\d{13}|\d{10})$/.test(code)) return;
         if (phaseRef.current === "paused") return;
         const now = Date.now();
         if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
@@ -3375,7 +3377,8 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
         readerRef.current = reader;
         if (!videoRef.current) return;
         await reader.startScanning(videoRef.current, (code) => {
-          if (!/^(97[89]\d{10}|\d{10})$/.test(code)) return;
+          // Accepte tout EAN-13 (livre, revue, jeu, produit) ou ISBN-10
+          if (!/^(\d{13}|\d{10})$/.test(code)) return;
           if (phaseRef.current === "paused") return;
           const now = Date.now();
           if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
