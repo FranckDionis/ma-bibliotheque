@@ -212,29 +212,32 @@ function dbToBook(row) {
 }
 
 function bookToDb(book) {
-  const out = {
-    isbn: book.isbn || null,
-    title: book.title || null,
-    subtitle: book.subtitle || null,
-    author: book.author || null,
-    cover: book.cover || null,
-    bibliotheque: book.bibliotheque || null,
-    etagere: typeof book.etagere === "number" ? book.etagere : parseInt(book.etagere) || 1,
-    position: typeof book.position === "number" ? book.position : parseInt(book.position) || 1,
-    notes: book.notes || null,
-    pages: book.pages ? parseInt(book.pages) : null,
-    language: book.language || null,
-    description: book.description || null,
-    categories: book.categories || null,
-    rating: book.rating ? parseFloat(book.rating) : null,
-    ratings_count: book.ratingsCount ? parseInt(book.ratingsCount) : null,
-    info_link: book.infoLink || null,
-    format: book.format || null,
-    dimensions: book.dimensions || null,
-    weight: book.weight || null,
-    publisher: book.publisher || null,
-    year: book.year || null,
-  };
+  // IMPORTANT : on ne mappe QUE les champs présents dans l'objet d'entrée.
+  // Si on faisait `isbn: book.isbn || null` pour un patch comme {cover: "..."},
+  // tous les autres champs seraient mis à NULL et écraseraient la base.
+  const out = {};
+  // Mapping camelCase → snake_case + écriture seulement si la clé existe dans l'objet
+  if ("isbn" in book) out.isbn = book.isbn || null;
+  if ("title" in book) out.title = book.title || null;
+  if ("subtitle" in book) out.subtitle = book.subtitle || null;
+  if ("author" in book) out.author = book.author || null;
+  if ("cover" in book) out.cover = book.cover || null;
+  if ("bibliotheque" in book) out.bibliotheque = book.bibliotheque || null;
+  if ("etagere" in book) out.etagere = typeof book.etagere === "number" ? book.etagere : parseInt(book.etagere) || 1;
+  if ("position" in book) out.position = typeof book.position === "number" ? book.position : parseInt(book.position) || 1;
+  if ("notes" in book) out.notes = book.notes || null;
+  if ("pages" in book) out.pages = book.pages ? parseInt(book.pages) : null;
+  if ("language" in book) out.language = book.language || null;
+  if ("description" in book) out.description = book.description || null;
+  if ("categories" in book) out.categories = book.categories || null;
+  if ("rating" in book) out.rating = book.rating ? parseFloat(book.rating) : null;
+  if ("ratingsCount" in book) out.ratings_count = book.ratingsCount ? parseInt(book.ratingsCount) : null;
+  if ("infoLink" in book) out.info_link = book.infoLink || null;
+  if ("format" in book) out.format = book.format || null;
+  if ("dimensions" in book) out.dimensions = book.dimensions || null;
+  if ("weight" in book) out.weight = book.weight || null;
+  if ("publisher" in book) out.publisher = book.publisher || null;
+  if ("year" in book) out.year = book.year || null;
   // Si c'est une mise à jour partielle, on conserve l'id
   if (book.id && typeof book.id === "string" && book.id.includes("-")) {
     // UUID Supabase
