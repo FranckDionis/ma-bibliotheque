@@ -55,7 +55,10 @@ export const ITEM_TYPES_LIST = [
 
 export const KNOWN_MAGAZINES = [
   // ----- Jeunesse - Bayard / Milan / Fleurus -----
-  { title: "Pomme d'Api", publisher: "Bayard Jeunesse", ageRange: "3-7 ans", issnPrefix: "0244-3805" },
+  // Le champ eanPrefix est utilisé pour reconnaître les revues à préfixe EAN
+  // français (généralement 7 premiers chiffres stables). Plus précis que l'ISSN
+  // pour ces titres car les revues françaises utilisent souvent EAN-13 standard.
+  { title: "Pomme d'Api", publisher: "Bayard Jeunesse", ageRange: "3-7 ans", eanPrefix: "3780237" },
   { title: "Toupie", publisher: "Milan Presse", ageRange: "3-6 ans" },
   { title: "Toboggan", publisher: "Milan Presse", ageRange: "6-9 ans" },
   { title: "Histoires Vraies", publisher: "Fleurus Presse", ageRange: "8-13 ans" },
@@ -71,7 +74,7 @@ export const KNOWN_MAGAZINES = [
   { title: "Le Journal de Mickey", publisher: "Disney/Hachette" },
 
   // ----- Adultes - Histoire / Sciences / Géographie -----
-  { title: "Historia", publisher: "Sophia Publications" },
+  { title: "Historia", publisher: "Sophia Publications", eanPrefix: "3780263" },
   { title: "Sciences et Avenir", publisher: "Sciences et Avenir" },
   { title: "Sciences & Vie", publisher: "Reworld Media" },
   { title: "Géo", publisher: "Prisma Media" },
@@ -102,14 +105,29 @@ export function guessTypeFromBarcode(barcode) {
   // ISBN-10 (livre)
   if (clean.length === 10) return "livre";
 
-  // ISSN-13 : commence par 977 (revues / périodiques)
+  // ISSN-13 : commence par 977 (revues / périodiques internationaux)
   if (clean.length === 13 && clean.startsWith("977")) {
     return "revue";
   }
+  // Presse française : préfixe GS1 attribué aux périodiques français.
+  // Les revues françaises (Historia, Pomme d'Api, Image Doc...) ont souvent
+  // des codes commençant par 378.
+  if (clean.length === 13 && clean.startsWith("378")) {
+    return "revue";
+  }
 
-  // EAN-13 jeu Nintendo Switch : préfixe Nintendo 0045496 ou similaire
+  // Jeux Nintendo Switch en UPC-A (12 chiffres) — Mario Kart, Zelda, etc.
+  if (clean.length === 12 && clean.startsWith("045496")) {
+    return "jeu-switch";
+  }
+  // EAN-13 jeu Nintendo Switch : équivalent EAN-13 (avec un 0 de tête)
   if (clean.length === 13 && (clean.startsWith("0045496") || clean.startsWith("4902370"))) {
     return "jeu-switch";
+  }
+
+  // UPC-A (12 chiffres) hors Nintendo : produit américain — souvent jeu de société
+  if (clean.length === 12) {
+    return "jeu-societe";
   }
 
   // EAN-13 (autre code produit) : par défaut on suggère "jeu de société",
@@ -138,21 +156,32 @@ export function extractIssnFromBarcode(barcode) {
 }
 
 // Cherche dans la base des revues connues si on en reconnaît une via son ISSN
-// ou une partie stable du code-barres. Renvoie l'objet magazine ou null.
+// ou un préfixe EAN-13 français stable. Renvoie l'objet magazine ou null.
 export function recognizeMagazine(barcode) {
-  const issn = extractIssnFromBarcode(barcode);
-  if (!issn) return null;
+  const clean = (barcode || "").replace(/\D/g, "");
+  if (clean.length < 10) return null;
 
-  // Compare avec les ISSN connus (préfixes courts pour tolérance)
+  // 1) Reconnaissance via préfixe EAN-13 français (Bayard, Milan, etc.)
+  // C'est le cas le plus fréquent pour les revues françaises grand public.
   for (const mag of KNOWN_MAGAZINES) {
-    if (mag.issnPrefix) {
-      // Format normalisé "0244-3805" → "02443805"
-      const normalizedIssn = mag.issnPrefix.replace(/\D/g, "");
-      if (normalizedIssn && issn.startsWith(normalizedIssn.substring(0, 7))) {
-        return mag;
+    if (mag.eanPrefix && clean.startsWith(mag.eanPrefix)) {
+      return mag;
+    }
+  }
+
+  // 2) Reconnaissance via ISSN (préfixe 977 international)
+  const issn = extractIssnFromBarcode(clean);
+  if (issn) {
+    for (const mag of KNOWN_MAGAZINES) {
+      if (mag.issnPrefix) {
+        const normalizedIssn = mag.issnPrefix.replace(/\D/g, "");
+        if (normalizedIssn && issn.startsWith(normalizedIssn.substring(0, 7))) {
+          return mag;
+        }
       }
     }
   }
+
   return null;
 }
 // Détermine quels champs afficher dans le formulaire et la fiche détail
