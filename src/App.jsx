@@ -7,6 +7,14 @@ import {
   saveStructureRemote,
   saveLayoutRemote,
   fetchBooks as fetchBooksRemote,
+  fetchStructure as fetchStructureRemote,
+  fetchLayout as fetchLayoutRemote,
+  insertBook as insertBookRemote,
+  updateBook as updateBookRemote,
+  deleteBook as deleteBookRemote,
+  subscribeToBooks,
+  subscribeToStructure,
+  subscribeToLayout,
 } from "./db";
 import AuthScreen from "./AuthScreen";
 
@@ -641,66 +649,173 @@ export default function App() {
     setShowSettings(false);
   };
 
-  // Charge livres + layout + structure depuis le storage persistant au démarrage
+  // === MODE ACTIF ===
+  // isCloudMode = true si l'utilisateur est connecté et que Supabase est disponible.
+  // Toutes les fonctions de données vérifient ce booléen pour décider d'utiliser
+  // Supabase (mode partagé) ou localStorage (mode local).
+  const isCloudMode = isSupabaseConfigured && authState && authState !== "skipped";
+
+  // Charge livres + layout + structure au démarrage.
+  // Mode cloud : depuis Supabase. Mode local : depuis localStorage.
+  // Le useEffect se relance quand on bascule auth (login/logout).
   useEffect(() => {
+    if (!authChecked) return; // attend la vérif auth avant de charger
+    let cancelled = false;
+    setLoading(true);
+
     (async () => {
-      try {
-        const result = await window.storage.get(STORAGE_KEY);
-        if (result?.value) {
-          setBooks(JSON.parse(result.value));
+      if (isCloudMode) {
+        // === MODE CLOUD ===
+        try {
+          const [remoteBooks, remoteStructure, remoteLayout] = await Promise.all([
+            fetchBooksRemote(),
+            fetchStructureRemote(),
+            fetchLayoutRemote(),
+          ]);
+          if (cancelled) return;
+          setBooks(remoteBooks);
+          if (remoteStructure && (remoteStructure.pieces?.length || 0) > 0) {
+            setStructure({
+              pieces: remoteStructure.pieces || INITIAL_PIECES,
+              bibliotheques: remoteStructure.bibliotheques || INITIAL_BIBLIOTHEQUES,
+              etageres: remoteStructure.etageres || INITIAL_ETAGERES,
+            });
+          } else {
+            // Première utilisation cloud : initialiser la structure côté Supabase
+            await saveStructureRemote(INITIAL_STRUCTURE);
+          }
+          if (remoteLayout) {
+            setLayout({
+              pieces: { ...DEFAULT_LAYOUT.pieces, ...(remoteLayout.pieces || {}) },
+              bibliotheques: { ...DEFAULT_LAYOUT.bibliotheques, ...(remoteLayout.bibliotheques || {}) },
+            });
+          }
+        } catch (e) {
+          showToast(`Erreur de chargement : ${e.message}`, "error");
         }
-      } catch (e) { /* pas de données encore */ }
-      try {
-        const layoutResult = await window.storage.get(LAYOUT_KEY);
-        if (layoutResult?.value) {
-          const saved = JSON.parse(layoutResult.value);
-          setLayout({
-            pieces: { ...DEFAULT_LAYOUT.pieces, ...(saved.pieces || {}) },
-            bibliotheques: { ...DEFAULT_LAYOUT.bibliotheques, ...(saved.bibliotheques || {}) },
-          });
-        }
-      } catch (e) { /* pas de layout encore */ }
-      try {
-        const structResult = await window.storage.get(STRUCTURE_KEY);
-        if (structResult?.value) {
-          const saved = JSON.parse(structResult.value);
-          setStructure({
-            pieces: saved.pieces || INITIAL_PIECES,
-            bibliotheques: saved.bibliotheques || INITIAL_BIBLIOTHEQUES,
-            etageres: saved.etageres || INITIAL_ETAGERES,
-          });
-        }
-      } catch (e) { /* pas de structure encore — on garde l'initiale */ }
-      setLoading(false);
+      } else {
+        // === MODE LOCAL ===
+        try {
+          const result = await window.storage.get(STORAGE_KEY);
+          if (result?.value && !cancelled) setBooks(JSON.parse(result.value));
+        } catch (e) { /* pas de données encore */ }
+        try {
+          const layoutResult = await window.storage.get(LAYOUT_KEY);
+          if (layoutResult?.value && !cancelled) {
+            const saved = JSON.parse(layoutResult.value);
+            setLayout({
+              pieces: { ...DEFAULT_LAYOUT.pieces, ...(saved.pieces || {}) },
+              bibliotheques: { ...DEFAULT_LAYOUT.bibliotheques, ...(saved.bibliotheques || {}) },
+            });
+          }
+        } catch (e) { /* pas de layout */ }
+        try {
+          const structResult = await window.storage.get(STRUCTURE_KEY);
+          if (structResult?.value && !cancelled) {
+            const saved = JSON.parse(structResult.value);
+            setStructure({
+              pieces: saved.pieces || INITIAL_PIECES,
+              bibliotheques: saved.bibliotheques || INITIAL_BIBLIOTHEQUES,
+              etageres: saved.etageres || INITIAL_ETAGERES,
+            });
+          }
+        } catch (e) { /* pas de structure */ }
+      }
+      if (!cancelled) setLoading(false);
     })();
-  }, []);
+
+    return () => { cancelled = true; };
+  }, [authChecked, isCloudMode]);
+
+  // === ABONNEMENTS TEMPS RÉEL (mode cloud uniquement) ===
+  // Quand un autre membre de la famille modifie quelque chose, on reçoit
+  // une notification et on rafraîchit la donnée concernée.
+  useEffect(() => {
+    if (!isCloudMode) return;
+
+    const booksSub = subscribeToBooks(async (payload) => {
+      // Stratégie simple et robuste : on recharge la liste complète à chaque changement.
+      // Pour quelques centaines de livres, c'est acceptable.
+      try {
+        const fresh = await fetchBooksRemote();
+        setBooks(fresh);
+      } catch (e) { /* ignore */ }
+    });
+
+    const structSub = subscribeToStructure(async () => {
+      try {
+        const fresh = await fetchStructureRemote();
+        if (fresh) setStructure(fresh);
+      } catch (e) { /* ignore */ }
+    });
+
+    const layoutSub = subscribeToLayout(async () => {
+      try {
+        const fresh = await fetchLayoutRemote();
+        if (fresh) {
+          setLayout({
+            pieces: { ...DEFAULT_LAYOUT.pieces, ...(fresh.pieces || {}) },
+            bibliotheques: { ...DEFAULT_LAYOUT.bibliotheques, ...(fresh.bibliotheques || {}) },
+          });
+        }
+      } catch (e) { /* ignore */ }
+    });
+
+    return () => {
+      booksSub.unsubscribe();
+      structSub.unsubscribe();
+      layoutSub.unsubscribe();
+    };
+  }, [isCloudMode]);
 
   const saveLayout = async (newLayout) => {
     setLayout(newLayout);
-    try {
-      await window.storage.set(LAYOUT_KEY, JSON.stringify(newLayout));
-    } catch (e) {
-      showToast("Erreur de sauvegarde de la disposition", "error");
+    if (isCloudMode) {
+      try {
+        await saveLayoutRemote(newLayout);
+      } catch (e) {
+        showToast("Erreur de sauvegarde de la disposition", "error");
+      }
+    } else {
+      try {
+        await window.storage.set(LAYOUT_KEY, JSON.stringify(newLayout));
+      } catch (e) {
+        showToast("Erreur de sauvegarde de la disposition", "error");
+      }
     }
   };
 
   const saveStructure = async (newStructure) => {
     setStructure(newStructure);
-    try {
-      await window.storage.set(STRUCTURE_KEY, JSON.stringify(newStructure));
-    } catch (e) {
-      showToast("Erreur de sauvegarde de la structure", "error");
+    if (isCloudMode) {
+      try {
+        await saveStructureRemote(newStructure);
+      } catch (e) {
+        showToast("Erreur de sauvegarde de la structure", "error");
+      }
+    } else {
+      try {
+        await window.storage.set(STRUCTURE_KEY, JSON.stringify(newStructure));
+      } catch (e) {
+        showToast("Erreur de sauvegarde de la structure", "error");
+      }
     }
   };
 
-  // Sauvegarde après chaque modification
+  // Sauvegarde de tout le tableau de livres (mode local uniquement — utilisé pour
+  // les opérations massives type import/migration). En mode cloud, on passe par
+  // les fonctions unitaires insertBookRemote / updateBookRemote / deleteBookRemote.
   const saveBooks = async (newBooks) => {
     setBooks(newBooks);
-    try {
-      await window.storage.set(STORAGE_KEY, JSON.stringify(newBooks));
-    } catch (e) {
-      showToast("Erreur de sauvegarde", "error");
+    if (!isCloudMode) {
+      try {
+        await window.storage.set(STORAGE_KEY, JSON.stringify(newBooks));
+      } catch (e) {
+        showToast("Erreur de sauvegarde", "error");
+      }
     }
+    // En mode cloud, les changements ont normalement déjà été poussés un par un
+    // via insertBookRemote/updateBookRemote/deleteBookRemote.
   };
 
   const showToast = (message, type = "success") => {
@@ -709,53 +824,127 @@ export default function App() {
   };
 
   const addBook = async (book, options = {}) => {
-    const newBook = {
-      ...book,
-      id: Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6),
-      addedAt: new Date().toISOString(),
-    };
-    // Utilise le pattern fonctionnel pour éviter les closures périmées
-    // quand plusieurs addBook s'enchaînent rapidement (mode batch)
-    setBooks((prev) => {
-      const next = [newBook, ...prev];
-      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
-      return next;
-    });
-    if (!options.silent) {
-      showToast("Livre ajouté à votre bibliothèque");
-      setView("home");
+    if (isCloudMode) {
+      // Mode cloud : insert immédiat dans Supabase, qui renvoie l'objet complet (avec son UUID)
+      try {
+        const inserted = await insertBookRemote(book);
+        // Préserve _placeholderId pour le suivi en mode batch
+        if (book._placeholderId) inserted._placeholderId = book._placeholderId;
+        // Optimistic update : on l'ajoute localement aussi tout de suite
+        // (l'abonnement realtime fera la sync mais avec une petite latence)
+        setBooks((prev) => {
+          // évite le doublon si l'event realtime arrive en même temps
+          if (prev.some((b) => b.id === inserted.id)) return prev;
+          return [inserted, ...prev];
+        });
+        if (!options.silent) {
+          showToast("Livre ajouté à votre bibliothèque");
+          setView("home");
+        }
+        return inserted;
+      } catch (e) {
+        showToast(`Erreur d'ajout : ${e.message}`, "error");
+        return null;
+      }
+    } else {
+      // Mode local
+      const newBook = {
+        ...book,
+        id: Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6),
+        addedAt: new Date().toISOString(),
+      };
+      setBooks((prev) => {
+        const next = [newBook, ...prev];
+        window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+        return next;
+      });
+      if (!options.silent) {
+        showToast("Livre ajouté à votre bibliothèque");
+        setView("home");
+      }
+      return newBook;
     }
-    return newBook;
   };
 
   const updateBook = async (id, updates) => {
-    setBooks((prev) => {
-      const next = prev.map((b) => (b.id === id ? { ...b, ...updates } : b));
-      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
-      return next;
-    });
-    showToast("Livre mis à jour");
+    if (isCloudMode) {
+      try {
+        const updated = await updateBookRemote(id, updates);
+        setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, ...updated } : b)));
+        showToast("Livre mis à jour");
+      } catch (e) {
+        showToast(`Erreur : ${e.message}`, "error");
+      }
+    } else {
+      setBooks((prev) => {
+        const next = prev.map((b) => (b.id === id ? { ...b, ...updates } : b));
+        window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+        return next;
+      });
+      showToast("Livre mis à jour");
+    }
   };
 
   // Mise à jour en mode batch (pas de toast, par placeholder ID)
   const enrichBookByPlaceholder = async (placeholderId, updates) => {
-    setBooks((prev) => {
-      const next = prev.map((b) =>
-        b._placeholderId === placeholderId ? { ...b, ...updates } : b
-      );
-      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
-      return next;
-    });
+    if (isCloudMode) {
+      // En mode cloud, on cherche le livre par son _placeholderId pour récupérer son UUID Supabase
+      const target = books.find((b) => b._placeholderId === placeholderId);
+      if (!target) return;
+      try {
+        const updated = await updateBookRemote(target.id, updates);
+        setBooks((prev) => prev.map((b) =>
+          b._placeholderId === placeholderId ? { ...b, ...updated } : b
+        ));
+      } catch (e) { /* ignore */ }
+    } else {
+      setBooks((prev) => {
+        const next = prev.map((b) =>
+          b._placeholderId === placeholderId ? { ...b, ...updates } : b
+        );
+        window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+        return next;
+      });
+    }
+  };
+
+  // Mise à jour silencieuse d'un livre par son ID — utilisée par les fonctions
+  // de re-recherche / nettoyage couvertures qui itèrent sur des dizaines de livres.
+  // Ne déclenche aucun toast.
+  const persistBookUpdate = async (id, updates) => {
+    if (isCloudMode) {
+      try {
+        await updateBookRemote(id, updates);
+        setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, ...updates } : b)));
+      } catch (e) { /* ignore */ }
+    } else {
+      setBooks((prev) => {
+        const next = prev.map((b) => (b.id === id ? { ...b, ...updates } : b));
+        window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+        return next;
+      });
+    }
   };
 
   const deleteBook = async (id) => {
-    setBooks((prev) => {
-      const next = prev.filter((b) => b.id !== id);
-      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
-      return next;
-    });
-    showToast("Livre supprimé");
-    setView("home");
+    if (isCloudMode) {
+      try {
+        await deleteBookRemote(id);
+        setBooks((prev) => prev.filter((b) => b.id !== id));
+        showToast("Livre supprimé");
+        setView("home");
+      } catch (e) {
+        showToast(`Erreur : ${e.message}`, "error");
+      }
+    } else {
+      setBooks((prev) => {
+        const next = prev.filter((b) => b.id !== id);
+        window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+        return next;
+      });
+      showToast("Livre supprimé");
+      setView("home");
+    }
   };
 
   const filteredBooks = books.filter((b) => {
@@ -939,11 +1128,7 @@ export default function App() {
           if (!book.year && result.year) updates.year = result.year;
           if (Object.keys(updates).length > 0) {
             updated++;
-            setBooks((prev) => {
-              const next = prev.map((b) => (b.id === book.id ? { ...b, ...updates } : b));
-              window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
-              return next;
-            });
+            await persistBookUpdate(book.id, updates);
           }
         }
       } catch (e) { /* ignore */ }
@@ -979,11 +1164,7 @@ export default function App() {
         const newCover = await findCoverFor(book.isbn);
         if (newCover) {
           updated++;
-          setBooks((prev) => {
-            const next = prev.map((b) => (b.id === book.id ? { ...b, cover: newCover } : b));
-            window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
-            return next;
-          });
+          await persistBookUpdate(book.id, { cover: newCover });
         }
       } catch (e) { /* ignore */ }
       setEnrichProgress({ current: i + 1, total: candidates.length, found: updated, updated, mode: "covers" });
@@ -1006,12 +1187,10 @@ export default function App() {
       return;
     }
     if (!window.confirm(`Supprimer les ${candidates.length} couverture${candidates.length > 1 ? "s" : ""} Google Books ?\n\nVous pourrez ensuite utiliser "Re-rechercher les livres incomplets" pour les remplacer par Open Library ou Amazon.`)) return;
-    setBooks((prev) => {
-      const ids = new Set(candidates.map((b) => b.id));
-      const next = prev.map((b) => (ids.has(b.id) ? { ...b, cover: "" } : b));
-      window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
-      return next;
-    });
+    // Suppression : on parcourt et on met à jour chacun (cloud ou local selon le mode)
+    for (const book of candidates) {
+      await persistBookUpdate(book.id, { cover: "" });
+    }
     showToast(`${candidates.length} couverture${candidates.length > 1 ? "s" : ""} supprimée${candidates.length > 1 ? "s" : ""}`);
   };
 
