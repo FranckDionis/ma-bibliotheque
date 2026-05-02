@@ -1198,6 +1198,49 @@ export default function App() {
     enrichCancelRef.current = true;
   };
 
+  // === NETTOYAGE DES LIVRES VIDES ===
+  // Supprime les livres qui n'ont ni titre, ni ISBN valide, ni couverture.
+  // Utile après un bug ou une migration ratée.
+  const findEmptyBooks = (booksList) => {
+    return booksList.filter((b) => {
+      const hasTitle = !!(b.title && b.title.trim());
+      const hasIsbn = !!(b.isbn && b.isbn.trim());
+      const hasCover = !!(b.cover && b.cover.trim());
+      return !hasTitle && !hasIsbn && !hasCover;
+    });
+  };
+
+  const handleCleanEmptyBooks = async () => {
+    const empties = findEmptyBooks(books);
+    if (empties.length === 0) {
+      showToast("Aucun livre vide à supprimer");
+      return;
+    }
+    if (!window.confirm(
+      `Supprimer ${empties.length} livre${empties.length > 1 ? "s" : ""} vide${empties.length > 1 ? "s" : ""} (sans titre, ni ISBN, ni couverture) ?\n\nCette action est définitive.`
+    )) return;
+
+    let deleted = 0;
+    for (const book of empties) {
+      try {
+        if (isCloudMode) {
+          await deleteBookRemote(book.id);
+        }
+        deleted++;
+      } catch (e) { /* ignore */ }
+    }
+    // Met à jour l'état local en une seule passe
+    const idsToRemove = new Set(empties.map((b) => b.id));
+    setBooks((prev) => {
+      const next = prev.filter((b) => !idsToRemove.has(b.id));
+      if (!isCloudMode) {
+        window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+      }
+      return next;
+    });
+    showToast(`${deleted} livre${deleted > 1 ? "s" : ""} vide${deleted > 1 ? "s" : ""} supprimé${deleted > 1 ? "s" : ""}`);
+  };
+
   if (loading || !authChecked) {
     return (
       <div className="min-h-screen flex items-center justify-center" style={{ background: "#f4ecd8" }}>
@@ -1392,6 +1435,8 @@ export default function App() {
           onSignOut={handleSignOut}
           onMigrateToCloud={handleMigrateToCloud}
           migrating={migrating}
+          onCleanEmptyBooks={handleCleanEmptyBooks}
+          emptyBooksCount={findEmptyBooks(books).length}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -4371,6 +4416,8 @@ function SettingsModal({
   onSignOut,
   onMigrateToCloud,
   migrating,
+  onCleanEmptyBooks,
+  emptyBooksCount,
   onClose,
 }) {
   const fileRef = useRef(null);
@@ -4586,6 +4633,26 @@ function SettingsModal({
                 Supprimer toutes les couvertures Google
               </button>
             </div>
+          </div>
+        )}
+
+        {/* Section Nettoyage des livres vides */}
+        {!enrichProgress && emptyBooksCount > 0 && (
+          <div className="mb-4 p-3 rounded-lg" style={{ background: "rgba(139, 44, 44, 0.1)", border: "1px solid var(--accent)" }}>
+            <h4 className="text-sm font-bold mb-1" style={{ color: "var(--accent)", fontFamily: "var(--font-display)" }}>
+              🧹 Livres vides
+            </h4>
+            <p className="text-xs mb-3" style={{ color: "var(--ink)" }}>
+              {emptyBooksCount} livre{emptyBooksCount > 1 ? "s sont" : " est"} totalement vide{emptyBooksCount > 1 ? "s" : ""} (sans titre, ISBN, ni couverture). Vous pouvez les supprimer en un tap.
+            </p>
+            <button
+              onClick={onCleanEmptyBooks}
+              className="w-full py-2.5 rounded-lg font-medium text-sm flex items-center justify-center gap-1.5"
+              style={{ background: "var(--accent)", color: "var(--cream)" }}
+            >
+              <Trash2 className="w-4 h-4" />
+              Supprimer les livres vides ({emptyBooksCount})
+            </button>
           </div>
         )}
 
