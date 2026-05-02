@@ -186,6 +186,7 @@ export function subscribeToLayout(onChange) {
 function dbToBook(row) {
   return {
     id: row.id,
+    type: row.type || "livre",
     isbn: row.isbn || "",
     title: row.title || "",
     subtitle: row.subtitle || "",
@@ -208,6 +209,14 @@ function dbToBook(row) {
     publisher: row.publisher || "",
     year: row.year || "",
     addedAt: row.created_at,
+    // Champs spécifiques aux nouveaux types
+    issueNumber: row.issue_number || "",     // n° de revue
+    issueDate: row.issue_date || "",          // date de parution revue
+    playersMin: row.players_min || 0,         // nb joueurs min (jeux)
+    playersMax: row.players_max || 0,         // nb joueurs max (jeux)
+    durationMin: row.duration_min || 0,       // durée en minutes (jeux)
+    ageMin: row.age_min || 0,                 // âge minimum (jeux)
+    platform: row.platform || "",             // ex: "Nintendo Switch" pour les jeux
   };
 }
 
@@ -238,6 +247,15 @@ function bookToDb(book) {
   if ("weight" in book) out.weight = book.weight || null;
   if ("publisher" in book) out.publisher = book.publisher || null;
   if ("year" in book) out.year = book.year || null;
+  // Champs spécifiques aux nouveaux types
+  if ("type" in book) out.type = book.type || "livre";
+  if ("issueNumber" in book) out.issue_number = book.issueNumber || null;
+  if ("issueDate" in book) out.issue_date = book.issueDate || null;
+  if ("playersMin" in book) out.players_min = book.playersMin ? parseInt(book.playersMin) : null;
+  if ("playersMax" in book) out.players_max = book.playersMax ? parseInt(book.playersMax) : null;
+  if ("durationMin" in book) out.duration_min = book.durationMin ? parseInt(book.durationMin) : null;
+  if ("ageMin" in book) out.age_min = book.ageMin ? parseInt(book.ageMin) : null;
+  if ("platform" in book) out.platform = book.platform || null;
   // Si c'est une mise à jour partielle, on conserve l'id
   if (book.id && typeof book.id === "string" && book.id.includes("-")) {
     // UUID Supabase
