@@ -598,6 +598,7 @@ export default function App() {
   const [view, setView] = useState("home"); // home, search, add, library, detail, edit
   const [searchQuery, setSearchQuery] = useState("");
   const [filterBib, setFilterBib] = useState("all");
+  const [filterType, setFilterType] = useState("all");
   const [selectedBook, setSelectedBook] = useState(null);
   const [toast, setToast] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -970,7 +971,9 @@ export default function App() {
       b.author?.toLowerCase().includes(searchQuery.toLowerCase()) ||
       b.isbn?.includes(searchQuery);
     const matchBib = filterBib === "all" || b.bibliotheque === filterBib;
-    return matchSearch && matchBib;
+    const itemType = b.type || "livre";
+    const matchType = filterType === "all" || itemType === filterType;
+    return matchSearch && matchBib && matchType;
   });
 
   // === EXPORT / IMPORT ===
@@ -1359,7 +1362,12 @@ export default function App() {
               ) : (
                 <CloudOff className="w-3.5 h-3.5" title="Mode local" />
               )}
-              <span>{books.length} {books.length > 1 ? "livres" : "livre"}</span>
+              <span>{books.length} {(() => {
+                // Si tous les objets sont des livres → "livres", sinon "objets"
+                const allLivres = books.every((b) => !b.type || b.type === "livre");
+                if (allLivres) return books.length > 1 ? "livres" : "livre";
+                return books.length > 1 ? "objets" : "objet";
+              })()}</span>
             </div>
             <button
               onClick={() => setShowSettings(true)}
@@ -1384,6 +1392,8 @@ export default function App() {
             setSearchQuery={setSearchQuery}
             filterBib={filterBib}
             setFilterBib={setFilterBib}
+            filterType={filterType}
+            setFilterType={setFilterType}
             onSelectBook={(b) => { setSelectedBook(b); setView("detail"); }}
             onAdd={() => setView("add")}
           />
@@ -1538,7 +1548,14 @@ export default function App() {
 }
 
 // === VUE PRINCIPALE ===
-function HomeView({ books, structure, filteredBooks, searchQuery, setSearchQuery, filterBib, setFilterBib, onSelectBook, onAdd }) {
+function HomeView({ books, structure, filteredBooks, searchQuery, setSearchQuery, filterBib, setFilterBib, filterType, setFilterType, onSelectBook, onAdd }) {
+  // Compte des objets par type pour décider d'afficher ou non le filtre
+  const typeCounts = {};
+  for (const b of books) {
+    const t = b.type || "livre";
+    typeCounts[t] = (typeCounts[t] || 0) + 1;
+  }
+  const hasMultipleTypes = Object.keys(typeCounts).length > 1;
   if (books.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center pt-20 px-6 text-center">
@@ -1591,6 +1608,24 @@ function HomeView({ books, structure, filteredBooks, searchQuery, setSearchQuery
         />
       </div>
 
+      {/* Filtre par type — visible quand il y a plusieurs types */}
+      {hasMultipleTypes && (
+        <div className="mb-2 flex gap-2 overflow-x-auto pb-2 -mx-4 px-4" style={{ scrollbarWidth: "none" }}>
+          <FilterChip active={filterType === "all"} onClick={() => setFilterType("all")}>
+            Tout ({books.length})
+          </FilterChip>
+          {ITEM_TYPES_LIST.map((t) => {
+            const count = typeCounts[t.id] || 0;
+            if (count === 0) return null;
+            return (
+              <FilterChip key={t.id} active={filterType === t.id} onClick={() => setFilterType(t.id)}>
+                {t.emoji} {t.pluralLabel} ({count})
+              </FilterChip>
+            );
+          })}
+        </div>
+      )}
+
       {/* Filtre bibliothèque */}
       <div className="mb-4 flex gap-2 overflow-x-auto pb-2 -mx-4 px-4" style={{ scrollbarWidth: "none" }}>
         <FilterChip active={filterBib === "all"} onClick={() => setFilterBib("all")}>
@@ -1641,32 +1676,65 @@ function FilterChip({ active, onClick, children }) {
 
 function BookCard({ book, structure, onClick, index }) {
   const bib = structure.bibliotheques.find((b) => b.id === book.bibliotheque);
+  const itemType = ITEM_TYPES[book.type || "livre"];
+  const isLivre = !book.type || book.type === "livre";
   return (
     <button
       onClick={onClick}
-      className="book-card w-full text-left p-3 rounded-xl flex gap-3 shadow-sm border"
+      className="book-card w-full text-left p-3 rounded-xl flex gap-3 shadow-sm border relative"
       style={{
         background: "white",
         borderColor: "var(--parchment)",
         animationDelay: `${Math.min(index * 50, 400)}ms`,
       }}
     >
+      {/* Badge type pour les non-livres */}
+      {!isLivre && (
+        <div
+          className="absolute top-1 right-1 w-6 h-6 rounded-full flex items-center justify-center"
+          style={{ background: itemType?.color || "var(--leather)", fontSize: "0.85rem" }}
+          title={itemType?.label}
+        >
+          {itemType?.emoji}
+        </div>
+      )}
       <div className="w-16 h-24 flex-shrink-0 rounded overflow-hidden flex items-center justify-center"
         style={{ background: "var(--parchment)" }}>
         {book.cover ? (
           <img src={book.cover} alt={book.title} className="w-full h-full object-cover" />
         ) : (
-          <BookOpen className="w-8 h-8" style={{ color: "var(--leather)" }} />
+          <span style={{ fontSize: "2rem" }}>{itemType?.emoji || "📖"}</span>
         )}
       </div>
-      <div className="flex-1 min-w-0">
+      <div className="flex-1 min-w-0 pr-6">
         <h3 className="font-semibold leading-tight mb-1 line-clamp-2"
           style={{ fontFamily: "var(--font-display)", color: "var(--ink)", fontSize: "1rem" }}>
           {book.title || "Sans titre"}
         </h3>
-        {book.author && (
+        {/* Pour les revues : N° et date */}
+        {book.type === "revue" && (book.issueNumber || book.issueDate) && (
+          <p className="text-sm mb-1" style={{ color: "var(--leather-dark)", fontWeight: 500 }}>
+            {book.issueNumber && `N° ${book.issueNumber}`}
+            {book.issueNumber && book.issueDate && " — "}
+            {book.issueDate}
+          </p>
+        )}
+        {/* Pour les livres : auteur */}
+        {isLivre && book.author && (
           <p className="text-sm mb-2 line-clamp-1" style={{ color: "var(--ink-soft)" }}>
             {book.author}
+          </p>
+        )}
+        {/* Pour les jeux : joueurs / durée */}
+        {(book.type === "jeu-societe" || book.type === "jeu-switch") && (book.playersMax > 0 || book.durationMin > 0) && (
+          <p className="text-sm mb-1" style={{ color: "var(--ink-soft)" }}>
+            {book.playersMax > 0 && (
+              book.playersMin > 0 && book.playersMin !== book.playersMax
+                ? `${book.playersMin}–${book.playersMax} joueurs`
+                : `${book.playersMax} joueurs`
+            )}
+            {book.playersMax > 0 && book.durationMin > 0 && " · "}
+            {book.durationMin > 0 && `${book.durationMin} min`}
           </p>
         )}
         <div className="flex items-center gap-1 text-xs" style={{ color: "var(--leather)" }}>
@@ -4830,11 +4898,20 @@ function SettingsModal({
   onClose,
 }) {
   const fileRef = useRef(null);
+  // Statistiques par type d'objet
+  const byType = {};
+  for (const t of ITEM_TYPES_LIST) byType[t.id] = 0;
+  for (const b of books) {
+    const t = b.type || "livre";
+    if (byType[t] !== undefined) byType[t]++;
+    else byType.livre++;
+  }
   const stats = {
     total: books.length,
     withTitle: books.filter((b) => b.title).length,
     withCover: books.filter((b) => b.cover).length,
     withoutTitle: books.filter((b) => !b.title).length,
+    byType,
   };
   // Pendant l'enrichissement, on empêche la fermeture par clic extérieur
   const isRunning = !!enrichProgress;
@@ -4927,11 +5004,18 @@ function SettingsModal({
           </h4>
           <div className="text-sm space-y-1" style={{ color: "var(--ink)" }}>
             <div className="flex justify-between">
-              <span>Total de livres</span>
+              <span>Total d'objets</span>
               <strong>{stats.total}</strong>
             </div>
-            <div className="flex justify-between">
-              <span>Avec titre/auteur</span>
+            {/* Répartition par type — ne s'affiche que pour les types présents */}
+            {ITEM_TYPES_LIST.map((t) => stats.byType[t.id] > 0 && (
+              <div key={t.id} className="flex justify-between pl-3 text-xs" style={{ color: "var(--ink-soft)" }}>
+                <span>{t.emoji} {t.pluralLabel}</span>
+                <span>{stats.byType[t.id]}</span>
+              </div>
+            ))}
+            <div className="flex justify-between pt-1 mt-1 border-t" style={{ borderColor: "rgba(0,0,0,0.1)" }}>
+              <span>Avec titre</span>
               <strong>{stats.withTitle} ({stats.total > 0 ? Math.round(stats.withTitle / stats.total * 100) : 0}%)</strong>
             </div>
             <div className="flex justify-between">
