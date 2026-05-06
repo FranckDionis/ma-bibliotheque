@@ -438,6 +438,116 @@ async function lookupBNF(isbn) {
   }
 }
 
+// ============================================================
+// SOURCES POUR PRODUITS NON-LIVRES (jeux, autres EAN/UPC)
+// ============================================================
+
+// Open Food Facts gère un endpoint produit générique (pas que de l'alimentaire) :
+// world.openfoodfacts.org couvre des dizaines de millions d'EAN/UPC, dont des
+// boîtes de jeux et jeux Switch. Gratuit, sans clé, CORS ouvert.
+// Les jaquettes y sont souvent disponibles en photo utilisateur.
+async function lookupOpenFoodFacts(code) {
+  try {
+    const res = await fetchWithTimeout(`https://world.openfoodfacts.org/api/v2/product/${code}.json`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.status !== 1 || !data.product) return null;
+    const p = data.product;
+    const title = p.product_name || p.product_name_fr || p.generic_name || "";
+    if (!title) return null;
+    // Photo : front_url > image_url > image_front_url
+    const cover =
+      p.image_front_url ||
+      p.image_url ||
+      p.selected_images?.front?.display?.fr ||
+      p.selected_images?.front?.display?.en ||
+      "";
+    return {
+      title,
+      author: "",
+      cover,
+      publisher: p.brands || "",
+      year: "",
+      description: p.generic_name || "",
+      source: "Open Food Facts",
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// BoardGameGeek — référence absolue pour les jeux de société.
+// L'API BGG ne supporte pas la recherche par EAN directement, mais elle a une
+// API de recherche par nom. Pour l'instant on l'expose pour usage futur (la
+// recherche par EAN passe par Open Food Facts qui renvoie le nom, ensuite on
+// peut enrichir avec BGG si l'on veut). À ce stade on s'en tient à OFF.
+
+// Stratégie pour les jeux Switch en UPC-A (12 chiffres) :
+// On préfixe d'un 0 pour obtenir un EAN-13 valide, ce qui maximise les chances
+// de match dans Open Food Facts.
+function upcToEan(code) {
+  const clean = (code || "").replace(/\D/g, "");
+  if (clean.length === 12) return "0" + clean;
+  return clean;
+}
+
+// Recherche unifiée selon le type d'objet détecté.
+// - livre / inconnu  → Google Books + Open Library + BnF (cascade existante)
+// - revue            → reconnaissance par préfixe (déjà fait côté UI) + Open Food Facts en complément
+// - jeu-switch       → Open Food Facts (UPC normalisé)
+// - jeu-societe      → Open Food Facts
+// Renvoie { title, author, cover, publisher, year, description, source, debug, _type? }
+async function lookupAnyBarcode(code, type) {
+  const clean = (code || "").replace(/\D/g, "");
+  if (!clean) return null;
+
+  // Pour les livres on garde la cascade riche existante
+  if (type === "livre") {
+    return lookupISBN(clean);
+  }
+
+  // Pour les autres types : on tente Open Food Facts en priorité (couvre EAN
+  // et UPC produits), et en parallèle Google Books au cas où (certains jeux
+  // ont étonnamment une fiche Google Books, ex: livres de règles).
+  const eanForOFF = upcToEan(clean);
+  const [off, google] = await Promise.all([
+    lookupOpenFoodFacts(eanForOFF),
+    // Google Books peut parfois remonter une fiche pour un produit non-livre
+    // (rare mais utile en secours pour le titre). On le met en parallèle.
+    lookupGoogleBooks(clean).catch(() => null),
+  ]);
+
+  const debug = {
+    openFoodFacts: off ? `OK (${off.title?.slice(0, 40)})` : "rien",
+    google: google ? `OK (${google.title?.slice(0, 40)})` : "rien",
+  };
+
+  // Choix : OFF d'abord (plus pertinent pour produits), puis Google en secours
+  const chosen = off || google;
+  if (!chosen) return { title: "", author: "", cover: "", source: null, debug };
+
+  return {
+    title: chosen.title || "",
+    author: chosen.author || "",
+    cover: chosen.cover || "",
+    subtitle: "",
+    publisher: chosen.publisher || "",
+    year: chosen.year || "",
+    description: chosen.description || "",
+    categories: "",
+    pages: 0,
+    language: "",
+    rating: 0,
+    ratingsCount: 0,
+    infoLink: "",
+    format: "",
+    dimensions: "",
+    weight: "",
+    source: chosen.source,
+    debug,
+  };
+}
+
 // Cascade : essaye chaque source en parallèle, retourne le meilleur résultat
 async function lookupISBN(isbn) {
   const [google, openLib, bnf, fallbackCover] = await Promise.all([
@@ -1846,7 +1956,22 @@ function AddView({ structure, onCancel, onAdd, onEnrichBook, showToast }) {
             Ajouter un objet
           </h2>
 
-          {/* Sélecteur de type */}
+          {/* === SCAN RAPIDE UNIVERSEL === */}
+          {/* Indépendant du type : la détection est automatique d'après le code-barres.
+              Mis en tête car c'est le mode le plus efficace pour ranger une étagère. */}
+          <ChoiceCard
+            icon={<Zap className="w-6 h-6" />}
+            title="Scan rapide en série"
+            desc="Étagère entière — livres, revues, jeux : type détecté automatiquement"
+            onClick={() => setMode("batch-setup")}
+            highlight
+          />
+
+          <div className="text-xs uppercase tracking-wider mt-5 mb-2" style={{ color: "var(--ink-soft)" }}>
+            Ou ajouter un objet à la fois
+          </div>
+
+          {/* Sélecteur de type — sert pour les modes individuels (scan simple, photo, manuel) */}
           <div className="grid grid-cols-2 gap-2 mb-4">
             {ITEM_TYPES_LIST.map((t) => (
               <button
@@ -1865,16 +1990,9 @@ function AddView({ structure, onCancel, onAdd, onEnrichBook, showToast }) {
             ))}
           </div>
 
-          {/* Options d'ajout — varient selon le type sélectionné */}
+          {/* Options d'ajout individuel — varient selon le type sélectionné */}
           {selectedType === "livre" && (
             <>
-              <ChoiceCard
-                icon={<Zap className="w-6 h-6" />}
-                title="Scan rapide en série"
-                desc="Toute une étagère d'un coup, de gauche à droite"
-                onClick={() => setMode("batch-setup")}
-                highlight
-              />
               <ChoiceCard
                 icon={<ScanLine className="w-6 h-6" />}
                 title="Scanner le code-barres"
@@ -3264,7 +3382,7 @@ function BatchSetup({ structure, onCancel, onStart }) {
         Scan rapide d'une étagère
       </h2>
       <p className="text-sm" style={{ color: "var(--ink-soft)" }}>
-        Choisissez l'emplacement de départ. Chaque livre scanné sera placé à la suite (gauche → droite), et la position s'incrémentera automatiquement.
+        Choisissez l'emplacement de départ. Chaque objet scanné (livre, revue, jeu Switch, jeu de société…) sera placé à la suite, son <strong>type est détecté automatiquement</strong> d'après le code-barres, et la position s'incrémente toute seule.
       </p>
 
       <Field label="Bibliothèque">
@@ -3434,13 +3552,25 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
     };
   }, [phase, cameraStarted]);
 
-  const handleISBNScanned = async (isbn) => {
-    // Mode continu : on ajoute IMMÉDIATEMENT le livre avec l'ISBN seul,
-    // puis on enrichit en arrière-plan. La caméra reste active.
+  const handleISBNScanned = async (code) => {
+    // Mode continu : détection automatique du type d'objet (livre / revue /
+    // jeu Switch / jeu de société) à partir du code-barres, ajout immédiat
+    // d'un placeholder typé, puis enrichissement en arrière-plan via la
+    // source la plus appropriée. La caméra reste active.
     const placeholderId = Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6);
     const placeholderPosition = currentSetup.position;
     const placeholderBib = currentSetup.bibliotheque;
     const placeholderEtagere = currentSetup.etagere;
+
+    // Détection du type d'objet d'après le format/préfixe du code-barres
+    const detectedType = guessTypeFromBarcode(code);
+
+    // Reconnaissance d'une revue connue (préfixe EAN ou ISSN) — on pré-remplit
+    // le titre et l'éditeur dès le scan, sans attendre le réseau.
+    let magazineMatch = null;
+    if (detectedType === "revue") {
+      magazineMatch = recognizeMagazine(code);
+    }
 
     // Petit feedback flash brief sans bloquer
     setPhase("flash");
@@ -3449,30 +3579,36 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
       setPhase((p) => (p === "flash" ? "scanning" : p));
     }, 300);
 
-    // Ajout placeholder immédiat
+    // Ajout placeholder immédiat avec le bon type (et titre pré-rempli si revue connue)
     const placeholder = {
       _placeholderId: placeholderId,
-      isbn,
-      title: "",
+      type: detectedType,
+      isbn: code,
+      title: magazineMatch?.title || "",
       author: "",
       cover: "",
+      publisher: magazineMatch?.publisher || "",
       bibliotheque: placeholderBib,
       etagere: placeholderEtagere,
       position: placeholderPosition,
-      notes: "",
+      notes: magazineMatch?.ageRange || "",
     };
+    if (detectedType === "jeu-switch") placeholder.platform = "Nintendo Switch";
     await onAddBook(placeholder);
     setLastBook(placeholder);
     setBatchHistory((h) => [placeholder, ...h]);
     setCurrentSetup((s) => ({ ...s, position: s.position + 1 }));
 
-    // Lookup en arrière-plan — le livre sera mis à jour quand le résultat arrive
+    // Lookup en arrière-plan — l'objet sera mis à jour quand le résultat arrive.
+    // On utilise la source adaptée au type via lookupAnyBarcode.
     (async () => {
       try {
-        const found = await lookupISBN(isbn);
+        const found = await lookupAnyBarcode(code, detectedType);
         if (found && (found.title || found.cover)) {
+          // Pour une revue déjà reconnue, on garde le titre canonique de la base
+          // si la source en ligne en propose un différent (souvent moins propre).
           const enrichedFields = {
-            title: found.title || "",
+            title: magazineMatch?.title || found.title || "",
             author: found.author || "",
             cover: found.cover || "",
             subtitle: found.subtitle || "",
@@ -3486,7 +3622,7 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
             format: found.format || "",
             dimensions: found.dimensions || "",
             weight: found.weight || "",
-            publisher: found.publisher || "",
+            publisher: magazineMatch?.publisher || found.publisher || "",
             year: found.year || "",
           };
           // Met à jour le placeholder via une fonction utilitaire injectée par le parent
