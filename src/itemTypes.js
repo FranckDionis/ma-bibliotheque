@@ -89,6 +89,79 @@ export const KNOWN_MAGAZINES = [
 ];
 
 // ============================================================
+// PRÉFIXES ÉDITEURS PRESSE FRANÇAISE (fallback)
+// ============================================================
+// Les éditeurs de presse français disposent de plages d'EAN-13 attribuées par
+// le GS1. À défaut de pouvoir nommer la revue exacte, on peut au moins
+// reconnaître l'éditeur et le type "presse jeunesse / adulte". L'utilisateur
+// n'aura plus qu'à compléter le titre.
+//
+// Format : { prefixStart, prefixEnd, publisher, kind } — un préfixe matche si
+// les premiers chiffres du code-barres tombent dans l'intervalle [start, end].
+export const PRESS_PUBLISHER_PREFIXES = [
+  // Bayard Presse / Bayard Jeunesse — préfixes 37802xx, 37803xx, 37805xx
+  { prefixStart: "3780200", prefixEnd: "3780299", publisher: "Bayard Jeunesse", kind: "presse-jeunesse" },
+  { prefixStart: "3780300", prefixEnd: "3780399", publisher: "Bayard Presse", kind: "presse-adulte" },
+  { prefixStart: "3780500", prefixEnd: "3780599", publisher: "Bayard / Milan", kind: "presse" },
+  { prefixStart: "3780600", prefixEnd: "3780699", publisher: "Bayard Presse", kind: "presse" },
+  // Milan Presse — préfixes 37811xx, 37812xx, 37813xx
+  { prefixStart: "3781100", prefixEnd: "3781399", publisher: "Milan Presse", kind: "presse-jeunesse" },
+  // Fleurus Presse / Édifa
+  { prefixStart: "3780400", prefixEnd: "3780499", publisher: "Fleurus Presse", kind: "presse" },
+  // Sophia Publications (Historia, La Recherche, …) déjà nommé via Historia
+  // Mais d'autres titres peuvent partager le préfixe 37802xx
+];
+
+// Recherche un éditeur de presse à partir d'un code-barres (fallback quand
+// recognizeMagazine ne trouve pas la revue exacte).
+export function recognizePressPublisher(barcode) {
+  const clean = (barcode || "").replace(/\D/g, "");
+  if (clean.length < 13) return null;
+  const seven = clean.substring(0, 7);
+  // Conversion en nombre pour comparaison d'intervalle
+  const n = parseInt(seven, 10);
+  for (const p of PRESS_PUBLISHER_PREFIXES) {
+    const a = parseInt(p.prefixStart, 10);
+    const b = parseInt(p.prefixEnd, 10);
+    if (n >= a && n <= b) {
+      return { publisher: p.publisher, kind: p.kind };
+    }
+  }
+  return null;
+}
+
+// ============================================================
+// JEUX CONNUS PAR EAN/UPC (jeux Switch + jeux de société)
+// ============================================================
+// Ces codes-barres sont rarement indexés dans les bases libres (Open Food Facts
+// inclus). Les rentrer en dur est plus rapide et plus fiable.
+//
+// La clé `code` est le code-barres exact (sans tirets ni espaces). On accepte
+// indifféremment l'UPC-A 12 chiffres et l'EAN-13 (avec 0 préfixe).
+export const KNOWN_GAMES = [
+  // Aucune entrée pour l'instant — la base pourra être étoffée au fur et à
+  // mesure des scans qui ne remontent rien et que l'utilisateur saisit à la
+  // main. Le format est prêt :
+  // { code: "045496904099", title: "The Legend of Zelda: Breath of the Wild", publisher: "Nintendo", platform: "Nintendo Switch", type: "jeu-switch" },
+  // { code: "4010168202730", title: "Activity", publisher: "Piatnik", type: "jeu-societe" },
+];
+
+// Reconnaît un jeu via son code-barres dans la base interne KNOWN_GAMES.
+// Renvoie l'objet { title, publisher, ... } ou null.
+export function recognizeGame(barcode) {
+  const clean = (barcode || "").replace(/\D/g, "");
+  if (clean.length < 10) return null;
+  // On compare en normalisant : on retire les éventuels 0 de tête pour matcher
+  // un EAN-13 d'un côté avec un UPC-A 12 de l'autre.
+  const normalized = clean.replace(/^0+/, "");
+  for (const g of KNOWN_GAMES) {
+    const gameClean = g.code.replace(/\D/g, "").replace(/^0+/, "");
+    if (gameClean === normalized) return g;
+  }
+  return null;
+}
+
+// ============================================================
 // DÉTECTION AUTOMATIQUE DU TYPE À PARTIR D'UN CODE-BARRES
 // ============================================================
 // On essaie de deviner intelligemment le type d'objet selon la nature du code.
