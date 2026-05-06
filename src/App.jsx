@@ -18,7 +18,7 @@ import {
   subscribeToLayout,
 } from "./db";
 import AuthScreen from "./AuthScreen";
-import { ITEM_TYPES, ITEM_TYPES_LIST, guessTypeFromBarcode, FIELDS_BY_TYPE, recognizeMagazine } from "./itemTypes";
+import { ITEM_TYPES, ITEM_TYPES_LIST, guessTypeFromBarcode, FIELDS_BY_TYPE, recognizeMagazine, recognizeGame, recognizePressPublisher } from "./itemTypes";
 
 // === ADAPTATEUR DE STOCKAGE ===
 // Utilise localStorage du navigateur (les données restent sur l'iPhone, dans le navigateur).
@@ -491,11 +491,67 @@ function upcToEan(code) {
   return clean;
 }
 
+// Wikidata SPARQL — recherche un objet par GTIN (P3962) puis par EAN-13/UPC
+// dans les propriétés alternatives (P5749 = ISBN-13, etc.).
+// Wikidata expose CORS ouvert et ne demande pas de clé. Le résultat n'est pas
+// garanti (Wikidata indexe loin de tous les produits) mais c'est un excellent
+// secours pour les jeux Switch et grosses sorties commerciales.
+async function lookupWikidata(code) {
+  const clean = (code || "").replace(/\D/g, "");
+  if (!clean) return null;
+  // Variantes du code à tester (EAN-13 et UPC-A-préfixé-d-un-0)
+  const variants = new Set([clean]);
+  if (clean.length === 12) variants.add("0" + clean);
+  if (clean.length === 13 && clean.startsWith("0")) variants.add(clean.slice(1));
+
+  // P3962 = GTIN (le plus courant pour les produits commerciaux)
+  // On cherche aussi via le label en filtrant sur Q-items "video game" ou "board game"
+  // Pour simplifier on fait une seule requête multi-variantes.
+  const valuesClause = [...variants].map((v) => `"${v}"`).join(" ");
+  const sparql = `
+    SELECT ?item ?itemLabel ?image ?publisherLabel WHERE {
+      VALUES ?gtin { ${valuesClause} }
+      ?item wdt:P3962 ?gtin.
+      OPTIONAL { ?item wdt:P18 ?image. }
+      OPTIONAL { ?item wdt:P123 ?publisher. }
+      SERVICE wikibase:label { bd:serviceParam wikibase:language "fr,en". }
+    }
+    LIMIT 1
+  `;
+  try {
+    const url = `https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(sparql)}`;
+    const res = await fetchWithTimeout(url, 6000);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const row = data.results?.bindings?.[0];
+    if (!row) return null;
+    const title = row.itemLabel?.value || "";
+    if (!title) return null;
+    // Wikidata renvoie une URL Commons "Special:FilePath" — utilisable directement
+    let cover = row.image?.value || "";
+    // On force https et on demande une miniature de taille raisonnable via les
+    // services Commons (le path Special:FilePath sait déjà servir un thumb si on
+    // ajoute ?width=, sinon on récupère la taille d'origine).
+    if (cover && !cover.includes("?")) cover += "?width=600";
+    return {
+      title,
+      author: "",
+      cover,
+      publisher: row.publisherLabel?.value || "",
+      year: "",
+      description: "",
+      source: "Wikidata",
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 // Recherche unifiée selon le type d'objet détecté.
 // - livre / inconnu  → Google Books + Open Library + BnF (cascade existante)
 // - revue            → reconnaissance par préfixe (déjà fait côté UI) + Open Food Facts en complément
-// - jeu-switch       → Open Food Facts (UPC normalisé)
-// - jeu-societe      → Open Food Facts
+// - jeu-switch       → KNOWN_GAMES → Open Food Facts → Wikidata (UPC normalisé)
+// - jeu-societe      → KNOWN_GAMES → Open Food Facts → Wikidata
 // Renvoie { title, author, cover, publisher, year, description, source, debug, _type? }
 async function lookupAnyBarcode(code, type) {
   const clean = (code || "").replace(/\D/g, "");
@@ -506,34 +562,79 @@ async function lookupAnyBarcode(code, type) {
     return lookupISBN(clean);
   }
 
-  // Pour les autres types : on tente Open Food Facts en priorité (couvre EAN
-  // et UPC produits), et en parallèle Google Books au cas où (certains jeux
-  // ont étonnamment une fiche Google Books, ex: livres de règles).
+  // === RECONNAISSANCE INTERNE (instantanée, sans réseau) ===
+  // 1) Jeu connu dans KNOWN_GAMES ?
+  const knownGame = recognizeGame(clean);
+  // 2) Revue connue ?
+  const knownMag = recognizeMagazine(clean);
+  // 3) Préfixe éditeur de presse identifié ? (Bayard, Milan, Fleurus…)
+  const pressPub = recognizePressPublisher(clean);
+
+  // === LOOKUP RÉSEAU EN PARALLÈLE ===
   const eanForOFF = upcToEan(clean);
-  const [off, google] = await Promise.all([
-    lookupOpenFoodFacts(eanForOFF),
+  const [off, google, wikidata] = await Promise.all([
+    lookupOpenFoodFacts(eanForOFF).catch(() => null),
     // Google Books peut parfois remonter une fiche pour un produit non-livre
     // (rare mais utile en secours pour le titre). On le met en parallèle.
     lookupGoogleBooks(clean).catch(() => null),
+    // Wikidata couvre bien les jeux Switch et certains jeux de société
+    lookupWikidata(clean).catch(() => null),
   ]);
 
   const debug = {
+    knownGame: knownGame ? `OK (${knownGame.title})` : "rien",
+    knownMag: knownMag ? `OK (${knownMag.title})` : "rien",
+    pressPub: pressPub ? `OK (${pressPub.publisher})` : "rien",
     openFoodFacts: off ? `OK (${off.title?.slice(0, 40)})` : "rien",
     google: google ? `OK (${google.title?.slice(0, 40)})` : "rien",
+    wikidata: wikidata ? `OK (${wikidata.title?.slice(0, 40)})` : "rien",
   };
 
-  // Choix : OFF d'abord (plus pertinent pour produits), puis Google en secours
-  const chosen = off || google;
-  if (!chosen) return { title: "", author: "", cover: "", source: null, debug };
+  // === FUSION SOURCES ===
+  // Priorité titre :
+  //   1. KNOWN_GAMES / KNOWN_MAGAZINES — déterministe et fiable
+  //   2. Open Food Facts — bon pour produits indexés
+  //   3. Wikidata — bon pour jeux/œuvres notables
+  //   4. Google Books — secours
+  //   5. À défaut : "Revue Bayard…" si on a reconnu l'éditeur de presse
+  const pick = (...vals) => vals.find((v) => v !== undefined && v !== null && v !== "") ?? "";
+
+  const title =
+    knownGame?.title ||
+    knownMag?.title ||
+    pick(off?.title, wikidata?.title, google?.title) ||
+    (pressPub ? `Revue ${pressPub.publisher}` : "");
+
+  const publisher =
+    knownGame?.publisher ||
+    knownMag?.publisher ||
+    pressPub?.publisher ||
+    pick(off?.publisher, wikidata?.publisher, google?.publisher);
+
+  // Couverture : OFF > Wikidata > Google
+  const cover = pick(off?.cover, wikidata?.cover, google?.cover);
+
+  // Source affichée
+  let source = null;
+  if (knownGame) source = "Base interne (jeux)";
+  else if (knownMag) source = "Base interne (revues)";
+  else if (off) source = "Open Food Facts";
+  else if (wikidata) source = "Wikidata";
+  else if (google) source = "Google Books";
+  else if (pressPub) source = "Préfixe éditeur";
+
+  if (!title && !cover) {
+    return { title: "", author: "", cover: "", source: null, debug };
+  }
 
   return {
-    title: chosen.title || "",
-    author: chosen.author || "",
-    cover: chosen.cover || "",
+    title,
+    author: pick(google?.author, ""),
+    cover,
     subtitle: "",
-    publisher: chosen.publisher || "",
-    year: chosen.year || "",
-    description: chosen.description || "",
+    publisher,
+    year: pick(google?.year, wikidata?.year, ""),
+    description: pick(off?.description, google?.description, ""),
     categories: "",
     pages: 0,
     language: "",
@@ -543,7 +644,7 @@ async function lookupAnyBarcode(code, type) {
     format: "",
     dimensions: "",
     weight: "",
-    source: chosen.source,
+    source,
     debug,
   };
 }
@@ -1183,26 +1284,57 @@ export default function App() {
       showToast(`Erreur de lecture distante : ${e.message}`, "error");
       return;
     }
-    // Confirmation explicite
-    let msg = `Migrer ${books.length} livre${books.length > 1 ? "s" : ""} et ${structure.bibliotheques.length} bibliothèque${structure.bibliotheques.length > 1 ? "s" : ""} vers la base partagée ?`;
-    if (existing.length > 0) {
-      msg += `\n\n⚠️ La base contient déjà ${existing.length} livre${existing.length > 1 ? "s" : ""}. Vos livres seront AJOUTÉS (risque de doublons).`;
+
+    // === FILTRAGE ANTI-DOUBLONS ===
+    // Critère retenu (cf. choix utilisateur) : un livre local est considéré
+    // comme déjà présent dans la base partagée si SON ISBN existe déjà côté
+    // distant — peu importe son emplacement. Les livres sans ISBN sont
+    // toujours migrés (impossible de comparer).
+    const existingIsbns = new Set(
+      existing
+        .map((b) => (b.isbn || "").replace(/\D/g, ""))
+        .filter((s) => s.length >= 10)
+    );
+    const cleanIsbn = (b) => (b.isbn || "").replace(/\D/g, "");
+    const toMigrate = books.filter((b) => {
+      const isbn = cleanIsbn(b);
+      // Sans ISBN : on migre (pas de moyen de détecter le doublon).
+      if (isbn.length < 10) return true;
+      // Avec ISBN : on ne migre que s'il n'est PAS déjà côté distant.
+      return !existingIsbns.has(isbn);
+    });
+    const skippedCount = books.length - toMigrate.length;
+
+    // Confirmation explicite avec le détail du tri
+    let msg;
+    if (toMigrate.length === 0) {
+      msg = `✅ Tous vos ${books.length} livre${books.length > 1 ? "s sont" : " est"} déjà dans la base partagée. Rien à migrer.`;
+      window.alert(msg);
+      return;
     }
+    msg = `Migrer ${toMigrate.length} livre${toMigrate.length > 1 ? "s" : ""} vers la base partagée ?`;
+    if (skippedCount > 0) {
+      msg += `\n\n${skippedCount} livre${skippedCount > 1 ? "s" : ""} déjà présent${skippedCount > 1 ? "s" : ""} dans la base partagée (même ISBN) ${skippedCount > 1 ? "seront ignorés" : "sera ignoré"}.`;
+    }
+    msg += `\n\nLa structure (${structure.bibliotheques.length} bibliothèque${structure.bibliotheques.length > 1 ? "s" : ""}) sera également synchronisée.`;
     msg += "\n\nVos livres locaux seront conservés.";
     if (!window.confirm(msg)) return;
 
     try {
-      setMigrating({ current: 0, total: books.length });
+      setMigrating({ current: 0, total: toMigrate.length });
       // 1. Pousse la structure (pièces, bibliothèques, étagères)
       await saveStructureRemote(structure);
       // 2. Pousse le layout
       await saveLayoutRemote(layout);
-      // 3. Pousse les livres par lots avec progression
-      await insertBooksBulk(books, (current, total) => {
+      // 3. Pousse uniquement les livres absents de la base, par lots avec progression
+      await insertBooksBulk(toMigrate, (current, total) => {
         setMigrating({ current, total });
       });
       setMigrating(null);
-      showToast(`✅ ${books.length} livres migrés vers la base partagée`);
+      const summary = skippedCount > 0
+        ? `✅ ${toMigrate.length} livre${toMigrate.length > 1 ? "s" : ""} migré${toMigrate.length > 1 ? "s" : ""}, ${skippedCount} ignoré${skippedCount > 1 ? "s" : ""} (déjà présent${skippedCount > 1 ? "s" : ""})`
+        : `✅ ${toMigrate.length} livre${toMigrate.length > 1 ? "s" : ""} migré${toMigrate.length > 1 ? "s" : ""} vers la base partagée`;
+      showToast(summary);
     } catch (e) {
       setMigrating(null);
       showToast(`Erreur de migration : ${e.message}`, "error");
@@ -1222,11 +1354,90 @@ export default function App() {
     return false;
   };
 
+  // === DÉDUPLICATION SUR UNE MÊME ÉTAGÈRE ===
+  // Cherche les groupes de livres ayant le MÊME code-barres ET le MÊME emplacement
+  // (bibliothèque + étagère). Pour chaque groupe, on garde celui avec le plus
+  // d'informations (titre + auteur + couverture + champs enrichis), et on
+  // supprime les autres.
+  // Renvoie { groups: [{ keep, removes }], duplicateCount }
+  const findShelfDuplicates = (booksList) => {
+    // Index par clé "code|bibliotheque|etagere"
+    const groups = new Map();
+    for (const b of booksList) {
+      const code = (b.isbn || "").replace(/\D/g, "");
+      // Pas de code-barres ⇒ on ne peut pas détecter le doublon de manière fiable.
+      if (!code) continue;
+      const key = `${code}|${b.bibliotheque || ""}|${b.etagere || ""}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(b);
+    }
+    // Garder uniquement les groupes avec au moins 2 entrées
+    const dupGroups = [];
+    let totalDuplicates = 0;
+    for (const [, list] of groups) {
+      if (list.length < 2) continue;
+      // Score de complétude : plus c'est gros, mieux c'est
+      const score = (b) => {
+        let s = 0;
+        if (b.title) s += 4;
+        if (b.cover) s += 4;
+        if (b.author) s += 2;
+        if (b.description) s += 1;
+        if (b.pages) s += 1;
+        if (b.publisher) s += 1;
+        if (b.year) s += 1;
+        if (b.categories) s += 1;
+        return s;
+      };
+      const sorted = [...list].sort((a, b) => score(b) - score(a));
+      const keep = sorted[0];
+      const removes = sorted.slice(1);
+      dupGroups.push({ keep, removes });
+      totalDuplicates += removes.length;
+    }
+    return { groups: dupGroups, duplicateCount: totalDuplicates };
+  };
+
+  // Supprime les doublons d'étagère détectés (cf. findShelfDuplicates).
+  // Renvoie le nombre supprimé.
+  const removeShelfDuplicates = async () => {
+    const { groups, duplicateCount } = findShelfDuplicates(books);
+    if (duplicateCount === 0) return 0;
+    const idsToRemove = [];
+    for (const g of groups) {
+      for (const r of g.removes) idsToRemove.push(r.id);
+    }
+    // En cloud : supprimer côté serveur d'abord
+    if (isCloudMode) {
+      for (const id of idsToRemove) {
+        try { await deleteBookRemote(id); } catch (e) { /* ignore */ }
+      }
+    }
+    // État local
+    const idSet = new Set(idsToRemove);
+    setBooks((prev) => {
+      const next = prev.filter((b) => !idSet.has(b.id));
+      if (!isCloudMode) {
+        window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+      }
+      return next;
+    });
+    return duplicateCount;
+  };
+
   const findIncompleteBooks = (booksList) => {
     return booksList.filter((b) => {
-      if (!isLikelyBookISBN(b.isbn)) return false;
-      // Incomplet si manque un champ essentiel OU un champ enrichi
-      // (description, pages, langue, catégories — les plus utiles à enrichir)
+      // On accepte tous les codes-barres exploitables (10+ chiffres),
+      // pas seulement les ISBN livres : revues, jeux, etc.
+      const code = (b.isbn || "").replace(/\D/g, "");
+      if (code.length < 10) return false;
+      // Pour les livres on regarde aussi les champs enrichis ; pour les autres
+      // types, on se contente de titre/couverture (les seuls champs vraiment
+      // critiques pour l'affichage).
+      if (b.type && b.type !== "livre") {
+        return !b.title || !b.cover;
+      }
+      // Livre (par défaut) : critères enrichis
       return !b.title || !b.author || !b.cover ||
              !b.description || !b.pages || !b.language || !b.categories;
     });
@@ -1243,11 +1454,65 @@ export default function App() {
   };
 
   const handleEnrichIncomplete = async () => {
-    const candidates = findIncompleteBooks(books);
+    // === ÉTAPE 1 : DÉDUPLICATION D'ÉTAGÈRE ===
+    // Avant tout enrichissement, on supprime les doublons sur la même étagère
+    // (même code-barres + même emplacement). C'est utile en sortie de scan
+    // rapide où le même livre a parfois été scanné plusieurs fois.
+    const { groups: dupGroups, duplicateCount } = findShelfDuplicates(books);
+    let dedupedCount = 0;
+    if (duplicateCount > 0) {
+      const groupCount = dupGroups.length;
+      const ok = window.confirm(
+        `${duplicateCount} doublon${duplicateCount > 1 ? "s détectés" : " détecté"} sur la même étagère ` +
+        `(${groupCount} groupe${groupCount > 1 ? "s" : ""} de doublons — même code-barres + même emplacement).\n\n` +
+        `Les supprimer avant de relancer la recherche ?\n` +
+        `Pour chaque groupe, l'objet le plus complet (titre + couverture + détails) sera conservé.`
+      );
+      if (ok) {
+        dedupedCount = await removeShelfDuplicates();
+      }
+    }
+
+    // === ÉTAPE 2 : ENRICHISSEMENT ===
+    // On relit l'état "à jour" via le state (qui a été nettoyé si dédupliqué)
+    // pour ne pas lancer de lookup sur des livres qui viennent d'être supprimés.
+    // Pour faire simple : on relit `books` depuis le state, qui est déjà mis à
+    // jour par setBooks dans removeShelfDuplicates. Mais en pratique le rendu
+    // n'a pas eu lieu. On reconstruit donc une liste "candidats" cohérente.
+    let booksToScan = books;
+    if (dedupedCount > 0) {
+      // Reconstruit la liste en excluant les ids supprimés (même logique que
+      // removeShelfDuplicates pour rester cohérent avec ce qui se passe sur
+      // l'écran en arrière-plan).
+      const { groups } = findShelfDuplicates(books);
+      const removedIds = new Set();
+      for (const g of groups) {
+        for (const r of g.removes) removedIds.add(r.id);
+      }
+      booksToScan = books.filter((b) => !removedIds.has(b.id));
+    }
+
+    // Sont éligibles : tous les objets avec un code-barres exploitable
+    // (livre via ISBN OU revue/jeu via EAN/UPC), incomplets sur titre/cover.
+    // On élargit ainsi par rapport à findIncompleteBooks qui ne ciblait que
+    // les ISBN-livres : maintenant les jeux et revues incomplets sont aussi
+    // re-recherchés (via lookupAnyBarcode + recognizeMagazine + Wikidata).
+    const candidates = booksToScan.filter((b) => {
+      const code = (b.isbn || "").replace(/\D/g, "");
+      if (code.length < 10) return false;
+      // Incomplet si manque titre OU couverture (les 2 infos clés à afficher)
+      return !b.title || !b.cover;
+    });
+
     if (candidates.length === 0) {
-      showToast("Tous les livres avec ISBN valide sont déjà complets");
+      if (dedupedCount > 0) {
+        showToast(`${dedupedCount} doublon${dedupedCount > 1 ? "s supprimé" + (dedupedCount > 1 ? "s" : "") : " supprimé"} — rien à compléter`);
+      } else {
+        showToast("Tous les objets avec code-barres valide sont déjà complets");
+      }
       return;
     }
+
     enrichCancelRef.current = false;
     setEnrichProgress({ current: 0, total: candidates.length, found: 0, updated: 0, mode: "incomplete" });
     let found = 0;
@@ -1256,27 +1521,57 @@ export default function App() {
       if (enrichCancelRef.current) break;
       const book = candidates[i];
       try {
-        const result = await lookupISBN(book.isbn);
-        if (result && (result.title || result.cover)) {
+        // Détection du type d'objet pour aiguillage (livre / revue / jeu / …)
+        const detectedType = book.type || guessTypeFromBarcode(book.isbn);
+        // Reconnaissance d'une revue connue via préfixe EAN/ISSN (rapide, sans réseau)
+        let magazineMatch = null;
+        if (detectedType === "revue") {
+          magazineMatch = recognizeMagazine(book.isbn);
+        }
+        // Lookup en ligne adapté au type (Google/OL/BnF pour les livres,
+        // Open Food Facts / Wikidata pour les autres types)
+        const result = await lookupAnyBarcode(book.isbn, detectedType);
+
+        // Fusion : on combine reconnaissance interne (revue) + résultat réseau
+        const merged = {
+          title: magazineMatch?.title || result?.title || "",
+          publisher: magazineMatch?.publisher || result?.publisher || "",
+          author: result?.author || "",
+          cover: result?.cover || "",
+          subtitle: result?.subtitle || "",
+          pages: result?.pages || 0,
+          language: result?.language || "",
+          description: result?.description || "",
+          categories: result?.categories || "",
+          rating: result?.rating || 0,
+          ratingsCount: result?.ratingsCount || 0,
+          infoLink: result?.infoLink || "",
+          format: result?.format || "",
+          dimensions: result?.dimensions || "",
+          weight: result?.weight || "",
+          year: result?.year || "",
+        };
+
+        if (merged.title || merged.cover) {
           found++;
           const updates = {};
           // Ne remplace QUE les champs vides — préserve les éditions manuelles
-          if (!book.title && result.title) updates.title = result.title;
-          if (!book.author && result.author) updates.author = result.author;
-          if (!book.cover && result.cover) updates.cover = result.cover;
-          if (!book.subtitle && result.subtitle) updates.subtitle = result.subtitle;
-          if (!book.pages && result.pages) updates.pages = result.pages;
-          if (!book.language && result.language) updates.language = result.language;
-          if (!book.description && result.description) updates.description = result.description;
-          if (!book.categories && result.categories) updates.categories = result.categories;
-          if (!book.rating && result.rating) updates.rating = result.rating;
-          if (!book.ratingsCount && result.ratingsCount) updates.ratingsCount = result.ratingsCount;
-          if (!book.infoLink && result.infoLink) updates.infoLink = result.infoLink;
-          if (!book.format && result.format) updates.format = result.format;
-          if (!book.dimensions && result.dimensions) updates.dimensions = result.dimensions;
-          if (!book.weight && result.weight) updates.weight = result.weight;
-          if (!book.publisher && result.publisher) updates.publisher = result.publisher;
-          if (!book.year && result.year) updates.year = result.year;
+          if (!book.title && merged.title) updates.title = merged.title;
+          if (!book.author && merged.author) updates.author = merged.author;
+          if (!book.cover && merged.cover) updates.cover = merged.cover;
+          if (!book.subtitle && merged.subtitle) updates.subtitle = merged.subtitle;
+          if (!book.pages && merged.pages) updates.pages = merged.pages;
+          if (!book.language && merged.language) updates.language = merged.language;
+          if (!book.description && merged.description) updates.description = merged.description;
+          if (!book.categories && merged.categories) updates.categories = merged.categories;
+          if (!book.rating && merged.rating) updates.rating = merged.rating;
+          if (!book.ratingsCount && merged.ratingsCount) updates.ratingsCount = merged.ratingsCount;
+          if (!book.infoLink && merged.infoLink) updates.infoLink = merged.infoLink;
+          if (!book.format && merged.format) updates.format = merged.format;
+          if (!book.dimensions && merged.dimensions) updates.dimensions = merged.dimensions;
+          if (!book.weight && merged.weight) updates.weight = merged.weight;
+          if (!book.publisher && merged.publisher) updates.publisher = merged.publisher;
+          if (!book.year && merged.year) updates.year = merged.year;
           if (Object.keys(updates).length > 0) {
             updated++;
             await persistBookUpdate(book.id, updates);
@@ -1289,9 +1584,10 @@ export default function App() {
     const wasCancelled = enrichCancelRef.current;
     setEnrichProgress(null);
     if (wasCancelled) {
-      showToast(`Annulé — ${updated} livre${updated > 1 ? "s" : ""} mis à jour`);
+      showToast(`Annulé — ${updated} objet${updated > 1 ? "s" : ""} mis à jour`);
     } else {
-      showToast(`Terminé — ${updated} livre${updated > 1 ? "s" : ""} enrichi${updated > 1 ? "s" : ""} sur ${candidates.length}`);
+      const dedupMsg = dedupedCount > 0 ? ` (${dedupedCount} doublon${dedupedCount > 1 ? "s supprimés" : " supprimé"})` : "";
+      showToast(`Terminé — ${updated} objet${updated > 1 ? "s" : ""} enrichi${updated > 1 ? "s" : ""} sur ${candidates.length}${dedupMsg}`);
     }
   };
 
@@ -3565,11 +3861,22 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
     // Détection du type d'objet d'après le format/préfixe du code-barres
     const detectedType = guessTypeFromBarcode(code);
 
-    // Reconnaissance d'une revue connue (préfixe EAN ou ISSN) — on pré-remplit
-    // le titre et l'éditeur dès le scan, sans attendre le réseau.
+    // === RECONNAISSANCE INTERNE INSTANTANÉE (sans réseau) ===
+    // 1) Revue connue ?
     let magazineMatch = null;
     if (detectedType === "revue") {
       magazineMatch = recognizeMagazine(code);
+    }
+    // 2) Jeu connu (Switch ou société) ?
+    let gameMatch = null;
+    if (detectedType === "jeu-switch" || detectedType === "jeu-societe") {
+      gameMatch = recognizeGame(code);
+    }
+    // 3) Éditeur de presse identifié par préfixe ?
+    //    (utile quand on a détecté "revue" mais sans match magazineMatch précis)
+    let pressMatch = null;
+    if (detectedType === "revue" && !magazineMatch) {
+      pressMatch = recognizePressPublisher(code);
     }
 
     // Petit feedback flash brief sans bloquer
@@ -3579,21 +3886,25 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
       setPhase((p) => (p === "flash" ? "scanning" : p));
     }, 300);
 
-    // Ajout placeholder immédiat avec le bon type (et titre pré-rempli si revue connue)
+    // Ajout placeholder immédiat avec le bon type (et titre pré-rempli si la
+    // base interne a déjà reconnu l'objet — revue, jeu, ou éditeur de presse).
     const placeholder = {
       _placeholderId: placeholderId,
       type: detectedType,
       isbn: code,
-      title: magazineMatch?.title || "",
+      title: magazineMatch?.title || gameMatch?.title || "",
       author: "",
       cover: "",
-      publisher: magazineMatch?.publisher || "",
+      publisher: magazineMatch?.publisher || gameMatch?.publisher || pressMatch?.publisher || "",
       bibliotheque: placeholderBib,
       etagere: placeholderEtagere,
       position: placeholderPosition,
       notes: magazineMatch?.ageRange || "",
     };
-    if (detectedType === "jeu-switch") placeholder.platform = "Nintendo Switch";
+    // Plate-forme par défaut pour les jeux Switch
+    if (detectedType === "jeu-switch") {
+      placeholder.platform = gameMatch?.platform || "Nintendo Switch";
+    }
     await onAddBook(placeholder);
     setLastBook(placeholder);
     setBatchHistory((h) => [placeholder, ...h]);
