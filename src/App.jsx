@@ -112,6 +112,39 @@ const ICON_CHOICES = ["🍽️", "🛋️", "🛏️", "📚", "🚪", "🪑", "
 const genId = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
 // ============================================================
+// PLACEMENT INTELLIGENT DES OBJETS SUR UNE ÉTAGÈRE
+// ============================================================
+// Cherche la première position libre sur une étagère donnée, en regardant les
+// livres déjà placés à cet emplacement (même bibliothèque + même numéro
+// d'étagère). On commence à 1 et on monte tant que la position est occupée,
+// en s'arrêtant à la première qui est libre — ça permet aussi de "boucher les
+// trous" si un livre a été supprimé au milieu de l'étagère.
+//
+// Paramètres :
+//   - books : liste complète des objets de la bibliothèque
+//   - bibId : id de la bibliothèque
+//   - etagere : numéro de l'étagère (1, 2, 3…)
+//   - extraReserved : positions supplémentaires à considérer comme prises
+//     (utilisé en mode batch pour tenir compte des livres scannés à l'instant
+//     même qui n'ont pas encore été reflétés dans `books`).
+//
+// Renvoie : un entier ≥ 1.
+function findFirstFreePosition(books, bibId, etagere, extraReserved = []) {
+  // Index des positions occupées sur cette étagère précise
+  const taken = new Set(extraReserved);
+  for (const b of books || []) {
+    if (b.bibliotheque === bibId && Number(b.etagere) === Number(etagere)) {
+      const p = Number(b.position);
+      if (Number.isFinite(p) && p >= 1) taken.add(p);
+    }
+  }
+  // Cherche le premier entier ≥ 1 absent du set
+  let pos = 1;
+  while (taken.has(pos)) pos++;
+  return pos;
+}
+
+// ============================================================
 // COMPRESSION D'IMAGE (couvertures et photos d'objets)
 // ============================================================
 // Les photos prises au smartphone pèsent souvent 2 à 8 Mo en HD. Stocker ça
@@ -1985,6 +2018,7 @@ export default function App() {
         )}
         {view === "add" && (
           <AddView
+            books={books}
             structure={structure}
             onCancel={() => setView("home")}
             onAdd={addBook}
@@ -2004,6 +2038,7 @@ export default function App() {
         )}
         {view === "edit" && selectedBook && (
           <EditView
+            books={books}
             book={selectedBook}
             structure={structure}
             onCancel={() => setView("detail")}
@@ -2325,7 +2360,7 @@ function BookCard({ book, structure, onClick, index }) {
 }
 
 // === VUE AJOUT ===
-function AddView({ structure, onCancel, onAdd, onEnrichBook, onEnrichBookById, showToast }) {
+function AddView({ books, structure, onCancel, onAdd, onEnrichBook, onEnrichBookById, showToast }) {
   const [mode, setMode] = useState("choice"); // choice, barcode, cover, manual, form, batch-setup, batch-scan
   const [scannedData, setScannedData] = useState(null);
   const [searching, setSearching] = useState(false);
@@ -2511,6 +2546,7 @@ function AddView({ structure, onCancel, onAdd, onEnrichBook, onEnrichBookById, s
 
       {mode === "batch-setup" && (
         <BatchSetup
+          books={books}
           structure={structure}
           onCancel={() => setMode("choice")}
           onStart={(setup) => {
@@ -2522,6 +2558,7 @@ function AddView({ structure, onCancel, onAdd, onEnrichBook, onEnrichBookById, s
 
       {mode === "batch-scan" && batchSetup && (
         <BatchScanner
+          books={books}
           structure={structure}
           setup={batchSetup}
           onAddBook={(book) => onAdd(book, { silent: true })}
@@ -2553,6 +2590,7 @@ function AddView({ structure, onCancel, onAdd, onEnrichBook, onEnrichBookById, s
 
       {mode === "form" && (
         <BookForm
+          books={books}
           structure={structure}
           initial={scannedData || {}}
           onCancel={() => setMode("choice")}
@@ -2909,18 +2947,44 @@ function CoverScanner({ onCancel, onCapture }) {
 }
 
 // === FORMULAIRE ===
-function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
+function BookForm({ books, structure, initial, onCancel, onSubmit, submitLabel }) {
   // Type d'objet (livre/revue/jeu-societe/jeu-switch)
   const [type, setType] = useState(initial.type || "livre");
   const fields = FIELDS_BY_TYPE[type] || FIELDS_BY_TYPE.livre;
+
+  // Marque "création" : si initial.id est absent, on est sur un nouveau livre.
+  // Dans ce cas la position sera auto-calculée. En édition, on respecte la
+  // position d'origine sauf si l'utilisateur la change manuellement.
+  const isCreation = !initial.id;
 
   const [title, setTitle] = useState(initial.title || "");
   const [author, setAuthor] = useState(initial.author || "");
   const [isbn, setIsbn] = useState(initial.isbn || "");
   const [cover, setCover] = useState(initial.cover || "");
-  const [bibliotheque, setBibliotheque] = useState(initial.bibliotheque || structure.bibliotheques[0]?.id || "");
-  const [etagere, setEtagere] = useState(initial.etagere || "1");
-  const [position, setPosition] = useState(initial.position || "1");
+  const initialBib = initial.bibliotheque || structure.bibliotheques[0]?.id || "";
+  const initialEtagere = initial.etagere || "1";
+  const [bibliotheque, setBibliotheque] = useState(initialBib);
+  const [etagere, setEtagere] = useState(initialEtagere);
+  // Position : en création, on cherche la première position libre sur la
+  // bib+étagère retenues ; en édition, on garde la position du livre.
+  const [position, setPosition] = useState(() => {
+    if (initial.position) return String(initial.position);
+    if (isCreation && books) {
+      return String(findFirstFreePosition(books, initialBib, parseInt(initialEtagere) || 1));
+    }
+    return "1";
+  });
+  // Drapeau : l'utilisateur a-t-il modifié la position à la main ? Si oui on
+  // arrête de la recalculer automatiquement quand bib/étagère changent.
+  const positionTouchedRef = useRef(!!initial.position);
+  // Recalcule la position quand bib/étagère changent en mode création, sauf
+  // si l'utilisateur a déjà touché à la position manuellement.
+  useEffect(() => {
+    if (!isCreation || positionTouchedRef.current || !books) return;
+    const free = findFirstFreePosition(books, bibliotheque, parseInt(etagere) || 1);
+    setPosition(String(free));
+  }, [bibliotheque, etagere, isCreation, books]);
+
   const [notes, setNotes] = useState(initial.notes || "");
   const [retrying, setRetrying] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
@@ -3346,7 +3410,10 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
             type="number"
             min="1"
             value={position}
-            onChange={(e) => setPosition(e.target.value)}
+            onChange={(e) => {
+              positionTouchedRef.current = true;
+              setPosition(e.target.value);
+            }}
             className="w-full p-3 rounded-lg border-2 outline-none"
             style={{ borderColor: "var(--parchment)" }}
           />
@@ -3824,10 +3891,27 @@ function DetailRow({ label, value, suffix = "" }) {
 }
 
 // === SETUP DU SCAN EN SÉRIE ===
-function BatchSetup({ structure, onCancel, onStart }) {
-  const [bibliotheque, setBibliotheque] = useState(structure.bibliotheques[0]?.id || "");
+function BatchSetup({ books, structure, onCancel, onStart }) {
+  const initialBib = structure.bibliotheques[0]?.id || "";
+  const [bibliotheque, setBibliotheque] = useState(initialBib);
   const [etagere, setEtagere] = useState("1");
-  const [position, setPosition] = useState("1");
+  // La position de départ est calculée automatiquement à partir des livres
+  // déjà placés sur l'étagère sélectionnée. L'utilisateur peut toujours la
+  // surcharger manuellement (ex. pour redémarrer un scan inachevé), mais le
+  // défaut est intelligent : on propose la première position libre.
+  const [position, setPosition] = useState(() => {
+    if (!books || !initialBib) return "1";
+    return String(findFirstFreePosition(books, initialBib, 1));
+  });
+  // Drapeau : l'utilisateur a-t-il modifié la position à la main ? Si oui, on
+  // n'écrase plus son choix quand bib/étagère changent.
+  const positionTouchedRef = useRef(false);
+  // Recalcule la position quand bib/étagère changent (sauf override manuel).
+  useEffect(() => {
+    if (positionTouchedRef.current || !books) return;
+    const free = findFirstFreePosition(books, bibliotheque, parseInt(etagere) || 1);
+    setPosition(String(free));
+  }, [bibliotheque, etagere, books]);
 
   return (
     <div className="space-y-4">
@@ -3875,12 +3959,19 @@ function BatchSetup({ structure, onCancel, onStart }) {
             type="number"
             min="1"
             value={position}
-            onChange={(e) => setPosition(e.target.value)}
+            onChange={(e) => {
+              positionTouchedRef.current = true;
+              setPosition(e.target.value);
+            }}
             className="w-full p-3 rounded-lg border-2 outline-none"
             style={{ borderColor: "var(--parchment)" }}
           />
         </Field>
       </div>
+
+      <p className="text-xs" style={{ color: "var(--ink-soft)" }}>
+        💡 La position proposée est la première place libre sur l'étagère selon vos données. Modifiez-la si vous voulez démarrer ailleurs.
+      </p>
 
       <button
         onClick={() => onStart({
@@ -3901,7 +3992,7 @@ function BatchSetup({ structure, onCancel, onStart }) {
 }
 
 // === SCANNER EN SÉRIE ===
-function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookById, onChangeShelf, onFinish, showToast }) {
+function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnrichBookById, onChangeShelf, onFinish, showToast }) {
   const [currentSetup, setCurrentSetup] = useState(setup);
   const [phase, setPhase] = useState("scanning"); // scanning, processing, confirming, paused
   const [lastBook, setLastBook] = useState(null);
@@ -3909,6 +4000,12 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
   const [showShelfChange, setShowShelfChange] = useState(false);
   const [cameraStarted, setCameraStarted] = useState(false);
   const [starting, setStarting] = useState(false);
+  // Positions déjà attribuées dans cette session de scan, par étagère.
+  // Sert à éviter qu'un scan en cours d'enrichissement ne se voie attribuer
+  // la même position qu'un autre scan parallèle (les livres ne sont pas
+  // toujours immédiatement reflétés dans `books` à cause du realtime).
+  // Clé : `${bibId}|${etagere}` — Valeur : Set de positions occupées.
+  const sessionTakenRef = useRef(new Map());
   // Modale "prendre une photo de fallback" : { bookId, isbn, type, title } ou null
   // Apparaît quand un scan ne permet pas de récupérer de jaquette en ligne.
   const [photoFallback, setPhotoFallback] = useState(null);
@@ -4072,9 +4169,33 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
     // de magazines sans jaquette).
     if (photoFallbackActiveRef.current) return;
     const placeholderId = Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6);
-    const placeholderPosition = currentSetup.position;
     const placeholderBib = currentSetup.bibliotheque;
     const placeholderEtagere = currentSetup.etagere;
+
+    // === CALCUL DE LA POSITION ===
+    // On cherche la première position libre sur l'étagère sélectionnée, en
+    // tenant compte :
+    //   - des livres déjà présents dans `books` (prop)
+    //   - des positions prises pendant cette session de scan rapide qui ne
+    //     sont pas encore reflétées dans `books` (sessionTakenRef).
+    //
+    // ⚠️ On respecte aussi `currentSetup.position` qui est la valeur "de
+    // départ" choisie par l'utilisateur dans BatchSetup. Si elle est plus
+    // grande que la première position libre auto-calculée, c'est que
+    // l'utilisateur veut explicitement démarrer plus loin (ex. il sait que
+    // les premières positions sont libres mais veut commencer à 5). Dans ce
+    // cas on prend max(setupPosition, autoFreePosition).
+    const shelfKey = `${placeholderBib}|${placeholderEtagere}`;
+    const sessionSet = sessionTakenRef.current.get(shelfKey) || new Set();
+    const extraReserved = Array.from(sessionSet);
+    const autoFree = findFirstFreePosition(books, placeholderBib, placeholderEtagere, extraReserved);
+    // currentSetup.position reflète la "prochaine position pressentie" : au
+    // démarrage = position de départ utilisateur, après chaque scan = la
+    // prochaine cherchée. On le considère comme une borne minimale.
+    const placeholderPosition = Math.max(autoFree, currentSetup.position || 1);
+    // Marque cette position comme prise pour les scans suivants de la session
+    sessionSet.add(placeholderPosition);
+    sessionTakenRef.current.set(shelfKey, sessionSet);
 
     // Détection du type d'objet d'après le format/préfixe du code-barres
     const detectedType = guessTypeFromBarcode(code);
@@ -4133,7 +4254,11 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
     const trackedBook = { ...placeholder, id: dbId };
     setLastBook(trackedBook);
     setBatchHistory((h) => [trackedBook, ...h]);
-    setCurrentSetup((s) => ({ ...s, position: s.position + 1 }));
+    // Affiche la prochaine position envisagée (juste après celle qu'on vient
+    // d'attribuer). Le vrai calcul a lieu au prochain scan via
+    // findFirstFreePosition + sessionTakenRef ; cette valeur sert d'abord à
+    // l'UX (afficher "Prochaine position : N") et de borne minimale.
+    setCurrentSetup((s) => ({ ...s, position: placeholderPosition + 1 }));
 
     // Lookup en arrière-plan — l'objet sera mis à jour quand le résultat arrive.
     // On utilise la source adaptée au type via lookupAnyBarcode.
@@ -4216,24 +4341,39 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
 
   const undoLast = () => {
     if (batchHistory.length === 0) return;
-    // Reculer la position
+    const last = batchHistory[0];
+    // Libère la position prise dans la session de scan en cours pour que les
+    // prochains scans puissent la réutiliser. Ne touche pas aux positions des
+    // livres déjà persistés en BDD (qui restent bien à leur place).
+    if (last && last.bibliotheque && last.etagere && last.position) {
+      const shelfKey = `${last.bibliotheque}|${last.etagere}`;
+      const sessionSet = sessionTakenRef.current.get(shelfKey);
+      if (sessionSet) sessionSet.delete(Number(last.position));
+    }
+    // Recule la "prochaine position pressentie" de 1, sans descendre sous 1.
+    // Le calcul réel via findFirstFreePosition prendra la main au prochain scan.
     setCurrentSetup((s) => ({ ...s, position: Math.max(1, s.position - 1) }));
     setBatchHistory((h) => h.slice(1));
     setLastBook(batchHistory[1] || null);
-    showToast("Dernier livre conservé, position reculée");
+    showToast("Position reculée — la place est libérée");
   };
 
   const changeShelf = (newEtagere) => {
-    setCurrentSetup((s) => ({ ...s, etagere: parseInt(newEtagere) || 1, position: 1 }));
+    const etagereNum = parseInt(newEtagere) || 1;
+    // Calcule la première position libre sur la nouvelle étagère
+    const free = findFirstFreePosition(books, currentSetup.bibliotheque, etagereNum);
+    setCurrentSetup((s) => ({ ...s, etagere: etagereNum, position: free }));
     setShowShelfChange(false);
-    showToast(`Étagère ${newEtagere} — position 1`);
+    showToast(`Étagère ${newEtagere} — démarrage en position ${free}`);
     setPhase("scanning");
   };
 
   const changeBibliotheque = (newBib) => {
-    setCurrentSetup({ bibliotheque: newBib, etagere: 1, position: 1 });
+    // Calcule la première position libre sur l'étagère 1 de la nouvelle bib
+    const free = findFirstFreePosition(books, newBib, 1);
+    setCurrentSetup({ bibliotheque: newBib, etagere: 1, position: free });
     setShowShelfChange(false);
-    showToast("Nouvelle bibliothèque — étagère 1, position 1");
+    showToast(`Nouvelle bibliothèque — étagère 1, position ${free}`);
     setPhase("scanning");
   };
 
@@ -4257,7 +4397,15 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
               {currentBib?.nom}
             </div>
             <div className="text-sm mt-1" style={{ color: "var(--parchment)" }}>
-              Étagère <strong>{currentSetup.etagere}</strong> · Prochaine position <strong>{currentSetup.position}</strong>
+              Étagère <strong>{currentSetup.etagere}</strong> · Prochaine position <strong>{(() => {
+                // Calcul en live de la VRAIE prochaine position libre, en
+                // tenant compte de `books` ET des positions prises dans la
+                // session de scan en cours.
+                const shelfKey = `${currentSetup.bibliotheque}|${currentSetup.etagere}`;
+                const sessionSet = sessionTakenRef.current.get(shelfKey) || new Set();
+                const auto = findFirstFreePosition(books, currentSetup.bibliotheque, currentSetup.etagere, Array.from(sessionSet));
+                return Math.max(auto, currentSetup.position || 1);
+              })()}</strong>
             </div>
           </div>
           <button
@@ -4624,13 +4772,14 @@ function PhotoFallbackModal({ info, onSkip, onCapture }) {
 }
 
 
-function EditView({ book, structure, onCancel, onSave }) {
+function EditView({ books, book, structure, onCancel, onSave }) {
   return (
     <div>
       <button onClick={onCancel} className="flex items-center gap-1 mb-4" style={{ color: "var(--leather)" }}>
         <X className="w-5 h-5" /> Annuler
       </button>
       <BookForm
+        books={books}
         structure={structure}
         initial={book}
         onCancel={onCancel}
