@@ -1568,21 +1568,23 @@ export default function App() {
     return duplicateCount;
   };
 
+  // Détecte les objets vraiment incomplets : ceux dont il manque le TITRE
+  // OU la COUVERTURE. Ce sont les seuls champs critiques pour l'affichage et
+  // ce sont ceux qu'une lookup en ligne va pouvoir récupérer de manière
+  // fiable. On ne flagge PAS les livres qui ont titre+cover mais où il manque
+  // description/pages/catégories : ces champs ne sont pas toujours fournis
+  // par les sources publiques, leur absence n'est pas un défaut.
+  // Cette définition est volontairement alignée sur le filtre utilisé par
+  // handleEnrichIncomplete pour que le compte affiché et le compte traité
+  // soient identiques.
   const findIncompleteBooks = (booksList) => {
     return booksList.filter((b) => {
       // On accepte tous les codes-barres exploitables (10+ chiffres),
       // pas seulement les ISBN livres : revues, jeux, etc.
       const code = (b.isbn || "").replace(/\D/g, "");
       if (code.length < 10) return false;
-      // Pour les livres on regarde aussi les champs enrichis ; pour les autres
-      // types, on se contente de titre/couverture (les seuls champs vraiment
-      // critiques pour l'affichage).
-      if (b.type && b.type !== "livre") {
-        return !b.title || !b.cover;
-      }
-      // Livre (par défaut) : critères enrichis
-      return !b.title || !b.author || !b.cover ||
-             !b.description || !b.pages || !b.language || !b.categories;
+      // Critère unifié : incomplet si manque titre OU couverture.
+      return !b.title || !b.cover;
     });
   };
 
