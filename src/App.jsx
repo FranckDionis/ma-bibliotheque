@@ -112,6 +112,49 @@ const ICON_CHOICES = ["🍽️", "🛋️", "🛏️", "📚", "🚪", "🪑", "
 const genId = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
 // ============================================================
+// COMPRESSION D'IMAGE (couvertures et photos d'objets)
+// ============================================================
+// Les photos prises au smartphone pèsent souvent 2 à 8 Mo en HD. Stocker ça
+// brut dans Supabase coûte très cher en bande passante, en quota, et alourdit
+// l'export JSON. On compresse à ~600 px de large + JPEG qualité 0.7
+// ⇒ typiquement 50–100 Ko, suffisant pour afficher une couverture sans perte
+// visible. Cohérent avec la taille des couvertures Open Library / Google Books.
+//
+// Renvoie une data URL JPEG compressée, ou la source originale si quoi que
+// ce soit échoue (on ne bloque jamais l'utilisateur en cas d'erreur image).
+async function compressImageDataUrl(srcDataUrl, opts = {}) {
+  const maxWidth = opts.maxWidth || 600;
+  const quality = opts.quality ?? 0.7;
+  if (!srcDataUrl || typeof srcDataUrl !== "string") return srcDataUrl;
+  // Si ce n'est pas une data URL ni un blob/objet local, on ne touche pas
+  // (par ex. couverture distante https://covers.openlibrary.org…)
+  if (!srcDataUrl.startsWith("data:") && !srcDataUrl.startsWith("blob:")) {
+    return srcDataUrl;
+  }
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = reject;
+      im.src = srcDataUrl;
+    });
+    // Calcule la taille cible en respectant le ratio ; ne jamais agrandir
+    const ratio = img.width > 0 ? maxWidth / img.width : 1;
+    const targetW = ratio < 1 ? maxWidth : img.width;
+    const targetH = ratio < 1 ? Math.round(img.height * ratio) : img.height;
+    const canvas = document.createElement("canvas");
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return srcDataUrl;
+    ctx.drawImage(img, 0, 0, targetW, targetH);
+    return canvas.toDataURL("image/jpeg", quality);
+  } catch (e) {
+    return srcDataUrl;
+  }
+}
+
+// ============================================================
 // Module unifié de scan code-barres (ZXing + fallback natif)
 // Charge ZXing dynamiquement depuis CDN une seule fois.
 // ZXing fonctionne dans Safari iOS, contrairement à BarcodeDetector.
@@ -1136,6 +1179,10 @@ export default function App() {
   };
 
   // Mise à jour en mode batch (pas de toast, par placeholder ID)
+  // ⚠️ Cette fonction est moins robuste : la souscription realtime de Supabase
+  // recharge la liste depuis la BDD (qui n'a pas la colonne _placeholderId), ce
+  // qui peut effacer le _placeholderId localement avant que le lookup ait
+  // terminé. Préférer enrichBookById ci-dessous quand on connaît l'ID DB.
   const enrichBookByPlaceholder = async (placeholderId, updates) => {
     if (isCloudMode) {
       // En mode cloud, on cherche le livre par son _placeholderId pour récupérer son UUID Supabase
@@ -1151,6 +1198,31 @@ export default function App() {
       setBooks((prev) => {
         const next = prev.map((b) =>
           b._placeholderId === placeholderId ? { ...b, ...updates } : b
+        );
+        window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+        return next;
+      });
+    }
+  };
+
+  // Mise à jour en mode batch par ID DB direct (sans toast).
+  // C'est l'API à privilégier pour le scan rapide : plus robuste car insensible
+  // au realtime qui peut écraser le _placeholderId côté client.
+  const enrichBookById = async (id, updates) => {
+    if (!id) return;
+    if (isCloudMode) {
+      try {
+        const updated = await updateBookRemote(id, updates);
+        // L'event realtime arrivera et rafraîchira aussi la liste, mais on
+        // applique tout de suite localement pour un feedback immédiat.
+        setBooks((prev) => prev.map((b) =>
+          b.id === id ? { ...b, ...updated } : b
+        ));
+      } catch (e) { /* ignore */ }
+    } else {
+      setBooks((prev) => {
+        const next = prev.map((b) =>
+          b.id === id ? { ...b, ...updates } : b
         );
         window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
         return next;
@@ -1844,6 +1916,7 @@ export default function App() {
             onCancel={() => setView("home")}
             onAdd={addBook}
             onEnrichBook={enrichBookByPlaceholder}
+            onEnrichBookById={enrichBookById}
             showToast={showToast}
           />
         )}
@@ -2179,7 +2252,7 @@ function BookCard({ book, structure, onClick, index }) {
 }
 
 // === VUE AJOUT ===
-function AddView({ structure, onCancel, onAdd, onEnrichBook, showToast }) {
+function AddView({ structure, onCancel, onAdd, onEnrichBook, onEnrichBookById, showToast }) {
   const [mode, setMode] = useState("choice"); // choice, barcode, cover, manual, form, batch-setup, batch-scan
   const [scannedData, setScannedData] = useState(null);
   const [searching, setSearching] = useState(false);
@@ -2380,6 +2453,7 @@ function AddView({ structure, onCancel, onAdd, onEnrichBook, showToast }) {
           setup={batchSetup}
           onAddBook={(book) => onAdd(book, { silent: true })}
           onEnrichBook={onEnrichBook}
+          onEnrichBookById={onEnrichBookById}
           onChangeShelf={(newSetup) => setBatchSetup(newSetup)}
           onFinish={() => setMode("choice")}
           showToast={showToast}
@@ -2720,7 +2794,13 @@ function CoverScanner({ onCancel, onCapture }) {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => onCapture(ev.target.result);
+    reader.onload = async (ev) => {
+      // Compression avant transmission au parent — réduit drastiquement la
+      // taille (typiquement 5 Mo → 80 Ko) sans perte visuelle pour une
+      // couverture de livre.
+      const compressed = await compressImageDataUrl(ev.target.result);
+      onCapture(compressed);
+    };
     reader.readAsDataURL(file);
   };
 
@@ -2800,7 +2880,11 @@ function BookForm({ structure, initial, onCancel, onSubmit, submitLabel }) {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => setCover(ev.target.result);
+    reader.onload = async (ev) => {
+      // Compression avant stockage — voir compressImageDataUrl pour les détails.
+      const compressed = await compressImageDataUrl(ev.target.result);
+      setCover(compressed);
+    };
     reader.readAsDataURL(file);
   };
 
@@ -3744,7 +3828,7 @@ function BatchSetup({ structure, onCancel, onStart }) {
 }
 
 // === SCANNER EN SÉRIE ===
-function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf, onFinish, showToast }) {
+function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookById, onChangeShelf, onFinish, showToast }) {
   const [currentSetup, setCurrentSetup] = useState(setup);
   const [phase, setPhase] = useState("scanning"); // scanning, processing, confirming, paused
   const [lastBook, setLastBook] = useState(null);
@@ -3752,6 +3836,29 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
   const [showShelfChange, setShowShelfChange] = useState(false);
   const [cameraStarted, setCameraStarted] = useState(false);
   const [starting, setStarting] = useState(false);
+  // Modale "prendre une photo de fallback" : { bookId, isbn, type, title } ou null
+  // Apparaît quand un scan ne permet pas de récupérer de jaquette en ligne.
+  const [photoFallback, setPhotoFallback] = useState(null);
+  // File d'attente des fallbacks photo : si plusieurs scans terminent sans
+  // jaquette pendant qu'on traite le précédent, on les empile pour ne perdre
+  // aucune occasion de photo.
+  const photoFallbackQueueRef = useRef([]);
+  // Pousse dans la file. Si rien d'actif, on déclenche immédiatement.
+  const queuePhotoFallback = (info) => {
+    setPhotoFallback((current) => {
+      if (current) {
+        // Une modale est déjà visible → on empile pour plus tard
+        photoFallbackQueueRef.current.push(info);
+        return current;
+      }
+      return info;
+    });
+  };
+  // Vide la modale, et passe au suivant s'il y en a un en attente.
+  const dismissPhotoFallback = () => {
+    const next = photoFallbackQueueRef.current.shift() || null;
+    setPhotoFallback(next);
+  };
 
   const videoRef = useRef(null);
   const readerRef = useRef(null);
@@ -3802,10 +3909,12 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
   // Mais on ne tient pas compte de ça dans cet effet : la caméra reste allumée
   // dans tous ces états.
 
-  // Stoppe le scanner SEULEMENT pour les phases vraiment bloquantes (modale, pause)
+  // Stoppe le scanner SEULEMENT pour les phases vraiment bloquantes (modale, pause).
+  // On stoppe aussi quand la modale "photo de fallback" est ouverte : la caméra
+  // système (input capture) prendra le relais et il y aurait conflit sinon.
   useEffect(() => {
     if (!cameraStarted) return;
-    if (phase === "paused") {
+    if (phase === "paused" || photoFallback) {
       if (readerRef.current) {
         try { readerRef.current.stop(); } catch (e) { /* ignore */ }
         readerRef.current = null;
@@ -3814,7 +3923,7 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
     }
     // Si on a déjà un reader actif, on le laisse tourner — pas de redémarrage inutile
     if (readerRef.current) return;
-    // Sinon on redémarre (cas du retour depuis "paused")
+    // Sinon on redémarre (cas du retour depuis "paused" ou après modale photo)
     let cancelled = false;
     (async () => {
       try {
@@ -3846,7 +3955,7 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
         readerRef.current = null;
       }
     };
-  }, [phase, cameraStarted]);
+  }, [phase, cameraStarted, photoFallback]);
 
   const handleISBNScanned = async (code) => {
     // Mode continu : détection automatique du type d'objet (livre / revue /
@@ -3905,50 +4014,87 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
     if (detectedType === "jeu-switch") {
       placeholder.platform = gameMatch?.platform || "Nintendo Switch";
     }
-    await onAddBook(placeholder);
-    setLastBook(placeholder);
-    setBatchHistory((h) => [placeholder, ...h]);
+    // === IMPORTANT : capture l'ID DB renvoyé par onAddBook ===
+    // C'est cet ID (UUID Supabase ou ID local) qui survivra au refresh
+    // realtime et permettra d'enrichir le bon livre par la suite.
+    // Sans ça, le _placeholderId est écrasé quand la souscription Supabase
+    // recharge la liste — et l'enrichissement n'a plus rien à mettre à jour.
+    const inserted = await onAddBook(placeholder);
+    const dbId = inserted?.id || null;
+    const trackedBook = { ...placeholder, id: dbId };
+    setLastBook(trackedBook);
+    setBatchHistory((h) => [trackedBook, ...h]);
     setCurrentSetup((s) => ({ ...s, position: s.position + 1 }));
 
     // Lookup en arrière-plan — l'objet sera mis à jour quand le résultat arrive.
     // On utilise la source adaptée au type via lookupAnyBarcode.
     (async () => {
+      let found = null;
       try {
-        const found = await lookupAnyBarcode(code, detectedType);
-        if (found && (found.title || found.cover)) {
-          // Pour une revue déjà reconnue, on garde le titre canonique de la base
-          // si la source en ligne en propose un différent (souvent moins propre).
-          const enrichedFields = {
-            title: magazineMatch?.title || found.title || "",
-            author: found.author || "",
-            cover: found.cover || "",
-            subtitle: found.subtitle || "",
-            pages: found.pages || 0,
-            language: found.language || "",
-            description: found.description || "",
-            categories: found.categories || "",
-            rating: found.rating || 0,
-            ratingsCount: found.ratingsCount || 0,
-            infoLink: found.infoLink || "",
-            format: found.format || "",
-            dimensions: found.dimensions || "",
-            weight: found.weight || "",
-            publisher: magazineMatch?.publisher || found.publisher || "",
-            year: found.year || "",
-          };
-          // Met à jour le placeholder via une fonction utilitaire injectée par le parent
-          if (typeof onEnrichBook === "function") {
-            onEnrichBook(placeholderId, enrichedFields);
-          }
-          // Met aussi à jour notre vue locale
-          setLastBook((curr) =>
-            curr?._placeholderId === placeholderId ? { ...curr, ...enrichedFields } : curr
-          );
-          setBatchHistory((h) =>
-            h.map((b) => b._placeholderId === placeholderId ? { ...b, ...enrichedFields } : b)
-          );
-        }
+        found = await lookupAnyBarcode(code, detectedType);
       } catch (e) { /* ignore */ }
+
+      if (found && (found.title || found.cover)) {
+        // Pour une revue/jeu déjà reconnu en local, on garde le titre canonique
+        // de la base interne si la source en ligne en propose un différent.
+        const enrichedFields = {
+          title: magazineMatch?.title || gameMatch?.title || found.title || "",
+          author: found.author || "",
+          cover: found.cover || "",
+          subtitle: found.subtitle || "",
+          pages: found.pages || 0,
+          language: found.language || "",
+          description: found.description || "",
+          categories: found.categories || "",
+          rating: found.rating || 0,
+          ratingsCount: found.ratingsCount || 0,
+          infoLink: found.infoLink || "",
+          format: found.format || "",
+          dimensions: found.dimensions || "",
+          weight: found.weight || "",
+          publisher: magazineMatch?.publisher || gameMatch?.publisher || found.publisher || "",
+          year: found.year || "",
+        };
+        // Mise à jour : on privilégie l'ID DB (insensible au realtime).
+        // Fallback sur l'ancien mécanisme par placeholderId si l'ID est absent.
+        if (dbId && typeof onEnrichBookById === "function") {
+          onEnrichBookById(dbId, enrichedFields);
+        } else if (typeof onEnrichBook === "function") {
+          onEnrichBook(placeholderId, enrichedFields);
+        }
+        // Met aussi à jour notre vue locale (lastBook + batchHistory)
+        setLastBook((curr) =>
+          (curr?.id && curr.id === dbId) || curr?._placeholderId === placeholderId
+            ? { ...curr, ...enrichedFields }
+            : curr
+        );
+        setBatchHistory((h) =>
+          h.map((b) =>
+            (b.id && b.id === dbId) || b._placeholderId === placeholderId
+              ? { ...b, ...enrichedFields }
+              : b
+          )
+        );
+      }
+
+      // === DÉCLENCHEMENT DU FALLBACK PHOTO ===
+      // Si après enrichissement on n'a TOUJOURS pas de jaquette, on propose à
+      // l'utilisateur de prendre une photo de l'objet pour avoir au moins un
+      // visuel. C'est particulièrement utile pour les jeux et revues que les
+      // sources en ligne ne référencent pas. La caméra de scan se met en
+      // pause pendant la prise de photo et reprend après.
+      const finalCover = found?.cover || "";
+      if (!finalCover && dbId) {
+        const fallbackTitle =
+          magazineMatch?.title || gameMatch?.title ||
+          found?.title || pressMatch?.publisher || "";
+        queuePhotoFallback({
+          bookId: dbId,
+          isbn: code,
+          type: detectedType,
+          title: fallbackTitle,
+        });
+      }
     })();
   };
 
@@ -4233,6 +4379,120 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onChangeShelf
           style={{ borderColor: "var(--leather)", color: "var(--leather-dark)", background: "white" }}
         >
           Terminer le scan ({batchHistory.length} {batchHistory.length > 1 ? "livres" : "livre"})
+        </button>
+      </div>
+
+      {/* Modale fallback : prendre une photo de l'objet quand aucune jaquette
+          n'a été trouvée en ligne. La photo est compressée à ~600px / qualité
+          0.7 avant d'être stockée comme couverture. */}
+      {photoFallback && (
+        <PhotoFallbackModal
+          info={photoFallback}
+          onSkip={dismissPhotoFallback}
+          onCapture={async (dataUrl) => {
+            const compressed = await compressImageDataUrl(dataUrl);
+            // Persiste la couverture sur le bon livre via son ID DB
+            if (typeof onEnrichBookById === "function" && photoFallback.bookId) {
+              onEnrichBookById(photoFallback.bookId, { cover: compressed });
+            }
+            // Met aussi à jour la vue locale (lastBook + batchHistory)
+            setLastBook((curr) =>
+              curr?.id === photoFallback.bookId ? { ...curr, cover: compressed } : curr
+            );
+            setBatchHistory((h) =>
+              h.map((b) => (b.id === photoFallback.bookId ? { ...b, cover: compressed } : b))
+            );
+            // Passe au fallback suivant en attente, le cas échéant.
+            dismissPhotoFallback();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// === MODALE FALLBACK PHOTO ===
+// Affichée quand un scan rapide n'a pas réussi à récupérer de jaquette en
+// ligne. Ouvre automatiquement l'appareil photo (input capture=environment) au
+// montage pour que l'utilisateur puisse prendre une photo de l'objet.
+// Sur iOS et Android, l'input file avec capture déclenche la caméra système,
+// qui inclut nativement les guides de cadrage / mode document si l'utilisateur
+// l'active dans son appli appareil photo.
+function PhotoFallbackModal({ info, onSkip, onCapture }) {
+  const fileRef = useRef(null);
+  const [opened, setOpened] = useState(false);
+
+  // Au montage : déclenche automatiquement l'ouverture de la caméra système.
+  // On laisse un petit délai pour que la modale ait le temps de s'afficher,
+  // sinon iOS peut bloquer l'ouverture de l'input (perception de geste manquant).
+  useEffect(() => {
+    const t = setTimeout(() => {
+      fileRef.current?.click();
+      setOpened(true);
+    }, 150);
+    return () => clearTimeout(t);
+  }, []);
+
+  const handleFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) {
+      // L'utilisateur a annulé la prise de photo — on garde la modale ouverte
+      // au cas où il veut réessayer, mais on permet aussi de passer.
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (ev) => onCapture(ev.target.result);
+    reader.readAsDataURL(file);
+  };
+
+  const typeLabel =
+    info.type === "jeu-switch" ? "le jeu Switch" :
+    info.type === "jeu-societe" ? "la boîte du jeu" :
+    info.type === "revue" ? "la couverture de la revue" :
+    "la couverture";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: "rgba(0,0,0,0.6)" }}>
+      <div className="w-full max-w-sm rounded-2xl p-5" style={{ background: "var(--cream)" }}>
+        <div className="flex items-center gap-2 mb-3">
+          <Camera className="w-6 h-6" style={{ color: "var(--leather-dark)" }} />
+          <h3 style={{ fontFamily: "var(--font-display)", fontSize: "1.15rem", color: "var(--ink)" }}>
+            Pas de jaquette trouvée
+          </h3>
+        </div>
+        <p className="text-sm mb-3" style={{ color: "var(--ink)" }}>
+          {info.title
+            ? <><strong>{info.title}</strong> n'a pas de jaquette en ligne.</>
+            : <>L'objet scanné (code <strong>{info.isbn}</strong>) n'a pas de jaquette en ligne.</>}
+        </p>
+        <p className="text-sm mb-4" style={{ color: "var(--ink-soft)" }}>
+          Prenez {typeLabel} en photo pour avoir un visuel. Cadrez bien l'objet, l'image sera automatiquement réduite avant l'enregistrement.
+        </p>
+
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          onChange={handleFile}
+          className="hidden"
+        />
+
+        <button
+          onClick={() => fileRef.current?.click()}
+          className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 mb-2"
+          style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+        >
+          <Camera className="w-5 h-5" /> {opened ? "Reprendre la photo" : "Ouvrir l'appareil photo"}
+        </button>
+
+        <button
+          onClick={onSkip}
+          className="w-full py-3 rounded-xl font-medium border-2"
+          style={{ borderColor: "var(--parchment)", color: "var(--ink-soft)", background: "white" }}
+        >
+          Passer (continuer le scan)
         </button>
       </div>
     </div>
