@@ -1344,10 +1344,27 @@ export default function App() {
       showToast("Connectez-vous d'abord pour migrer", "error");
       return;
     }
-    if (books.length === 0) {
+
+    // === LECTURE DES LIVRES LOCAUX RÉELS ===
+    // En mode cloud, le state `books` reflète la BDD distante (chargée au
+    // démarrage et maintenue par la subscription realtime). Le state n'est
+    // donc PAS la source à migrer. Il faut lire directement window.storage,
+    // qui contient les livres saisis pendant une éventuelle session
+    // antérieure "Continuer sans compte".
+    let localBooks = [];
+    try {
+      const result = await window.storage.get(STORAGE_KEY);
+      if (result?.value) {
+        const parsed = JSON.parse(result.value);
+        if (Array.isArray(parsed)) localBooks = parsed;
+      }
+    } catch (e) { /* pas de stockage → rien à migrer */ }
+
+    if (localBooks.length === 0) {
       showToast("Aucun livre local à migrer", "error");
       return;
     }
+
     // Vérifier si la base contient déjà des livres pour éviter les doublons
     let existing = [];
     try {
@@ -1368,28 +1385,28 @@ export default function App() {
         .filter((s) => s.length >= 10)
     );
     const cleanIsbn = (b) => (b.isbn || "").replace(/\D/g, "");
-    const toMigrate = books.filter((b) => {
+    const toMigrate = localBooks.filter((b) => {
       const isbn = cleanIsbn(b);
       // Sans ISBN : on migre (pas de moyen de détecter le doublon).
       if (isbn.length < 10) return true;
       // Avec ISBN : on ne migre que s'il n'est PAS déjà côté distant.
       return !existingIsbns.has(isbn);
     });
-    const skippedCount = books.length - toMigrate.length;
+    const skippedCount = localBooks.length - toMigrate.length;
 
     // Confirmation explicite avec le détail du tri
     let msg;
     if (toMigrate.length === 0) {
-      msg = `✅ Tous vos ${books.length} livre${books.length > 1 ? "s sont" : " est"} déjà dans la base partagée. Rien à migrer.`;
+      msg = `✅ Tous vos ${localBooks.length} livre${localBooks.length > 1 ? "s locaux sont" : " local est"} déjà dans la base partagée. Rien à migrer.`;
       window.alert(msg);
       return;
     }
-    msg = `Migrer ${toMigrate.length} livre${toMigrate.length > 1 ? "s" : ""} vers la base partagée ?`;
+    msg = `Migrer ${toMigrate.length} livre${toMigrate.length > 1 ? "s" : ""} local${toMigrate.length > 1 ? "aux" : ""} vers la base partagée ?`;
     if (skippedCount > 0) {
       msg += `\n\n${skippedCount} livre${skippedCount > 1 ? "s" : ""} déjà présent${skippedCount > 1 ? "s" : ""} dans la base partagée (même ISBN) ${skippedCount > 1 ? "seront ignorés" : "sera ignoré"}.`;
     }
     msg += `\n\nLa structure (${structure.bibliotheques.length} bibliothèque${structure.bibliotheques.length > 1 ? "s" : ""}) sera également synchronisée.`;
-    msg += "\n\nVos livres locaux seront conservés.";
+    msg += "\n\nVos livres locaux seront conservés sur cet appareil.";
     if (!window.confirm(msg)) return;
 
     try {
@@ -5691,6 +5708,37 @@ function SettingsModal({
   onClose,
 }) {
   const fileRef = useRef(null);
+
+  // === DÉTECTION DES LIVRES LOCAUX À MIGRER ===
+  // Le bouton "Migrer mes livres vers la base partagée" n'est utile QUE si
+  // l'utilisateur a des livres stockés dans window.storage (mode local) en
+  // plus d'être connecté à un compte cloud. Sinon, c'est trompeur : l'app
+  // synchronise déjà chaque ajout en live avec la BDD partagée.
+  // Ce state détecte les livres locaux résiduels (typiquement laissés par une
+  // session "Continuer sans compte" antérieure).
+  const [localBooksCount, setLocalBooksCount] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await window.storage.get(STORAGE_KEY);
+        if (cancelled) return;
+        if (result?.value) {
+          const localBooks = JSON.parse(result.value);
+          if (Array.isArray(localBooks)) {
+            setLocalBooksCount(localBooks.length);
+            return;
+          }
+        }
+        setLocalBooksCount(0);
+      } catch (e) {
+        // Pas de stockage local accessible → rien à migrer
+        setLocalBooksCount(0);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   // Statistiques par type d'objet
   const byType = {};
   for (const t of ITEM_TYPES_LIST) byType[t.id] = 0;
@@ -5746,8 +5794,13 @@ function SettingsModal({
                   <LogOut className="w-4 h-4" /> Se déconnecter
                 </button>
 
-                {/* Bouton de migration des livres locaux vers la base partagée */}
-                {books.length > 0 && (
+                {/* Bouton de migration des livres locaux vers la base partagée.
+                    On ne l'affiche QUE si window.storage contient encore des
+                    livres : typiquement vestige d'une session "Continuer sans
+                    compte" antérieure à la connexion. Pour la majorité des
+                    utilisateurs (qui se connectent dès le départ), tout est
+                    déjà sync en live et ce bouton serait trompeur. */}
+                {localBooksCount > 0 && (
                   <div className="pt-2 border-t" style={{ borderColor: "var(--gold)" }}>
                     {migrating ? (
                       <div className="space-y-2">
@@ -5768,14 +5821,14 @@ function SettingsModal({
                     ) : (
                       <>
                         <p className="text-xs mb-2" style={{ color: "var(--ink)" }}>
-                          Vous avez <strong>{books.length} livre{books.length > 1 ? "s" : ""}</strong> stocké{books.length > 1 ? "s" : ""} sur cet appareil. Migrez-les vers la base partagée pour qu'ils soient accessibles à toute la famille.
+                          <strong>{localBooksCount} livre{localBooksCount > 1 ? "s" : ""}</strong> {localBooksCount > 1 ? "sont stockés" : "est stocké"} sur cet appareil (hors base partagée), probablement avant votre connexion. {localBooksCount > 1 ? "Migrez-les" : "Migrez-le"} pour {localBooksCount > 1 ? "les" : "le"} rendre accessible{localBooksCount > 1 ? "s" : ""} à toute la famille.
                         </p>
                         <button
                           onClick={onMigrateToCloud}
                           className="w-full py-2 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5"
                           style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
                         >
-                          <Upload className="w-4 h-4" /> Migrer mes livres vers la base partagée
+                          <Upload className="w-4 h-4" /> Migrer ces livres vers la base partagée
                         </button>
                       </>
                     )}
