@@ -973,6 +973,45 @@ export default function App() {
               bibliotheques: { ...DEFAULT_LAYOUT.bibliotheques, ...(remoteLayout.bibliotheques || {}) },
             });
           }
+
+          // === NETTOYAGE AUTOMATIQUE DU STOCKAGE LOCAL ===
+          // En mode cloud, le storage local ne devrait contenir que des livres
+          // saisis pendant une éventuelle session "Continuer sans compte"
+          // antérieure et pas encore migrés. Tout livre local dont l'ISBN
+          // existe déjà en BDD distante est un résidu (typiquement laissé par
+          // une migration antérieure qui ne nettoyait pas ou par une suppression
+          // cloud qui ne propageait pas en local). On l'efface pour éviter que
+          // le bouton "Migrer" se réaffiche en boucle.
+          // Les livres locaux SANS ISBN, ou ceux dont l'ISBN n'existe pas côté
+          // distant, sont préservés : ils sont peut-être en attente de migration.
+          try {
+            const localResult = await window.storage.get(STORAGE_KEY);
+            if (localResult?.value) {
+              const localBooks = JSON.parse(localResult.value);
+              if (Array.isArray(localBooks) && localBooks.length > 0) {
+                const remoteIsbns = new Set(
+                  remoteBooks
+                    .map((b) => (b.isbn || "").replace(/\D/g, ""))
+                    .filter((s) => s.length >= 10)
+                );
+                const stillNeedingMigration = localBooks.filter((b) => {
+                  const isbn = (b.isbn || "").replace(/\D/g, "");
+                  // Sans ISBN : on garde (ne peut pas vérifier si déjà migré)
+                  if (isbn.length < 10) return true;
+                  // Avec ISBN : on garde uniquement si pas déjà côté distant
+                  return !remoteIsbns.has(isbn);
+                });
+                if (stillNeedingMigration.length === 0) {
+                  // Plus rien à migrer → suppression complète de la clé
+                  await window.storage.delete(STORAGE_KEY);
+                } else if (stillNeedingMigration.length < localBooks.length) {
+                  // Certains résidus à effacer, d'autres encore à migrer
+                  await window.storage.set(STORAGE_KEY, JSON.stringify(stillNeedingMigration));
+                }
+                // Sinon : aucun nettoyage nécessaire
+              }
+            }
+          } catch (e) { /* pas grave si le nettoyage échoue */ }
         } catch (e) {
           showToast(`Erreur de chargement : ${e.message}`, "error");
         }
@@ -1397,7 +1436,12 @@ export default function App() {
     // Confirmation explicite avec le détail du tri
     let msg;
     if (toMigrate.length === 0) {
-      msg = `✅ Tous vos ${localBooks.length} livre${localBooks.length > 1 ? "s locaux sont" : " local est"} déjà dans la base partagée. Rien à migrer.`;
+      // Tous les livres locaux sont déjà dans la base partagée → on en profite
+      // pour purger le stockage local (devenu redondant et source de confusion).
+      try {
+        await window.storage.delete(STORAGE_KEY);
+      } catch (e) { /* ignore */ }
+      msg = `✅ Tous vos ${localBooks.length} livre${localBooks.length > 1 ? "s locaux étaient" : " local était"} déjà dans la base partagée. Le stockage local a été nettoyé.`;
       window.alert(msg);
       return;
     }
@@ -1406,7 +1450,7 @@ export default function App() {
       msg += `\n\n${skippedCount} livre${skippedCount > 1 ? "s" : ""} déjà présent${skippedCount > 1 ? "s" : ""} dans la base partagée (même ISBN) ${skippedCount > 1 ? "seront ignorés" : "sera ignoré"}.`;
     }
     msg += `\n\nLa structure (${structure.bibliotheques.length} bibliothèque${structure.bibliotheques.length > 1 ? "s" : ""}) sera également synchronisée.`;
-    msg += "\n\nVos livres locaux seront conservés sur cet appareil.";
+    msg += `\n\n⚠️ Le stockage local sera ensuite vidé (les livres seront uniquement accessibles via la base partagée).`;
     if (!window.confirm(msg)) return;
 
     try {
@@ -1419,10 +1463,20 @@ export default function App() {
       await insertBooksBulk(toMigrate, (current, total) => {
         setMigrating({ current, total });
       });
+
+      // 4. Vide le stockage local : les livres sont maintenant dans la base
+      //    partagée, conserver une copie locale créerait de la confusion (le
+      //    bouton "Migrer" reviendrait, des suppressions cloud laisseraient
+      //    des fantômes locaux, etc.). Cette étape est cruciale pour que la
+      //    migration soit "définitive" du point de vue de l'utilisateur.
+      try {
+        await window.storage.delete(STORAGE_KEY);
+      } catch (e) { /* ignore — pas grave si le storage est déjà vide */ }
+
       setMigrating(null);
       const summary = skippedCount > 0
-        ? `✅ ${toMigrate.length} livre${toMigrate.length > 1 ? "s" : ""} migré${toMigrate.length > 1 ? "s" : ""}, ${skippedCount} ignoré${skippedCount > 1 ? "s" : ""} (déjà présent${skippedCount > 1 ? "s" : ""})`
-        : `✅ ${toMigrate.length} livre${toMigrate.length > 1 ? "s" : ""} migré${toMigrate.length > 1 ? "s" : ""} vers la base partagée`;
+        ? `✅ ${toMigrate.length} livre${toMigrate.length > 1 ? "s" : ""} migré${toMigrate.length > 1 ? "s" : ""}, ${skippedCount} ignoré${skippedCount > 1 ? "s" : ""} (déjà présent${skippedCount > 1 ? "s" : ""}). Le stockage local a été nettoyé.`
+        : `✅ ${toMigrate.length} livre${toMigrate.length > 1 ? "s" : ""} migré${toMigrate.length > 1 ? "s" : ""} vers la base partagée. Le stockage local a été nettoyé.`;
       showToast(summary);
     } catch (e) {
       setMigrating(null);
