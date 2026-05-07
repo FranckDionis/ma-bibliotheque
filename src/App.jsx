@@ -3843,8 +3843,15 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
   // jaquette pendant qu'on traite le précédent, on les empile pour ne perdre
   // aucune occasion de photo.
   const photoFallbackQueueRef = useRef([]);
+  // Ref miroir de l'état "une modale est-elle active OU dans la queue ?".
+  // Mise à jour synchrone (avant tout re-render) pour bloquer instantanément
+  // les nouveaux scans pendant la fermeture de la modale et la transition vers
+  // le fallback suivant. Sinon le callback de scan ZXing voit "photoFallback
+  // est null" pendant 1 frame entre deux modales et accepte un nouveau scan.
+  const photoFallbackActiveRef = useRef(false);
   // Pousse dans la file. Si rien d'actif, on déclenche immédiatement.
   const queuePhotoFallback = (info) => {
+    photoFallbackActiveRef.current = true;
     setPhotoFallback((current) => {
       if (current) {
         // Une modale est déjà visible → on empile pour plus tard
@@ -3855,9 +3862,27 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
     });
   };
   // Vide la modale, et passe au suivant s'il y en a un en attente.
+  // Important : ne pas générer une transition null → next, on saute direct.
+  // Si la queue est vide, on garde le verrou actif pendant un court délai pour
+  // empêcher la caméra ZXing de re-scanner immédiatement le même code-barres
+  // (l'utilisateur vient de pointer sa caméra vers l'objet pour la photo, le
+  // viseur peut le revoir une fraction de seconde après la fermeture).
   const dismissPhotoFallback = () => {
     const next = photoFallbackQueueRef.current.shift() || null;
-    setPhotoFallback(next);
+    if (next) {
+      photoFallbackActiveRef.current = true;
+      setPhotoFallback(next);
+    } else {
+      // Aucun fallback en attente → on lève le verrou après un délai de grâce
+      // (1,5 s) pour éviter le re-scan instantané du dernier code dans le viseur.
+      setPhotoFallback(null);
+      // Reset aussi le code-barres "récemment vu" pour profiter du dédoublonnage
+      // de 3 s par code, qui n'est plus pertinent après ce détour photo.
+      lastScannedRef.current = { code: null, time: 0 };
+      setTimeout(() => {
+        photoFallbackActiveRef.current = false;
+      }, 1500);
+    }
   };
 
   const videoRef = useRef(null);
@@ -3935,6 +3960,10 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
           // Accepte tout EAN-13, UPC-A (12 chiffres), ou ISBN-10
           if (!/^\d{10,13}$/.test(code)) return;
           if (phaseRef.current === "paused") return;
+          // Bloc immédiat si une modale photo est en cours OU s'il en reste
+          // en queue : on évite que la caméra capture le code-barres de
+          // l'objet en cours de photo (qui est encore devant l'objectif).
+          if (photoFallbackActiveRef.current) return;
           const now = Date.now();
           if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
             return;
@@ -3962,6 +3991,13 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
     // jeu Switch / jeu de société) à partir du code-barres, ajout immédiat
     // d'un placeholder typé, puis enrichissement en arrière-plan via la
     // source la plus appropriée. La caméra reste active.
+
+    // Garde anti-doublons : si une modale photo de fallback est active ou
+    // qu'il en reste en queue, on refuse tout nouveau scan. Cela coupe court
+    // au cas où le callback de scan aurait laissé passer un code-barres
+    // pendant la transition entre deux modales (ex. plusieurs scans rapides
+    // de magazines sans jaquette).
+    if (photoFallbackActiveRef.current) return;
     const placeholderId = Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6);
     const placeholderPosition = currentSetup.position;
     const placeholderBib = currentSetup.bibliotheque;
@@ -4384,23 +4420,31 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
 
       {/* Modale fallback : prendre une photo de l'objet quand aucune jaquette
           n'a été trouvée en ligne. La photo est compressée à ~600px / qualité
-          0.7 avant d'être stockée comme couverture. */}
+          0.7 avant d'être stockée comme couverture.
+          La key={bookId} force le remontage du composant entre deux items
+          successifs de la queue → l'auto-ouverture de l'appareil photo se
+          déclenche bien à chaque nouvel item. */}
       {photoFallback && (
         <PhotoFallbackModal
+          key={photoFallback.bookId}
           info={photoFallback}
           onSkip={dismissPhotoFallback}
           onCapture={async (dataUrl) => {
+            // Capture l'identifiant du livre cible MAINTENANT, avant tout
+            // await — sinon la closure pourrait lire une valeur de
+            // photoFallback déjà remplacée par l'item suivant.
+            const targetId = photoFallback.bookId;
             const compressed = await compressImageDataUrl(dataUrl);
             // Persiste la couverture sur le bon livre via son ID DB
-            if (typeof onEnrichBookById === "function" && photoFallback.bookId) {
-              onEnrichBookById(photoFallback.bookId, { cover: compressed });
+            if (typeof onEnrichBookById === "function" && targetId) {
+              onEnrichBookById(targetId, { cover: compressed });
             }
             // Met aussi à jour la vue locale (lastBook + batchHistory)
             setLastBook((curr) =>
-              curr?.id === photoFallback.bookId ? { ...curr, cover: compressed } : curr
+              curr?.id === targetId ? { ...curr, cover: compressed } : curr
             );
             setBatchHistory((h) =>
-              h.map((b) => (b.id === photoFallback.bookId ? { ...b, cover: compressed } : b))
+              h.map((b) => (b.id === targetId ? { ...b, cover: compressed } : b))
             );
             // Passe au fallback suivant en attente, le cas échéant.
             dismissPhotoFallback();
@@ -4421,6 +4465,9 @@ function BatchScanner({ structure, setup, onAddBook, onEnrichBook, onEnrichBookB
 function PhotoFallbackModal({ info, onSkip, onCapture }) {
   const fileRef = useRef(null);
   const [opened, setOpened] = useState(false);
+  // Garde anti-double-capture : une fois qu'un fichier est choisi et que
+  // onCapture commence à tourner, on bloque toute nouvelle invocation.
+  const capturingRef = useRef(false);
 
   // Au montage : déclenche automatiquement l'ouverture de la caméra système.
   // On laisse un petit délai pour que la modale ait le temps de s'afficher,
@@ -4440,6 +4487,10 @@ function PhotoFallbackModal({ info, onSkip, onCapture }) {
       // au cas où il veut réessayer, mais on permet aussi de passer.
       return;
     }
+    // Évite tout double traitement (ex. iOS qui rappelle onChange ou
+    // double-tap utilisateur en cours d'upload).
+    if (capturingRef.current) return;
+    capturingRef.current = true;
     const reader = new FileReader();
     reader.onload = (ev) => onCapture(ev.target.result);
     reader.readAsDataURL(file);
