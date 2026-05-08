@@ -4371,7 +4371,21 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
   //   - flash         : feedback visuel bref après ajout réussi
   const [phase, setPhase] = useState("scanning");
   const [lastBook, setLastBook] = useState(null);
-  const [batchHistory, setBatchHistory] = useState([]); // livres ajoutés dans cette session
+  // === SESSION DE SCAN — STRUCTURE LÉGÈRE EN REF ===
+  // Avant : `batchHistory` était un useState contenant les objets complets
+  // (avec covers base64). Après 20 scans avec quelques photos, ça représentait
+  // plusieurs Mo en mémoire React, recopiés à chaque render → ralentissement
+  // visible et risque de plantage sur mobile.
+  // Maintenant : on stocke uniquement ce dont on a vraiment besoin :
+  //   - sessionScansRef : Set d'ISBNs (sans suffixe) pour la détection de
+  //     doublon en O(1)
+  //   - sessionScansListRef : liste légère { id, isbn, title } pour l'usage
+  //     "Ajouter comme nouveau" qui doit compter les entrées du même code
+  //   - sessionCount : juste le compteur affiché en UI (state, pour re-render)
+  // PAS de cover, PAS d'auteur, PAS de description en mémoire de session.
+  const sessionScansRef = useRef(new Set());     // ISBNs de base (sans #N)
+  const sessionScansListRef = useRef([]);        // [{id, isbn, title}]
+  const [sessionCount, setSessionCount] = useState(0);
   const [showShelfChange, setShowShelfChange] = useState(false);
   const [cameraStarted, setCameraStarted] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -4451,23 +4465,20 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
   // Mais on ne tient pas compte de ça dans cet effet : la caméra reste allumée
   // dans tous ces états.
 
-  // Stoppe le scanner pour TOUTES les phases qui ne sont pas "scanning" ou
-  // "flash" (le flash est un feedback visuel bref qui ne change rien à l'état
-  // de la caméra). Phases bloquantes : searching, duplicate, photoFallback,
-  // paused.
+  // === GESTION CAMÉRA OPTIMISÉE ===
+  // La caméra (MediaStream + worker ZXing) est une ressource coûteuse. Avant,
+  // on appelait `stop()` puis `startScanning()` à chaque transition de phase,
+  // ce qui déclenchait un cycle complet getUserMedia → décodeur → arrêt à
+  // chaque scan. Sur 20 scans, ça représentait 20 allocations/libérations qui
+  // accumulaient des fuites mémoire et faisaient ralentir l'app.
+  //
+  // Maintenant : on démarre la caméra UNE SEULE FOIS quand `cameraStarted`
+  // passe à true. On la laisse tourner pendant toutes les phases (searching,
+  // photoFallback, etc.) et on filtre les codes-barres dans le callback via
+  // `busyRef`. La caméra n'est arrêtée qu'au démontage du composant.
   useEffect(() => {
     if (!cameraStarted) return;
-    const isBusy = phase !== "scanning" && phase !== "flash";
-    if (isBusy) {
-      if (readerRef.current) {
-        try { readerRef.current.stop(); } catch (e) { /* ignore */ }
-        readerRef.current = null;
-      }
-      return;
-    }
-    // Si on a déjà un reader actif, on le laisse tourner — pas de redémarrage inutile
-    if (readerRef.current) return;
-    // Sinon on redémarre (cas du retour depuis une phase bloquante)
+    if (readerRef.current) return; // déjà démarrée
     let cancelled = false;
     (async () => {
       try {
@@ -4479,7 +4490,8 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
           // Accepte tout EAN-13, UPC-A (12 chiffres), ou ISBN-10
           if (!/^\d{10,13}$/.test(code)) return;
           // Verrou synchrone : si une phase bloquante est active, on rejette
-          // immédiatement, sans attendre que React ait re-rendu.
+          // immédiatement. C'est ce qui remplace l'ancien stop()/start() entre
+          // chaque scan.
           if (busyRef.current) return;
           if (phaseRef.current === "paused") return;
           const now = Date.now();
@@ -4490,7 +4502,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
           // Vibreur court (50 ms) à chaque code lu — confirmation tactile
           if (navigator.vibrate) navigator.vibrate(50);
           // Appel via ref pour bénéficier de la version la plus à jour de
-          // handleISBNScanned (qui ferme sur batchHistory, books, etc.).
+          // handleISBNScanned (qui ferme sur books / sessionScansRef à jour).
           if (handleScanRef.current) handleScanRef.current(code);
         });
       } catch (e) {
@@ -4500,14 +4512,12 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     })();
     return () => {
       cancelled = true;
+      // Cleanup au démontage du useEffect (changement de cameraStarted ou
+      // démontage du composant).
       if (readerRef.current) {
         try { readerRef.current.stop(); } catch (e) { /* ignore */ }
         readerRef.current = null;
       }
-      // Détache aussi le srcObject de la balise <video> pour libérer
-      // complètement la caméra (certains navigateurs gardent la caméra
-      // partiellement active si l'élément vidéo conserve la référence au
-      // MediaStream, même après stop() des tracks).
       if (videoRef.current && videoRef.current.srcObject) {
         try {
           const stream = videoRef.current.srcObject;
@@ -4516,6 +4526,57 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
         } catch (e) { /* ignore */ }
       }
     };
+  }, [cameraStarted]);
+
+  // === LIBÉRATION TEMPORAIRE DE LA CAMÉRA POUR LA PHOTO ===
+  // Quand on entre en phase "photoFallback", la caméra système (input file
+  // capture=environment) doit pouvoir s'ouvrir. Sur certains navigateurs
+  // mobiles, elle est en conflit avec ZXing qui a déjà la caméra → la
+  // modale photo n'arrive pas à démarrer. On stoppe donc explicitement le
+  // reader pendant cette phase, et on le relance au retour à scanning.
+  useEffect(() => {
+    if (!cameraStarted) return;
+    if (phase === "photoFallback") {
+      if (readerRef.current) {
+        try { readerRef.current.stop(); } catch (e) { /* ignore */ }
+        readerRef.current = null;
+      }
+      if (videoRef.current && videoRef.current.srcObject) {
+        try {
+          const stream = videoRef.current.srcObject;
+          if (stream.getTracks) stream.getTracks().forEach((t) => t.stop());
+          videoRef.current.srcObject = null;
+        } catch (e) { /* ignore */ }
+      }
+    } else if (phase === "scanning" && !readerRef.current) {
+      // Au retour vers scanning, si le reader a été arrêté (sortie de
+      // photoFallback), on le redémarre.
+      let cancelled = false;
+      (async () => {
+        try {
+          const reader = await createBarcodeReader();
+          if (cancelled) return;
+          readerRef.current = reader;
+          if (!videoRef.current) return;
+          await reader.startScanning(videoRef.current, (code) => {
+            if (!/^\d{10,13}$/.test(code)) return;
+            if (busyRef.current) return;
+            if (phaseRef.current === "paused") return;
+            const now = Date.now();
+            if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
+              return;
+            }
+            lastScannedRef.current = { code, time: now };
+            if (navigator.vibrate) navigator.vibrate(50);
+            if (handleScanRef.current) handleScanRef.current(code);
+          });
+        } catch (e) {
+          if (e?.name === "NotAllowedError") setError("permission");
+          else setError(e?.message || "camera");
+        }
+      })();
+      return () => { cancelled = true; };
+    }
   }, [phase, cameraStarted]);
 
   // === CLEANUP AU DÉMONTAGE DU COMPOSANT ===
@@ -4573,10 +4634,19 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     // être détecté comme doublon de `3780263006908`.
     const cleanCode = code.replace(/\D/g, "");
     const baseIsbn = (raw) => (raw || "").split("#")[0].replace(/\D/g, "");
+    // Recherche dans `books` (BDD distante / locale) avec linear scan : c'est
+    // O(n) mais inévitable car la liste est grande et changeante.
     const findExistingByIsbn = (list) =>
       list.find((b) => baseIsbn(b.isbn) === cleanCode);
     const dupInBase = findExistingByIsbn(books);
-    const dupInSession = findExistingByIsbn(batchHistory);
+    // Recherche en session via Set (O(1)) — on a la liste légère stockée en
+    // ref (id + isbn + title), ce qui suffit pour afficher la modale doublon.
+    let dupInSession = null;
+    if (sessionScansRef.current.has(cleanCode)) {
+      dupInSession = sessionScansListRef.current.find(
+        (b) => baseIsbn(b.isbn) === cleanCode
+      );
+    }
     const duplicateOf = dupInBase || dupInSession;
 
     // === DÉTECTION DU TYPE + RECONNAISSANCE INTERNE ===
@@ -4652,21 +4722,20 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     let storedIsbn = code;
     if (forceAddAsNew) {
       // Compte combien d'objets ont déjà ce code (avec ou sans suffixe).
-      // On regarde dans books ET batchHistory pour couvrir les ajouts en
-      // session non encore reflétés dans books.
-      const allKnown = [...(books || []), ...batchHistory];
+      // On itère séparément sur books et la liste de session sans copier
+      // (pas de [...books, ...session] qui dupliquerait toute la mémoire).
       const baseCode = code; // déjà nettoyé en amont
-      const matching = allKnown.filter((b) => {
-        const raw = (b.isbn || "");
-        // Ignore les # et chiffres après pour la comparaison
-        const stripped = raw.split("#")[0].replace(/\D/g, "");
+      const isMatch = (raw) => {
+        const stripped = (raw || "").split("#")[0].replace(/\D/g, "");
         return stripped === baseCode;
-      });
-      // matching.length est le nombre d'occurrences déjà présentes :
+      };
+      let count = 0;
+      for (const b of books || []) if (isMatch(b.isbn)) count++;
+      for (const b of sessionScansListRef.current) if (isMatch(b.isbn)) count++;
+      // count est le nombre d'occurrences déjà présentes :
       // - s'il y en a 1 (le doublon original), on crée le #2
       // - s'il y en a 2 (#1 et #2), on crée le #3
-      // etc.
-      const nextIndex = matching.length + 1;
+      const nextIndex = count + 1;
       storedIsbn = `${baseCode}#${nextIndex}`;
     }
 
@@ -4717,7 +4786,15 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     const dbId = inserted?.id || null;
     const trackedBook = { ...placeholder, id: dbId };
     setLastBook(trackedBook);
-    setBatchHistory((h) => [trackedBook, ...h]);
+    // Mise à jour LÉGÈRE de la session : juste id + isbn + title (pas de
+    // cover lourde). On indexe aussi dans le Set pour la détection O(1).
+    sessionScansListRef.current.unshift({
+      id: dbId,
+      isbn: storedIsbn,
+      title: trackedBook.title || "",
+    });
+    sessionScansRef.current.add(code.replace(/\D/g, ""));
+    setSessionCount((c) => c + 1);
 
     // Marque la position comme prise dans la session
     const shelfKey = `${placeholderBib}|${placeholderEtagere}`;
@@ -4778,7 +4855,10 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     sessionTakenRef.current.set(newKey, newSet);
     // Avance l'UI sur la prochaine position pressentie
     setCurrentSetup((s) => ({ ...s, position: placeholderPosition + 1 }));
-    // Met à jour le panneau "dernier livre" et l'historique de session
+    // Met à jour le panneau "dernier livre". Le déplacement n'est PAS un
+    // nouveau scan en session (on ne réajoute pas dans sessionScansListRef
+    // car le livre est déjà dans `books` côté distant). On incrémente quand
+    // même le compteur affiché pour refléter l'action.
     const movedBook = {
       ...duplicateOf,
       bibliotheque: placeholderBib,
@@ -4786,7 +4866,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
       position: placeholderPosition,
     };
     setLastBook(movedBook);
-    setBatchHistory((h) => [movedBook, ...h]);
+    setSessionCount((c) => c + 1);
     showToast(`Déplacé : ${duplicateOf.title || "(sans titre)"}`);
     finishAndResume();
   };
@@ -4810,7 +4890,9 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
       onEnrichBookById(bookId, { cover: compressed });
     }
     setLastBook((curr) => curr?.id === bookId ? { ...curr, cover: compressed } : curr);
-    setBatchHistory((h) => h.map((b) => b.id === bookId ? { ...b, cover: compressed } : b));
+    // Note : on ne stocke pas la cover dans sessionScansListRef (volontairement,
+    // pour limiter la mémoire). Le livre est déjà à jour côté `books` via
+    // onEnrichBookById, c'est suffisant.
     finishAndResume();
   };
   // L'utilisateur a passé la modale photo (livre déjà ajouté sans jaquette).
@@ -4871,7 +4953,10 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     const dbId = inserted?.id || null;
     const trackedBook = { ...placeholder, id: dbId };
     setLastBook(trackedBook);
-    setBatchHistory((h) => [trackedBook, ...h]);
+    // Compteur affiché — pas d'entrée dans sessionScansListRef car ce livre
+    // n'a pas de code-barres et ne peut donc être déduit en doublon de futurs
+    // scans (la détection se fait par ISBN).
+    setSessionCount((c) => c + 1);
 
     // Marque la position comme prise dans la session
     sessionSet.add(placeholderPosition);
@@ -4904,21 +4989,35 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
   };
 
   const undoLast = () => {
-    if (batchHistory.length === 0) return;
-    const last = batchHistory[0];
+    // On utilise lastBook (le dernier ajout en mémoire) plutôt qu'une liste
+    // complète. Si l'utilisateur veut annuler plusieurs scans, il devra
+    // utiliser la suppression manuelle depuis la fiche détail — c'est rare
+    // en pratique, et garder une liste de N derniers livres en mémoire ne
+    // vaut pas le coût.
+    if (!lastBook) return;
     // Libère la position prise dans la session de scan en cours pour que les
     // prochains scans puissent la réutiliser. Ne touche pas aux positions des
     // livres déjà persistés en BDD (qui restent bien à leur place).
-    if (last && last.bibliotheque && last.etagere && last.position) {
-      const shelfKey = `${last.bibliotheque}|${last.etagere}`;
+    if (lastBook.bibliotheque && lastBook.etagere && lastBook.position) {
+      const shelfKey = `${lastBook.bibliotheque}|${lastBook.etagere}`;
       const sessionSet = sessionTakenRef.current.get(shelfKey);
-      if (sessionSet) sessionSet.delete(Number(last.position));
+      if (sessionSet) sessionSet.delete(Number(lastBook.position));
+    }
+    // Retire aussi l'entrée de la liste légère de session (utile pour la
+    // détection de doublon : si on annule, le scan de ce code à nouveau ne
+    // doit plus déclencher la modale doublon).
+    if (lastBook.isbn) {
+      const baseCode = (lastBook.isbn || "").split("#")[0].replace(/\D/g, "");
+      sessionScansRef.current.delete(baseCode);
+      sessionScansListRef.current = sessionScansListRef.current.filter(
+        (b) => b.id !== lastBook.id
+      );
     }
     // Recule la "prochaine position pressentie" de 1, sans descendre sous 1.
     // Le calcul réel via findFirstFreePosition prendra la main au prochain scan.
     setCurrentSetup((s) => ({ ...s, position: Math.max(1, s.position - 1) }));
-    setBatchHistory((h) => h.slice(1));
-    setLastBook(batchHistory[1] || null);
+    setSessionCount((c) => Math.max(0, c - 1));
+    setLastBook(null);
     showToast("Position reculée — la place est libérée");
   };
 
@@ -5172,7 +5271,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
                 color: "var(--cream)",
                 backdropFilter: "blur(8px)",
               }}>
-                {batchHistory.length} {batchHistory.length > 1 ? "livres scannés" : "livre scanné"}
+                {sessionCount} {sessionCount > 1 ? "livres scannés" : "livre scanné"}
               </div>
               {lastBook && (
                 <button
@@ -5239,7 +5338,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
           className="w-full py-3 rounded-xl font-medium border-2"
           style={{ borderColor: "var(--leather)", color: "var(--leather-dark)", background: "white" }}
         >
-          Terminer le scan ({batchHistory.length} {batchHistory.length > 1 ? "livres" : "livre"})
+          Terminer le scan ({sessionCount} {sessionCount > 1 ? "livres" : "livre"})
         </button>
       </div>
 
