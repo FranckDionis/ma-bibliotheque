@@ -630,7 +630,12 @@ async function lookupWikidata(code) {
 // - jeu-societe      → KNOWN_GAMES → Open Food Facts → Wikidata
 // Renvoie { title, author, cover, publisher, year, description, source, debug, _type? }
 async function lookupAnyBarcode(code, type) {
-  const clean = (code || "").replace(/\D/g, "");
+  // ⚠️ On retire d'abord un éventuel suffixe `#N` (utilisé pour distinguer
+  // plusieurs numéros de revues partageant le même code-barres EAN) AVANT
+  // de nettoyer les non-chiffres. Sinon `replace(/\D/g, "")` transformerait
+  // `3780263006908#2` en `37802630069082`, ce qui corromprait la lookup.
+  const baseCode = String(code || "").split("#")[0];
+  const clean = baseCode.replace(/\D/g, "");
   if (!clean) return null;
 
   // Pour les livres on garde la cascade riche existante
@@ -727,11 +732,15 @@ async function lookupAnyBarcode(code, type) {
 
 // Cascade : essaye chaque source en parallèle, retourne le meilleur résultat
 async function lookupISBN(isbn) {
+  // Retire un éventuel suffixe `#N` (utilisé pour les numéros de revues qui
+  // partagent un code-barres) avant tout appel réseau. Les bases en ligne ne
+  // connaissent évidemment que le code EAN brut.
+  const clean = String(isbn || "").split("#")[0];
   const [google, openLib, bnf, fallbackCover] = await Promise.all([
-    lookupGoogleBooks(isbn),
-    lookupOpenLibrary(isbn),
-    lookupBNF(isbn),
-    findCoverFor(isbn),
+    lookupGoogleBooks(clean),
+    lookupOpenLibrary(clean),
+    lookupBNF(clean),
+    findCoverFor(clean),
   ]);
 
   const debug = {
@@ -1022,15 +1031,23 @@ export default function App() {
             if (localResult?.value) {
               const localBooks = JSON.parse(localResult.value);
               if (Array.isArray(localBooks) && localBooks.length > 0) {
+                // Normalisation ISBN qui préserve le suffixe #N (utilisé pour
+                // distinguer les numéros de revues à code-barres partagé).
+                const normalizeIsbn = (b) => {
+                  const raw = (b.isbn || "").trim();
+                  if (!raw) return "";
+                  const [base, suffix] = raw.split("#");
+                  const cleanBase = base.replace(/\D/g, "");
+                  if (cleanBase.length < 10) return "";
+                  return suffix !== undefined ? `${cleanBase}#${suffix}` : cleanBase;
+                };
                 const remoteIsbns = new Set(
-                  remoteBooks
-                    .map((b) => (b.isbn || "").replace(/\D/g, ""))
-                    .filter((s) => s.length >= 10)
+                  remoteBooks.map(normalizeIsbn).filter(Boolean)
                 );
                 const stillNeedingMigration = localBooks.filter((b) => {
-                  const isbn = (b.isbn || "").replace(/\D/g, "");
+                  const isbn = normalizeIsbn(b);
                   // Sans ISBN : on garde (ne peut pas vérifier si déjà migré)
-                  if (isbn.length < 10) return true;
+                  if (!isbn) return true;
                   // Avec ISBN : on garde uniquement si pas déjà côté distant
                   return !remoteIsbns.has(isbn);
                 });
@@ -1451,16 +1468,27 @@ export default function App() {
     // comme déjà présent dans la base partagée si SON ISBN existe déjà côté
     // distant — peu importe son emplacement. Les livres sans ISBN sont
     // toujours migrés (impossible de comparer).
+    // ⚠️ Pour gérer les ISBN suffixés (`#2`, `#3` — utilisés pour distinguer
+    // les numéros de revues qui partagent un même code-barres), on compare
+    // l'ISBN COMPLET (avec son éventuel suffixe), pas le code "pur". Deux
+    // numéros différents d'Historia (`...#2` et `...#3`) sont alors bien
+    // considérés comme des objets distincts à migrer.
+    const normalizeIsbn = (b) => {
+      const raw = (b.isbn || "").trim();
+      if (!raw) return "";
+      // Si l'ISBN contient un suffixe #N, on garde la partie chiffres + suffixe
+      const [base, suffix] = raw.split("#");
+      const cleanBase = base.replace(/\D/g, "");
+      if (cleanBase.length < 10) return "";
+      return suffix !== undefined ? `${cleanBase}#${suffix}` : cleanBase;
+    };
     const existingIsbns = new Set(
-      existing
-        .map((b) => (b.isbn || "").replace(/\D/g, ""))
-        .filter((s) => s.length >= 10)
+      existing.map(normalizeIsbn).filter(Boolean)
     );
-    const cleanIsbn = (b) => (b.isbn || "").replace(/\D/g, "");
     const toMigrate = localBooks.filter((b) => {
-      const isbn = cleanIsbn(b);
-      // Sans ISBN : on migre (pas de moyen de détecter le doublon).
-      if (isbn.length < 10) return true;
+      const isbn = normalizeIsbn(b);
+      // Sans ISBN exploitable : on migre (pas de moyen de détecter le doublon).
+      if (!isbn) return true;
       // Avec ISBN : on ne migre que s'il n'est PAS déjà côté distant.
       return !existingIsbns.has(isbn);
     });
@@ -1538,9 +1566,20 @@ export default function App() {
   // Renvoie { groups: [{ keep, removes }], duplicateCount }
   const findShelfDuplicates = (booksList) => {
     // Index par clé "code|bibliotheque|etagere"
+    // ⚠️ On préserve le suffixe #N de l'ISBN (utilisé pour les revues à
+    // code-barres partagé) : `3780263006908#2` et `3780263006908#3` sont
+    // bien deux numéros différents d'Historia et NE doivent PAS être
+    // considérés comme doublons d'étagère.
+    const normalizeIsbn = (raw) => {
+      if (!raw) return "";
+      const [base, suffix] = String(raw).split("#");
+      const cleanBase = base.replace(/\D/g, "");
+      if (!cleanBase) return "";
+      return suffix !== undefined ? `${cleanBase}#${suffix}` : cleanBase;
+    };
     const groups = new Map();
     for (const b of booksList) {
-      const code = (b.isbn || "").replace(/\D/g, "");
+      const code = normalizeIsbn(b.isbn);
       // Pas de code-barres ⇒ on ne peut pas détecter le doublon de manière fiable.
       if (!code) continue;
       const key = `${code}|${b.bibliotheque || ""}|${b.etagere || ""}`;
@@ -3799,8 +3838,8 @@ function DetailView({ book, structure, onBack, onEdit, onDelete }) {
             {book.year && <DetailRow label="Année" value={book.year} />}
             {book.dimensions && isLivre && <DetailRow label="Dimensions" value={book.dimensions} />}
             {book.weight && isLivre && <DetailRow label="Poids" value={book.weight} />}
-            {showIsbn && <DetailRow label="ISBN" value={book.isbn} />}
-            {showCodebar && <DetailRow label="Code-barres" value={book.isbn} />}
+            {showIsbn && <DetailRow label="ISBN" value={String(book.isbn).split("#")[0]} />}
+            {showCodebar && <DetailRow label="Code-barres" value={String(book.isbn).split("#")[0]} />}
           </div>
         );
       })()}
@@ -4292,9 +4331,13 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     // Un objet déjà scanné dans la session courante (présent dans batchHistory)
     // compte aussi comme doublon — utile si l'utilisateur scanne deux fois le
     // même livre sans s'en rendre compte.
+    // ⚠️ On compare sur le code BASE (sans suffixe #N) : un objet stocké avec
+    // l'ISBN `3780263006908#2` (revue déjà ajoutée comme nouveau) doit aussi
+    // être détecté comme doublon de `3780263006908`.
     const cleanCode = code.replace(/\D/g, "");
+    const baseIsbn = (raw) => (raw || "").split("#")[0].replace(/\D/g, "");
     const findExistingByIsbn = (list) =>
-      list.find((b) => (b.isbn || "").replace(/\D/g, "") === cleanCode);
+      list.find((b) => baseIsbn(b.isbn) === cleanCode);
     const dupInBase = findExistingByIsbn(books);
     const dupInSession = findExistingByIsbn(batchHistory);
     const duplicateOf = dupInBase || dupInSession;
@@ -4352,15 +4395,47 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
 
   // Traite un scan déjà validé comme non-doublon : lance la lookup, puis ajoute
   // le livre. Si la lookup ne renvoie pas de jaquette, déclenche la modale photo.
-  // Cette fonction est aussi appelée si l'utilisateur a choisi "Ajouter quand
-  // même" sur un doublon.
+  // Cette fonction est aussi appelée si l'utilisateur a choisi "Ajouter comme
+  // nouveau" sur un doublon (avec ctx.forceAddAsNew = true).
   const processNewScan = async (ctx) => {
     const {
       code, detectedType, magazineMatch, gameMatch, pressMatch,
       placeholderBib, placeholderEtagere, placeholderPosition,
+      forceAddAsNew,
     } = ctx;
 
-    // Lookup en ligne (peut prendre plusieurs secondes)
+    // === SUFFIXAGE DE L'ISBN POUR "AJOUTER COMME NOUVEAU" ===
+    // Quand l'utilisateur force l'ajout malgré un doublon (typiquement pour
+    // les revues : tous les numéros d'Historia partagent le même EAN), on
+    // suffixe l'ISBN stocké en base avec "#2", "#3", etc. pour qu'il soit
+    // unique. Le caractère "#" n'est pas valide dans un EAN-13, donc aucun
+    // risque de confusion avec un vrai code-barres.
+    // Le code utilisé pour la lookup en ligne reste le code original (sans
+    // suffixe) — le suffixe est juste un marqueur interne d'unicité.
+    let storedIsbn = code;
+    if (forceAddAsNew) {
+      // Compte combien d'objets ont déjà ce code (avec ou sans suffixe).
+      // On regarde dans books ET batchHistory pour couvrir les ajouts en
+      // session non encore reflétés dans books.
+      const allKnown = [...(books || []), ...batchHistory];
+      const baseCode = code; // déjà nettoyé en amont
+      const matching = allKnown.filter((b) => {
+        const raw = (b.isbn || "");
+        // Ignore les # et chiffres après pour la comparaison
+        const stripped = raw.split("#")[0].replace(/\D/g, "");
+        return stripped === baseCode;
+      });
+      // matching.length est le nombre d'occurrences déjà présentes :
+      // - s'il y en a 1 (le doublon original), on crée le #2
+      // - s'il y en a 2 (#1 et #2), on crée le #3
+      // etc.
+      const nextIndex = matching.length + 1;
+      storedIsbn = `${baseCode}#${nextIndex}`;
+    }
+
+    // Lookup en ligne (peut prendre plusieurs secondes) — on utilise toujours
+    // le code original (sans suffixe) car les bases en ligne ne connaissent
+    // évidemment que le vrai code EAN.
     let found = null;
     try {
       found = await lookupAnyBarcode(code, detectedType);
@@ -4373,7 +4448,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     const placeholder = {
       _placeholderId: placeholderId,
       type: detectedType,
-      isbn: code,
+      isbn: storedIsbn,
       title: magazineMatch?.title || gameMatch?.title || found?.title || "",
       author: found?.author || "",
       cover: found?.cover || "",
@@ -4434,11 +4509,15 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
   const handleDuplicateIgnore = () => {
     finishAndResume();
   };
-  // L'utilisateur a choisi "Ajouter quand même" sur la modale doublon.
+  // L'utilisateur a choisi "Ajouter comme nouveau" sur la modale doublon.
+  // Cas d'usage typique : revue ou collection où le code-barres EAN est le
+  // même pour tous les numéros (Historia, Pomme d'Api, etc.) — l'utilisateur
+  // veut bien créer un nouvel objet, pas remplacer l'ancien. On va suffixer
+  // l'ISBN avec #2, #3, etc. pour le rendre unique dans la base.
   const handleDuplicateAddAnyway = async () => {
     if (!pendingScan) return;
     setPhase("searching");
-    await processNewScan(pendingScan);
+    await processNewScan({ ...pendingScan, forceAddAsNew: true });
   };
 
   // L'utilisateur a pris une photo dans la modale fallback.
@@ -5007,7 +5086,7 @@ function DuplicateModal({ duplicateOf, structure, onIgnore, onAddAnyway }) {
         </div>
 
         <p className="text-sm mb-4" style={{ color: "var(--ink-soft)" }}>
-          Ce code-barres existe déjà. Voulez-vous l'ajouter quand même (vous avez deux exemplaires) ou ignorer ce scan ?
+          Ce code-barres est déjà utilisé. C'est normal pour les revues (tous les numéros d'<em>Historia</em>, <em>Pomme d'Api</em>, etc. partagent le même code) : choisissez "Ajouter comme nouveau" et un identifiant unique sera ajouté automatiquement. Pour un vrai doublon (livre déjà saisi), choisissez "Ignorer".
         </p>
 
         <div className="space-y-2">
@@ -5023,7 +5102,7 @@ function DuplicateModal({ duplicateOf, structure, onIgnore, onAddAnyway }) {
             className="w-full py-3 rounded-xl font-medium border-2"
             style={{ borderColor: "var(--leather)", color: "var(--leather-dark)", background: "white" }}
           >
-            Ajouter quand même
+            Ajouter comme nouveau
           </button>
         </div>
       </div>
