@@ -3891,101 +3891,237 @@ function DetailRow({ label, value, suffix = "" }) {
 }
 
 // === SETUP DU SCAN EN SÉRIE ===
+// Présentation à 3 niveaux comme la vue "Plan" : on choisit d'abord une pièce,
+// puis une bibliothèque, puis une étagère. Plus naturel et plus rapide qu'un
+// formulaire avec un select et des champs numériques, surtout sur mobile.
 function BatchSetup({ books, structure, onCancel, onStart }) {
-  const initialBib = structure.bibliotheques[0]?.id || "";
-  const [bibliotheque, setBibliotheque] = useState(initialBib);
-  const [etagere, setEtagere] = useState("1");
-  // La position de départ est calculée automatiquement à partir des livres
-  // déjà placés sur l'étagère sélectionnée. L'utilisateur peut toujours la
-  // surcharger manuellement (ex. pour redémarrer un scan inachevé), mais le
-  // défaut est intelligent : on propose la première position libre.
-  const [position, setPosition] = useState(() => {
-    if (!books || !initialBib) return "1";
-    return String(findFirstFreePosition(books, initialBib, 1));
-  });
-  // Drapeau : l'utilisateur a-t-il modifié la position à la main ? Si oui, on
-  // n'écrase plus son choix quand bib/étagère changent.
-  const positionTouchedRef = useRef(false);
-  // Recalcule la position quand bib/étagère changent (sauf override manuel).
-  useEffect(() => {
-    if (positionTouchedRef.current || !books) return;
-    const free = findFirstFreePosition(books, bibliotheque, parseInt(etagere) || 1);
-    setPosition(String(free));
-  }, [bibliotheque, etagere, books]);
+  const [level, setLevel] = useState("pieces"); // pieces → bibliotheques → etageres
+  const [selectedPieceId, setSelectedPieceId] = useState(null);
+  const [selectedBibId, setSelectedBibId] = useState(null);
 
-  return (
-    <div className="space-y-4">
-      <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)" }}>
-        Scan rapide d'une étagère
-      </h2>
-      <p className="text-sm" style={{ color: "var(--ink-soft)" }}>
-        Choisissez l'emplacement de départ. Chaque objet scanné (livre, revue, jeu Switch, jeu de société…) sera placé à la suite, son <strong>type est détecté automatiquement</strong> d'après le code-barres, et la position s'incrémente toute seule.
-      </p>
+  // Comptes utiles à l'affichage (livres par pièce / bib / étagère)
+  const countByBib = books.reduce((acc, b) => {
+    if (b.bibliotheque) acc[b.bibliotheque] = (acc[b.bibliotheque] || 0) + 1;
+    return acc;
+  }, {});
+  const countByPiece = structure.bibliotheques.reduce((acc, b) => {
+    const c = countByBib[b.id] || 0;
+    acc[b.pieceId] = (acc[b.pieceId] || 0) + c;
+    return acc;
+  }, {});
 
-      <Field label="Bibliothèque">
-        <select
-          value={bibliotheque}
-          onChange={(e) => setBibliotheque(e.target.value)}
-          className="w-full p-3 rounded-lg border-2 outline-none bg-white"
-          style={{ borderColor: "var(--parchment)" }}
-        >
-          {structure.pieces.map((piece) => {
-            const bibs = structure.bibliotheques.filter((b) => b.pieceId === piece.id);
-            if (bibs.length === 0) return null;
-            return (
-              <optgroup key={piece.id} label={piece.nom}>
-                {bibs.map((b) => (
-                  <option key={b.id} value={b.id}>{b.nom}</option>
-                ))}
-              </optgroup>
-            );
-          })}
-        </select>
-      </Field>
+  const selectedPiece = selectedPieceId
+    ? structure.pieces.find((p) => p.id === selectedPieceId)
+    : null;
+  const selectedBib = selectedBibId
+    ? structure.bibliotheques.find((b) => b.id === selectedBibId)
+    : null;
 
-      <div className="grid grid-cols-2 gap-3">
-        <Field label="Étagère (haut → bas)">
-          <input
-            type="number"
-            min="1"
-            value={etagere}
-            onChange={(e) => setEtagere(e.target.value)}
-            className="w-full p-3 rounded-lg border-2 outline-none"
-            style={{ borderColor: "var(--parchment)" }}
-          />
-        </Field>
-        <Field label="Position de départ">
-          <input
-            type="number"
-            min="1"
-            value={position}
-            onChange={(e) => {
-              positionTouchedRef.current = true;
-              setPosition(e.target.value);
-            }}
-            className="w-full p-3 rounded-lg border-2 outline-none"
-            style={{ borderColor: "var(--parchment)" }}
-          />
-        </Field>
+  // Lance le scan une fois l'étagère choisie. La position de départ est
+  // calculée automatiquement (première place libre sur cette étagère).
+  const startScanOnShelf = (shelfNum) => {
+    const startPos = findFirstFreePosition(books, selectedBibId, shelfNum);
+    onStart({
+      bibliotheque: selectedBibId,
+      etagere: shelfNum,
+      position: startPos,
+    });
+  };
+
+  // === NIVEAU 1 : choix de la pièce ===
+  if (level === "pieces") {
+    return (
+      <div>
+        <button onClick={onCancel} className="flex items-center gap-1 mb-3" style={{ color: "var(--leather)" }}>
+          <X className="w-5 h-5" /> Annuler
+        </button>
+        <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)" }}>
+          Scan rapide
+        </h2>
+        <p className="text-sm mb-4" style={{ color: "var(--ink-soft)" }}>
+          Sélectionnez la pièce où se trouve l'étagère à scanner.
+        </p>
+        {structure.pieces.length === 0 ? (
+          <div className="text-center py-8" style={{ color: "var(--ink-soft)" }}>
+            Aucune pièce définie.
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-3">
+            {structure.pieces.map((piece) => {
+              const bibsCount = structure.bibliotheques.filter((b) => b.pieceId === piece.id).length;
+              const booksCount = countByPiece[piece.id] || 0;
+              return (
+                <button
+                  key={piece.id}
+                  onClick={() => {
+                    setSelectedPieceId(piece.id);
+                    setLevel("bibliotheques");
+                  }}
+                  className="p-4 rounded-xl border-2 text-left transition-all active:scale-95"
+                  style={{
+                    background: "var(--cream)",
+                    borderColor: "var(--parchment)",
+                    color: "var(--ink)",
+                  }}
+                >
+                  <div style={{ fontSize: "2.2rem", marginBottom: "0.4rem" }}>{piece.icon || "🏠"}</div>
+                  <div className="font-medium leading-tight" style={{ fontFamily: "var(--font-display)" }}>
+                    {piece.nom}
+                  </div>
+                  <div className="text-xs mt-1" style={{ color: "var(--ink-soft)" }}>
+                    {bibsCount} {bibsCount > 1 ? "bibliothèques" : "bibliothèque"} · {booksCount} {booksCount > 1 ? "livres" : "livre"}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
+    );
+  }
 
-      <p className="text-xs" style={{ color: "var(--ink-soft)" }}>
-        💡 La position proposée est la première place libre sur l'étagère selon vos données. Modifiez-la si vous voulez démarrer ailleurs.
-      </p>
+  // === NIVEAU 2 : choix de la bibliothèque dans la pièce ===
+  if (level === "bibliotheques" && selectedPiece) {
+    const bibsInPiece = structure.bibliotheques.filter((b) => b.pieceId === selectedPiece.id);
+    return (
+      <div>
+        <Breadcrumb
+          items={[
+            { label: "Pièces", onClick: () => { setLevel("pieces"); setSelectedPieceId(null); } },
+            { label: selectedPiece.nom },
+          ]}
+        />
+        <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)" }}>
+          {selectedPiece.nom}
+        </h2>
+        <p className="text-sm mb-4" style={{ color: "var(--ink-soft)" }}>
+          Choisissez la bibliothèque à scanner.
+        </p>
+        {bibsInPiece.length === 0 ? (
+          <div className="text-center py-8" style={{ color: "var(--ink-soft)" }}>
+            Aucune bibliothèque dans cette pièce.
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-3">
+            {bibsInPiece.map((b) => {
+              const booksCount = countByBib[b.id] || 0;
+              const shelvesCount = structure.etageres.filter((e) => e.bibId === b.id).length;
+              return (
+                <button
+                  key={b.id}
+                  onClick={() => {
+                    setSelectedBibId(b.id);
+                    setLevel("etageres");
+                  }}
+                  className="p-4 rounded-xl border-2 text-left transition-all active:scale-95"
+                  style={{
+                    background: "var(--cream)",
+                    borderColor: "var(--parchment)",
+                    color: "var(--ink)",
+                  }}
+                >
+                  <div style={{ fontSize: "2.2rem", marginBottom: "0.4rem" }}>📚</div>
+                  <div className="font-medium leading-tight" style={{ fontFamily: "var(--font-display)" }}>
+                    {b.nom}
+                  </div>
+                  <div className="text-xs mt-1" style={{ color: "var(--ink-soft)" }}>
+                    {shelvesCount} {shelvesCount > 1 ? "étagères" : "étagère"} · {booksCount} {booksCount > 1 ? "livres" : "livre"}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
 
-      <button
-        onClick={() => onStart({
-          bibliotheque,
-          etagere: parseInt(etagere) || 1,
-          position: parseInt(position) || 1,
-        })}
-        className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 mt-4"
-        style={{
-          background: "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)",
-          color: "var(--cream)",
-        }}
-      >
-        <Zap className="w-5 h-5" /> Démarrer le scan
+  // === NIVEAU 3 : choix de l'étagère dans la bibliothèque ===
+  if (level === "etageres" && selectedBib) {
+    const piece = structure.pieces.find((p) => p.id === selectedBib.pieceId);
+    const shelvesDef = structure.etageres
+      .filter((e) => e.bibId === selectedBib.id)
+      .sort((a, b) => a.num - b.num);
+    // Pour chaque étagère : nombre de livres + prochaine position libre
+    const booksInBib = books.filter((b) => b.bibliotheque === selectedBib.id);
+    const shelfStats = {};
+    shelvesDef.forEach((s) => {
+      const onShelf = booksInBib.filter((b) => Number(b.etagere) === Number(s.num));
+      shelfStats[s.num] = {
+        count: onShelf.length,
+        nextPos: findFirstFreePosition(books, selectedBib.id, s.num),
+      };
+    });
+    return (
+      <div>
+        <Breadcrumb
+          items={[
+            { label: "Pièces", onClick: () => { setLevel("pieces"); setSelectedPieceId(null); setSelectedBibId(null); } },
+            { label: piece?.nom || "Pièce", onClick: () => { setLevel("bibliotheques"); setSelectedBibId(null); } },
+            { label: selectedBib.nom },
+          ]}
+        />
+        <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)" }}>
+          {selectedBib.nom}
+        </h2>
+        <p className="text-sm mb-4" style={{ color: "var(--ink-soft)" }}>
+          Touchez l'étagère pour démarrer le scan. La première position libre est sélectionnée automatiquement.
+        </p>
+        {shelvesDef.length === 0 ? (
+          <div className="text-center py-8" style={{ color: "var(--ink-soft)" }}>
+            Aucune étagère dans cette bibliothèque.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {shelvesDef.map((s) => {
+              const stats = shelfStats[s.num];
+              return (
+                <button
+                  key={s.id}
+                  onClick={() => startScanOnShelf(s.num)}
+                  className="w-full p-4 rounded-xl border-2 flex items-center gap-3 transition-all active:scale-[0.98]"
+                  style={{
+                    background: "var(--cream)",
+                    borderColor: "var(--parchment)",
+                    color: "var(--ink)",
+                  }}
+                >
+                  <div
+                    className="w-12 h-12 rounded-lg flex items-center justify-center flex-shrink-0"
+                    style={{
+                      background: "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)",
+                      color: "var(--cream)",
+                      fontFamily: "var(--font-display)",
+                      fontSize: "1.4rem",
+                    }}
+                  >
+                    {s.num}
+                  </div>
+                  <div className="flex-1 min-w-0 text-left">
+                    <div className="font-medium" style={{ fontFamily: "var(--font-display)" }}>
+                      Étagère {s.num}{s.nom ? ` — ${s.nom}` : ""}
+                    </div>
+                    <div className="text-xs mt-0.5" style={{ color: "var(--ink-soft)" }}>
+                      {stats.count} {stats.count > 1 ? "livres" : "livre"}
+                      {" · "}
+                      <strong>Démarrer en position {stats.nextPos}</strong>
+                    </div>
+                  </div>
+                  <Zap className="w-5 h-5 flex-shrink-0" style={{ color: "var(--leather)" }} />
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Fallback : retour au niveau 1 si état incohérent
+  return (
+    <div className="text-center py-8" style={{ color: "var(--ink-soft)" }}>
+      <button onClick={() => { setLevel("pieces"); setSelectedPieceId(null); setSelectedBibId(null); }}>
+        Retour aux pièces
       </button>
     </div>
   );
@@ -4443,20 +4579,49 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
                 Ou simplement changer d'étagère (même bibliothèque)
               </div>
               <div className="flex gap-2 flex-wrap">
-                {[1, 2, 3, 4, 5, 6].map((n) => (
-                  <button
-                    key={n}
-                    onClick={() => changeShelf(n)}
-                    className="w-12 h-12 rounded-lg font-semibold border-2"
-                    style={{
-                      background: n === currentSetup.etagere ? "var(--leather-dark)" : "white",
-                      color: n === currentSetup.etagere ? "var(--cream)" : "var(--ink)",
-                      borderColor: "var(--parchment)",
-                    }}
-                  >
-                    {n}
-                  </button>
-                ))}
+                {(() => {
+                  // Liste les vraies étagères définies dans la bibliothèque
+                  // courante, triées par numéro. Tomber sur une plage 1-6
+                  // arbitraire ne reflétait pas la structure réelle de
+                  // l'utilisateur.
+                  const shelvesHere = structure.etageres
+                    .filter((e) => e.bibId === currentSetup.bibliotheque)
+                    .sort((a, b) => a.num - b.num);
+                  if (shelvesHere.length === 0) {
+                    return (
+                      <div className="text-xs italic" style={{ color: "var(--ink-soft)" }}>
+                        Aucune étagère définie pour cette bibliothèque.
+                      </div>
+                    );
+                  }
+                  return shelvesHere.map((s) => (
+                    <button
+                      key={s.id}
+                      onClick={() => changeShelf(s.num)}
+                      className="px-3 h-12 rounded-lg font-semibold border-2 flex flex-col items-center justify-center"
+                      style={{
+                        background: s.num === currentSetup.etagere ? "var(--leather-dark)" : "white",
+                        color: s.num === currentSetup.etagere ? "var(--cream)" : "var(--ink)",
+                        borderColor: "var(--parchment)",
+                        minWidth: "3rem",
+                      }}
+                    >
+                      <span style={{ fontSize: "0.95rem", lineHeight: 1 }}>{s.num}</span>
+                      {s.nom && (
+                        <span style={{
+                          fontSize: "0.6rem",
+                          lineHeight: 1,
+                          marginTop: "2px",
+                          opacity: 0.85,
+                          maxWidth: "80px",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}>{s.nom}</span>
+                      )}
+                    </button>
+                  ));
+                })()}
               </div>
             </div>
 
