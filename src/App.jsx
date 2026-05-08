@@ -919,6 +919,11 @@ export default function App() {
   const [selectedBook, setSelectedBook] = useState(null);
   const [toast, setToast] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  // Quand l'utilisateur lance un scan rapide depuis le plan (bouton + sur une
+  // étagère), on stocke ici l'étagère cible pour que AddView ouvre directement
+  // BatchScanner sans repasser par la sélection d'étagère.
+  // Format : { bibliotheque, etagere, position } ou null
+  const [quickScanShelf, setQuickScanShelf] = useState(null);
   // État de progression de la re-recherche en arrière-plan
   // null = inactif, sinon { current, total, found }
   const [enrichProgress, setEnrichProgress] = useState(null);
@@ -2053,13 +2058,32 @@ export default function App() {
             showToast={showToast}
             onSelectBook={(b) => { setSelectedBook(b); setView("detail"); }}
             onFilterBib={(bibId) => { setFilterBib(bibId); setView("home"); }}
+            onQuickScanShelf={(shelf) => {
+              // Lance le scan rapide directement sur l'étagère ciblée :
+              // on précalcule la première position libre et on bascule sur
+              // la vue "Ajouter" qui ouvrira BatchScanner sans étape de setup.
+              const startPos = findFirstFreePosition(books, shelf.bibliotheque, shelf.etagere);
+              setQuickScanShelf({
+                bibliotheque: shelf.bibliotheque,
+                etagere: shelf.etagere,
+                position: startPos,
+              });
+              setView("add");
+            }}
           />
         )}
         {view === "add" && (
           <AddView
             books={books}
             structure={structure}
-            onCancel={() => setView("home")}
+            quickScanShelf={quickScanShelf}
+            onCancel={() => {
+              // Si on est venu via le scan rapide depuis Pièces, on y retourne ;
+              // sinon retour à l'accueil (comportement par défaut).
+              const wasQuickScan = !!quickScanShelf;
+              setQuickScanShelf(null);
+              setView(wasQuickScan ? "library" : "home");
+            }}
             onAdd={addBook}
             onEnrichBook={enrichBookByPlaceholder}
             onEnrichBookById={enrichBookById}
@@ -2399,11 +2423,14 @@ function BookCard({ book, structure, onClick, index }) {
 }
 
 // === VUE AJOUT ===
-function AddView({ books, structure, onCancel, onAdd, onEnrichBook, onEnrichBookById, showToast }) {
-  const [mode, setMode] = useState("choice"); // choice, barcode, cover, manual, form, batch-setup, batch-scan
+function AddView({ books, structure, quickScanShelf, onCancel, onAdd, onEnrichBook, onEnrichBookById, showToast }) {
+  // Si quickScanShelf est défini (l'utilisateur a cliqué le bouton scan rapide
+  // depuis une étagère du plan), on saute la sélection d'étagère et on bascule
+  // directement sur le scanner avec le bon emplacement pré-rempli.
+  const [mode, setMode] = useState(quickScanShelf ? "batch-scan" : "choice");
   const [scannedData, setScannedData] = useState(null);
   const [searching, setSearching] = useState(false);
-  const [batchSetup, setBatchSetup] = useState(null);
+  const [batchSetup, setBatchSetup] = useState(quickScanShelf || null);
   const [selectedType, setSelectedType] = useState("livre");
 
   const handleISBNFound = async (isbn) => {
@@ -2604,7 +2631,16 @@ function AddView({ books, structure, onCancel, onAdd, onEnrichBook, onEnrichBook
           onEnrichBook={onEnrichBook}
           onEnrichBookById={onEnrichBookById}
           onChangeShelf={(newSetup) => setBatchSetup(newSetup)}
-          onFinish={() => setMode("choice")}
+          onFinish={() => {
+            // Si on est venu via le deep-link "scan rapide d'étagère" (depuis
+            // le plan), on retourne directement à la vue parente plutôt qu'à
+            // l'écran de choix d'ajout. Sinon, retour normal à l'écran choice.
+            if (quickScanShelf) {
+              onCancel();
+            } else {
+              setMode("choice");
+            }
+          }}
           showToast={showToast}
         />
       )}
@@ -5148,7 +5184,7 @@ function NavButton({ icon, label, active, onClick }) {
 
 // === VUE BIBLIOTHÈQUES — 3 NIVEAUX ===
 // === VUE BIBLIOTHÈQUES — 3 NIVEAUX AVEC CRUD ===
-function LibraryView({ books, structure, saveStructure, saveBooks, layout, saveLayout, showToast, onSelectBook, onFilterBib }) {
+function LibraryView({ books, structure, saveStructure, saveBooks, layout, saveLayout, showToast, onSelectBook, onFilterBib, onQuickScanShelf }) {
   const [level, setLevel] = useState("pieces"); // pieces | bibliotheques | etageres
   const [selectedPiece, setSelectedPiece] = useState(null);
   const [selectedBib, setSelectedBib] = useState(null);
@@ -5535,6 +5571,10 @@ function LibraryView({ books, structure, saveStructure, saveBooks, layout, saveL
                 books={byShelf[shelfDef.num] || []}
                 onSelectBook={onSelectBook}
                 onEdit={() => setEditingShelf(shelfDef)}
+                onQuickScan={onQuickScanShelf ? () => onQuickScanShelf({
+                  bibliotheque: selectedBib,
+                  etagere: shelfDef.num,
+                }) : undefined}
               />
             ))}
           </div>
@@ -6137,7 +6177,7 @@ function DraggableCanvas({ editMode, items, onMove, onTap, onLongPress, onSave, 
 }
 
 // === ÉTAGÈRE (vue niveau 3) ===
-function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit }) {
+function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit, onQuickScan }) {
   return (
     <div>
       <div className="flex items-center gap-2 mb-2">
@@ -6153,6 +6193,21 @@ function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit }) {
         <span className="text-xs" style={{ color: "var(--ink-soft)" }}>
           {books.length} {books.length > 1 ? "livres" : "livre"}
         </span>
+        {onQuickScan && (
+          <button
+            onClick={onQuickScan}
+            className="p-1.5 rounded-md flex-shrink-0 flex items-center gap-1"
+            style={{
+              background: "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)",
+              color: "var(--cream)",
+            }}
+            aria-label="Scanner cette étagère"
+            title="Scan rapide sur cette étagère"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <ScanLine className="w-3.5 h-3.5" />
+          </button>
+        )}
         {onEdit && (
           <button
             onClick={onEdit}
