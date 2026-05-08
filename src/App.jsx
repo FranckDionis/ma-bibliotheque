@@ -4239,6 +4239,14 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
   const readerRef = useRef(null);
   const lastScannedRef = useRef({ code: null, time: 0 });
   const phaseRef = useRef("scanning"); // pour accès depuis le callback async
+  // Ref vers la fonction handleISBNScanned actuelle. Le callback ZXing est
+  // créé une fois au démarrage de la caméra, mais handleISBNScanned est
+  // re-créé à chaque render et ferme sur des valeurs (books, batchHistory…)
+  // qui peuvent devenir périmées. Cette ref garantit que le callback ZXing
+  // appelle toujours la version la plus récente, qui voit l'état le plus à
+  // jour de batchHistory (essentiel pour la détection de doublon juste après
+  // l'ajout d'un livre).
+  const handleScanRef = useRef(null);
   const [error, setError] = useState(null);
   const [manualISBN, setManualISBN] = useState("");
 
@@ -4271,7 +4279,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
         }
         lastScannedRef.current = { code, time: now };
         if (navigator.vibrate) navigator.vibrate(50);
-        handleISBNScanned(code);
+        if (handleScanRef.current) handleScanRef.current(code);
       });
       setCameraStarted(true);
     } catch (e) {
@@ -4325,7 +4333,9 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
           lastScannedRef.current = { code, time: now };
           // Vibreur court (50 ms) à chaque code lu — confirmation tactile
           if (navigator.vibrate) navigator.vibrate(50);
-          handleISBNScanned(code);
+          // Appel via ref pour bénéficier de la version la plus à jour de
+          // handleISBNScanned (qui ferme sur batchHistory, books, etc.).
+          if (handleScanRef.current) handleScanRef.current(code);
         });
       } catch (e) {
         if (e?.name === "NotAllowedError") setError("permission");
@@ -4338,16 +4348,51 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
         try { readerRef.current.stop(); } catch (e) { /* ignore */ }
         readerRef.current = null;
       }
+      // Détache aussi le srcObject de la balise <video> pour libérer
+      // complètement la caméra (certains navigateurs gardent la caméra
+      // partiellement active si l'élément vidéo conserve la référence au
+      // MediaStream, même après stop() des tracks).
+      if (videoRef.current && videoRef.current.srcObject) {
+        try {
+          const stream = videoRef.current.srcObject;
+          if (stream.getTracks) stream.getTracks().forEach((t) => t.stop());
+          videoRef.current.srcObject = null;
+        } catch (e) { /* ignore */ }
+      }
     };
   }, [phase, cameraStarted]);
 
+  // === CLEANUP AU DÉMONTAGE DU COMPOSANT ===
+  // Sécurité supplémentaire : si l'utilisateur quitte BatchScanner brusquement
+  // (changement de vue, fermeture d'app), on s'assure que la caméra est bien
+  // libérée — la batterie remerciera. useEffect avec deps [] tourne uniquement
+  // au montage et démontage.
+  useEffect(() => {
+    return () => {
+      if (readerRef.current) {
+        try { readerRef.current.stop(); } catch (e) { /* ignore */ }
+        readerRef.current = null;
+      }
+      if (videoRef.current && videoRef.current.srcObject) {
+        try {
+          const stream = videoRef.current.srcObject;
+          if (stream.getTracks) stream.getTracks().forEach((t) => t.stop());
+          videoRef.current.srcObject = null;
+        } catch (e) { /* ignore */ }
+      }
+    };
+  }, []);
+
   // Helper : passe à la phase scanning + vibration longue de fin de traitement.
-  // Aussi : reset le code-barres "récemment vu" pour que le prochain scan
-  // du même code soit pris en compte (utile après dédup ou après photo).
-  const finishAndResume = (resetSessionTime = true) => {
+  // ⚠️ On NE RESET PAS lastScannedRef — au contraire on actualise son timestamp
+  // pour que la protection 3 secondes contre les re-scans du même code joue
+  // pleinement après le retour. Sans ça, juste après une prise de photo, la
+  // caméra ZXing peut revoir le code-barres encore dans son champ et déclencher
+  // un nouveau scan (qui tomberait alors sur la modale doublon → mauvaise UX).
+  const finishAndResume = () => {
     setPendingScan(null);
-    if (resetSessionTime) {
-      lastScannedRef.current = { code: null, time: 0 };
+    if (lastScannedRef.current.code) {
+      lastScannedRef.current = { ...lastScannedRef.current, time: Date.now() };
     }
     // Vibreur long (200 ms) pour signaler "prêt à scanner le suivant"
     if (navigator.vibrate) navigator.vibrate(200);
@@ -4545,6 +4590,50 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
   const handleDuplicateIgnore = () => {
     finishAndResume();
   };
+  // L'utilisateur a choisi "Déplacer ici" sur la modale doublon.
+  // Au lieu de créer un nouvel objet, on met à jour le livre existant pour
+  // qu'il pointe vers le nouvel emplacement. Cas d'usage : l'utilisateur
+  // range physiquement un livre à un endroit différent de celui enregistré
+  // dans l'app.
+  const handleDuplicateMove = async () => {
+    if (!pendingScan?.duplicateOf) return;
+    const { duplicateOf, placeholderBib, placeholderEtagere, placeholderPosition } = pendingScan;
+    // Libère l'ancienne position dans le sessionTaken si elle y était
+    // (cas rare : doublon de session). Pas critique, mais propre.
+    if (duplicateOf.bibliotheque && duplicateOf.etagere && duplicateOf.position) {
+      const oldKey = `${duplicateOf.bibliotheque}|${duplicateOf.etagere}`;
+      const oldSet = sessionTakenRef.current.get(oldKey);
+      if (oldSet) oldSet.delete(Number(duplicateOf.position));
+    }
+    // Met à jour le livre côté BDD/local via onEnrichBookById qui sait
+    // appliquer n'importe quels champs en une seule passe.
+    if (typeof onEnrichBookById === "function") {
+      await onEnrichBookById(duplicateOf.id, {
+        bibliotheque: placeholderBib,
+        etagere: placeholderEtagere,
+        position: placeholderPosition,
+      });
+    }
+    // Marque la nouvelle position comme prise dans la session pour que les
+    // prochains scans ne s'y placent pas.
+    const newKey = `${placeholderBib}|${placeholderEtagere}`;
+    const newSet = sessionTakenRef.current.get(newKey) || new Set();
+    newSet.add(placeholderPosition);
+    sessionTakenRef.current.set(newKey, newSet);
+    // Avance l'UI sur la prochaine position pressentie
+    setCurrentSetup((s) => ({ ...s, position: placeholderPosition + 1 }));
+    // Met à jour le panneau "dernier livre" et l'historique de session
+    const movedBook = {
+      ...duplicateOf,
+      bibliotheque: placeholderBib,
+      etagere: placeholderEtagere,
+      position: placeholderPosition,
+    };
+    setLastBook(movedBook);
+    setBatchHistory((h) => [movedBook, ...h]);
+    showToast(`Déplacé : ${duplicateOf.title || "(sans titre)"}`);
+    finishAndResume();
+  };
   // L'utilisateur a choisi "Ajouter comme nouveau" sur la modale doublon.
   // Cas d'usage typique : revue ou collection où le code-barres EAN est le
   // même pour tous les numéros (Historia, Pomme d'Api, etc.) — l'utilisateur
@@ -4572,6 +4661,14 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
   const handlePhotoFallbackSkip = () => {
     finishAndResume();
   };
+
+  // Met à jour la ref à chaque render pour que le callback ZXing (créé une
+  // seule fois au démarrage de la caméra) ait toujours accès à la version
+  // courante de handleISBNScanned, qui ferme sur batchHistory à jour.
+  // Sans cette indirection, la fonction capturée par ZXing au démarrage
+  // ne voit pas les livres ajoutés en cours de session → ne détecte pas les
+  // doublons immédiatement après un scan + photoFallback.
+  handleScanRef.current = handleISBNScanned;
 
   const handleManualISBN = () => {
     if (manualISBN.length >= 10) {
@@ -4944,8 +5041,14 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
         <DuplicateModal
           duplicateOf={pendingScan.duplicateOf}
           structure={structure}
+          newLocation={{
+            bibliotheque: pendingScan.placeholderBib,
+            etagere: pendingScan.placeholderEtagere,
+            position: pendingScan.placeholderPosition,
+          }}
           onIgnore={handleDuplicateIgnore}
           onAddAnyway={handleDuplicateAddAnyway}
+          onMove={handleDuplicateMove}
         />
       )}
 
@@ -5053,7 +5156,7 @@ function PhotoFallbackModal({ info, onSkip, onCapture }) {
           className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 mb-2"
           style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
         >
-          <Camera className="w-5 h-5" /> {opened ? "Reprendre la photo" : "Ouvrir l'appareil photo"}
+          <Camera className="w-5 h-5" /> {opened ? "Prendre la photo de la jaquette" : "Ouvrir l'appareil photo"}
         </button>
 
         <button
@@ -5073,9 +5176,13 @@ function PhotoFallbackModal({ info, onSkip, onCapture }) {
 // dans la bibliothèque (même ISBN, peu importe l'emplacement). Bloque la
 // caméra et demande à l'utilisateur s'il veut quand même ajouter (cas d'un
 // vrai second exemplaire physique) ou ignorer.
-function DuplicateModal({ duplicateOf, structure, onIgnore, onAddAnyway }) {
+function DuplicateModal({ duplicateOf, structure, newLocation, onIgnore, onAddAnyway, onMove }) {
   // Trouve le nom de la bibliothèque où se trouve déjà l'objet
   const bib = structure?.bibliotheques?.find((b) => b.id === duplicateOf.bibliotheque);
+  // Pour le bouton "Déplacer", afficher la cible
+  const newBib = newLocation
+    ? structure?.bibliotheques?.find((b) => b.id === newLocation.bibliotheque)
+    : null;
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
@@ -5122,7 +5229,10 @@ function DuplicateModal({ duplicateOf, structure, onIgnore, onAddAnyway }) {
         </div>
 
         <p className="text-sm mb-4" style={{ color: "var(--ink-soft)" }}>
-          Ce code-barres est déjà utilisé. C'est normal pour les revues (tous les numéros d'<em>Historia</em>, <em>Pomme d'Api</em>, etc. partagent le même code) : choisissez "Ajouter comme nouveau" et un identifiant unique sera ajouté automatiquement. Pour un vrai doublon (livre déjà saisi), choisissez "Ignorer".
+          Ce code-barres est déjà utilisé. Trois choix :
+          <br />• <strong>Ignorer</strong> si c'est vraiment le même livre déjà saisi.
+          <br />• <strong>Déplacer ici</strong> si vous rangez ce livre à un nouvel emplacement.
+          <br />• <strong>Ajouter comme nouveau</strong> pour les revues (Historia, Pomme d'Api…) où chaque numéro partage le même code-barres.
         </p>
 
         <div className="space-y-2">
@@ -5133,6 +5243,15 @@ function DuplicateModal({ duplicateOf, structure, onIgnore, onAddAnyway }) {
           >
             Ignorer (passer au suivant)
           </button>
+          {onMove && newLocation && (
+            <button
+              onClick={onMove}
+              className="w-full py-3 rounded-xl font-medium border-2"
+              style={{ borderColor: "var(--leather)", color: "var(--leather-dark)", background: "white" }}
+            >
+              Déplacer ici{newBib ? ` (${newBib.nom} · ét. ${newLocation.etagere} · pos. ${newLocation.position})` : ""}
+            </button>
+          )}
           <button
             onClick={onAddAnyway}
             className="w-full py-3 rounded-xl font-medium border-2"
