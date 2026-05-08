@@ -916,6 +916,13 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [filterBib, setFilterBib] = useState("all");
   const [filterType, setFilterType] = useState("all");
+  // Nouveaux filtres hiérarchiques : pièce → bibliothèque → étagère
+  // Le filtre `filterBib` existe déjà et est utilisé en cascade :
+  // - filterPiece détermine quelles bibliothèques sont disponibles
+  // - filterBib (au sein de la pièce) détermine quelles étagères sont visibles
+  // - filterEtagere filtre la liste finale
+  const [filterPiece, setFilterPiece] = useState("all");
+  const [filterEtagere, setFilterEtagere] = useState("all");
   const [selectedBook, setSelectedBook] = useState(null);
   const [toast, setToast] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -1368,10 +1375,27 @@ export default function App() {
       b.title?.toLowerCase().includes(searchQuery.toLowerCase()) ||
       b.author?.toLowerCase().includes(searchQuery.toLowerCase()) ||
       b.isbn?.includes(searchQuery);
+
+    // Filtre PIÈCE : trouve la pièce de la bibliothèque du livre
+    let matchPiece = filterPiece === "all";
+    if (!matchPiece && b.bibliotheque) {
+      const bib = structure.bibliotheques.find((x) => x.id === b.bibliotheque);
+      matchPiece = bib?.pieceId === filterPiece;
+    }
+
     const matchBib = filterBib === "all" || b.bibliotheque === filterBib;
+    const matchEtagere = filterEtagere === "all" || Number(b.etagere) === Number(filterEtagere);
+
     const itemType = b.type || "livre";
-    const matchType = filterType === "all" || itemType === filterType;
-    return matchSearch && matchBib && matchType;
+    // "no-title" est un pseudo-type pour filtrer les objets sans titre
+    // (utile pour terminer la saisie des objets incomplets après un scan).
+    const matchType =
+      filterType === "all"
+        ? true
+        : filterType === "no-title"
+          ? !b.title || !b.title.trim()
+          : itemType === filterType;
+    return matchSearch && matchPiece && matchBib && matchEtagere && matchType;
   });
 
   // === EXPORT / IMPORT ===
@@ -2039,8 +2063,12 @@ export default function App() {
             filteredBooks={filteredBooks}
             searchQuery={searchQuery}
             setSearchQuery={setSearchQuery}
+            filterPiece={filterPiece}
+            setFilterPiece={setFilterPiece}
             filterBib={filterBib}
             setFilterBib={setFilterBib}
+            filterEtagere={filterEtagere}
+            setFilterEtagere={setFilterEtagere}
             filterType={filterType}
             setFilterType={setFilterType}
             onSelectBook={(b) => { setSelectedBook(b); setView("detail"); }}
@@ -2057,7 +2085,16 @@ export default function App() {
             saveLayout={saveLayout}
             showToast={showToast}
             onSelectBook={(b) => { setSelectedBook(b); setView("detail"); }}
-            onFilterBib={(bibId) => { setFilterBib(bibId); setView("home"); }}
+            onFilterBib={(bibId) => {
+              // Aligne aussi le filtre pièce sur celle de la bibliothèque
+              // ciblée, pour que la cascade de chips reste cohérente quand
+              // l'utilisateur arrive sur l'accueil.
+              const bib = structure.bibliotheques.find((b) => b.id === bibId);
+              if (bib?.pieceId) setFilterPiece(bib.pieceId);
+              setFilterBib(bibId);
+              setFilterEtagere("all");
+              setView("home");
+            }}
             onQuickScanShelf={(shelf) => {
               // Lance le scan rapide directement sur l'étagère ciblée :
               // on précalcule la première position libre et on bascule sur
@@ -2182,8 +2219,13 @@ export default function App() {
             <NavButton
               icon={<Library className="w-6 h-6" />}
               label="Tous"
-              active={view === "home" && filterBib === "all"}
-              onClick={() => { setView("home"); setFilterBib("all"); }}
+              active={view === "home" && filterBib === "all" && filterPiece === "all" && filterEtagere === "all"}
+              onClick={() => {
+                setView("home");
+                setFilterPiece("all");
+                setFilterBib("all");
+                setFilterEtagere("all");
+              }}
             />
             <NavButton
               icon={<Layers className="w-6 h-6" />}
@@ -2219,14 +2261,67 @@ export default function App() {
 }
 
 // === VUE PRINCIPALE ===
-function HomeView({ books, structure, filteredBooks, searchQuery, setSearchQuery, filterBib, setFilterBib, filterType, setFilterType, onSelectBook, onAdd }) {
+function HomeView({ books, structure, filteredBooks, searchQuery, setSearchQuery, filterPiece, setFilterPiece, filterBib, setFilterBib, filterEtagere, setFilterEtagere, filterType, setFilterType, onSelectBook, onAdd }) {
   // Compte des objets par type pour décider d'afficher ou non le filtre
   const typeCounts = {};
   for (const b of books) {
     const t = b.type || "livre";
     typeCounts[t] = (typeCounts[t] || 0) + 1;
   }
+  // Compte des objets sans titre — pour le filtre "Sans titre" qui aide
+  // l'utilisateur à finir la saisie des objets incomplets après un scan.
+  const noTitleCount = books.filter((b) => !b.title || !b.title.trim()).length;
   const hasMultipleTypes = Object.keys(typeCounts).length > 1;
+
+  // === COMPTES POUR LES FILTRES HIÉRARCHIQUES ===
+  // Le décompte est fait sur l'ensemble des livres (avant filtrage) pour que
+  // les chips affichent le total disponible — l'utilisateur sait combien il
+  // y a au max dans chaque pièce/bib/étagère.
+  // Pour la cohérence du parcours en cascade, les sous-filtres se basent sur
+  // les sélections amont : si une pièce est sélectionnée, on ne montre que
+  // ses bibliothèques.
+  const piecesCounts = {}; // { pieceId: count }
+  for (const b of books) {
+    const bib = structure.bibliotheques.find((x) => x.id === b.bibliotheque);
+    if (bib?.pieceId) piecesCounts[bib.pieceId] = (piecesCounts[bib.pieceId] || 0) + 1;
+  }
+  // Liste des bibliothèques disponibles selon la pièce sélectionnée
+  const availableBibs = filterPiece === "all"
+    ? structure.bibliotheques
+    : structure.bibliotheques.filter((b) => b.pieceId === filterPiece);
+  const bibCounts = {};
+  for (const b of books) {
+    if (b.bibliotheque) bibCounts[b.bibliotheque] = (bibCounts[b.bibliotheque] || 0) + 1;
+  }
+  // Liste des étagères disponibles selon la bibliothèque sélectionnée
+  const availableShelves = filterBib === "all"
+    ? [] // pas de sélection bib → on n'affiche pas la ligne étagère
+    : structure.etageres.filter((e) => e.bibId === filterBib).sort((a, b) => a.num - b.num);
+  const etagereCounts = {};
+  for (const b of books) {
+    if (b.bibliotheque === filterBib && b.etagere !== undefined) {
+      const k = String(b.etagere);
+      etagereCounts[k] = (etagereCounts[k] || 0) + 1;
+    }
+  }
+
+  // Helpers de reset cascade : changer une pièce reset la bib et l'étagère.
+  const handlePiece = (pieceId) => {
+    setFilterPiece(pieceId);
+    setFilterBib("all");
+    setFilterEtagere("all");
+  };
+  const handleBib = (bibId) => {
+    setFilterBib(bibId);
+    setFilterEtagere("all");
+    // Si l'utilisateur sélectionne une bib, on aligne le filtre pièce sur
+    // celle qui contient la bib (utile pour cohérence visuelle).
+    if (bibId !== "all") {
+      const bib = structure.bibliotheques.find((b) => b.id === bibId);
+      if (bib?.pieceId) setFilterPiece(bib.pieceId);
+    }
+  };
+
   if (books.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center pt-20 px-6 text-center">
@@ -2279,8 +2374,11 @@ function HomeView({ books, structure, filteredBooks, searchQuery, setSearchQuery
         />
       </div>
 
-      {/* Filtre par type — visible quand il y a plusieurs types */}
-      {hasMultipleTypes && (
+      {/* === LIGNE 1 : FILTRE PAR TYPE D'OBJET (+ "Sans titre") === */}
+      {/* La chip "Sans titre" est utile pour finir la saisie d'objets ajoutés
+          via scan rapide où la lookup en ligne n'a pas trouvé de titre. Elle
+          n'apparaît que s'il y a au moins un objet incomplet à signaler. */}
+      {(hasMultipleTypes || noTitleCount > 0) && (
         <div className="mb-2 flex gap-2 overflow-x-auto pb-2 -mx-4 px-4" style={{ scrollbarWidth: "none" }}>
           <FilterChip active={filterType === "all"} onClick={() => setFilterType("all")}>
             Tout ({books.length})
@@ -2294,24 +2392,82 @@ function HomeView({ books, structure, filteredBooks, searchQuery, setSearchQuery
               </FilterChip>
             );
           })}
+          {noTitleCount > 0 && (
+            <FilterChip
+              active={filterType === "no-title"}
+              onClick={() => setFilterType("no-title")}
+            >
+              ⚠️ Sans titre ({noTitleCount})
+            </FilterChip>
+          )}
         </div>
       )}
 
-      {/* Filtre bibliothèque */}
-      <div className="mb-4 flex gap-2 overflow-x-auto pb-2 -mx-4 px-4" style={{ scrollbarWidth: "none" }}>
-        <FilterChip active={filterBib === "all"} onClick={() => setFilterBib("all")}>
-          Toutes ({books.length})
-        </FilterChip>
-        {structure.bibliotheques.map((b) => {
-          const count = books.filter((bk) => bk.bibliotheque === b.id).length;
-          if (count === 0) return null;
-          return (
-            <FilterChip key={b.id} active={filterBib === b.id} onClick={() => setFilterBib(b.id)}>
-              {b.nom} ({count})
-            </FilterChip>
-          );
-        })}
-      </div>
+      {/* === LIGNE 2 : FILTRE PAR PIÈCE === */}
+      {/* On affiche les pièces qui contiennent au moins un objet. */}
+      {structure.pieces.length > 1 && (
+        <div className="mb-2 flex gap-2 overflow-x-auto pb-2 -mx-4 px-4" style={{ scrollbarWidth: "none" }}>
+          <FilterChip active={filterPiece === "all"} onClick={() => handlePiece("all")}>
+            Toutes les pièces ({books.length})
+          </FilterChip>
+          {structure.pieces.map((p) => {
+            const count = piecesCounts[p.id] || 0;
+            if (count === 0) return null;
+            return (
+              <FilterChip key={p.id} active={filterPiece === p.id} onClick={() => handlePiece(p.id)}>
+                {p.icon || "🏠"} {p.nom} ({count})
+              </FilterChip>
+            );
+          })}
+        </div>
+      )}
+
+      {/* === LIGNE 3 : FILTRE PAR BIBLIOTHÈQUE === */}
+      {/* Les bibliothèques sont restreintes à la pièce sélectionnée s'il y en
+          a une. Sinon, toutes les bibliothèques s'affichent. */}
+      {availableBibs.length > 1 && (
+        <div className="mb-2 flex gap-2 overflow-x-auto pb-2 -mx-4 px-4" style={{ scrollbarWidth: "none" }}>
+          <FilterChip active={filterBib === "all"} onClick={() => handleBib("all")}>
+            Toutes les bibliothèques
+          </FilterChip>
+          {availableBibs.map((b) => {
+            const count = bibCounts[b.id] || 0;
+            if (count === 0) return null;
+            return (
+              <FilterChip key={b.id} active={filterBib === b.id} onClick={() => handleBib(b.id)}>
+                📚 {b.nom} ({count})
+              </FilterChip>
+            );
+          })}
+        </div>
+      )}
+
+      {/* === LIGNE 4 : FILTRE PAR ÉTAGÈRE === */}
+      {/* Visible uniquement quand une bibliothèque est sélectionnée. Liste les
+          étagères de cette bibliothèque qui contiennent au moins un objet. */}
+      {filterBib !== "all" && availableShelves.length > 0 && (
+        <div className="mb-4 flex gap-2 overflow-x-auto pb-2 -mx-4 px-4" style={{ scrollbarWidth: "none" }}>
+          <FilterChip active={filterEtagere === "all"} onClick={() => setFilterEtagere("all")}>
+            Toutes les étagères
+          </FilterChip>
+          {availableShelves.map((e) => {
+            const count = etagereCounts[String(e.num)] || 0;
+            if (count === 0) return null;
+            return (
+              <FilterChip
+                key={e.id}
+                active={String(filterEtagere) === String(e.num)}
+                onClick={() => setFilterEtagere(e.num)}
+              >
+                Ét. {e.num}{e.nom ? ` · ${e.nom}` : ""} ({count})
+              </FilterChip>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Espacement avant la liste si aucun filtre étagère affiché */}
+      {!(filterBib !== "all" && availableShelves.length > 0) && <div className="mb-2" />}
 
       {/* Liste */}
       {filteredBooks.length === 0 ? (
@@ -4677,6 +4833,76 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     }
   };
 
+  // === AJOUT D'UN LIVRE SANS ISBN ===
+  // Pour les livres anciens, livres jeunesse, manuscrits, etc. qui n'ont pas
+  // de code-barres exploitable. On crée immédiatement un placeholder typé
+  // "livre" à l'emplacement courant, puis on déclenche la modale photo pour
+  // que l'utilisateur cadre la jaquette. Pas de lookup en ligne (pas d'ISBN
+  // sur lequel chercher), pas de détection de doublon (chaque livre sans
+  // ISBN est unique du point de vue de l'app — on ne peut pas le comparer
+  // à autre chose).
+  const handleAddWithoutISBN = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+
+    const placeholderBib = currentSetup.bibliotheque;
+    const placeholderEtagere = currentSetup.etagere;
+    const shelfKey = `${placeholderBib}|${placeholderEtagere}`;
+    const sessionSet = sessionTakenRef.current.get(shelfKey) || new Set();
+    const extraReserved = Array.from(sessionSet);
+    const autoFree = findFirstFreePosition(books, placeholderBib, placeholderEtagere, extraReserved);
+    const placeholderPosition = Math.max(autoFree, currentSetup.position || 1);
+
+    const placeholderId = Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6);
+    const placeholder = {
+      _placeholderId: placeholderId,
+      type: "livre",
+      isbn: "", // ← pas d'ISBN, l'utilisateur le complétera plus tard si besoin
+      title: "", // ← l'utilisateur saisira le titre depuis la fiche détail
+      author: "",
+      cover: "",
+      bibliotheque: placeholderBib,
+      etagere: placeholderEtagere,
+      position: placeholderPosition,
+      notes: "",
+    };
+
+    const inserted = await onAddBook(placeholder);
+    const dbId = inserted?.id || null;
+    const trackedBook = { ...placeholder, id: dbId };
+    setLastBook(trackedBook);
+    setBatchHistory((h) => [trackedBook, ...h]);
+
+    // Marque la position comme prise dans la session
+    sessionSet.add(placeholderPosition);
+    sessionTakenRef.current.set(shelfKey, sessionSet);
+    setCurrentSetup((s) => ({ ...s, position: placeholderPosition + 1 }));
+
+    if (!dbId) {
+      // Insertion échouée — on revient à scanning sans modale photo
+      busyRef.current = false;
+      finishAndResume();
+      return;
+    }
+
+    // Stocke un pendingScan synthétique pour que la modale photo s'affiche
+    // proprement (avec un libellé adapté "livre sans code-barres").
+    setPendingScan({
+      code: "",
+      detectedType: "livre",
+      magazineMatch: null,
+      gameMatch: null,
+      pressMatch: null,
+      placeholderBib,
+      placeholderEtagere,
+      placeholderPosition,
+      bookId: dbId,
+      trackedBook,
+      noIsbn: true, // drapeau pour adapter le texte de la modale
+    });
+    setPhase("photoFallback");
+  };
+
   const undoLast = () => {
     if (batchHistory.length === 0) return;
     const last = batchHistory[0];
@@ -4992,11 +5218,22 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
         </div>
       )}
 
-      {/* Aide & Terminer */}
+      {/* Aide & Actions */}
       <div className="space-y-2">
         <p className="text-center text-xs" style={{ color: "var(--ink-soft)" }}>
           Pointez la caméra vers chaque code-barres. La caméra se met en pause pendant la recherche, puis reprend automatiquement.
         </p>
+        {/* Bouton "Pas de code-barres" : utile pour les livres anciens, livres
+            jeunesse, manuscrits, etc. qui n'ont pas d'ISBN. Crée un placeholder
+            sans code et déclenche immédiatement la modale photo. */}
+        <button
+          onClick={handleAddWithoutISBN}
+          disabled={busyRef.current || phase !== "scanning"}
+          className="w-full py-3 rounded-xl font-medium border-2 flex items-center justify-center gap-2 disabled:opacity-50"
+          style={{ borderColor: "var(--parchment)", color: "var(--ink-soft)", background: "white" }}
+        >
+          <Camera className="w-4 h-4" /> Livre sans code-barres (photo seule)
+        </button>
         <button
           onClick={onFinish}
           className="w-full py-3 rounded-xl font-medium border-2"
@@ -5062,6 +5299,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
             bookId: pendingScan.bookId,
             isbn: pendingScan.code,
             type: pendingScan.detectedType,
+            noIsbn: pendingScan.noIsbn,
             title:
               pendingScan.magazineMatch?.title ||
               pendingScan.gameMatch?.title ||
@@ -5130,16 +5368,20 @@ function PhotoFallbackModal({ info, onSkip, onCapture }) {
         <div className="flex items-center gap-2 mb-3">
           <Camera className="w-6 h-6" style={{ color: "var(--leather-dark)" }} />
           <h3 style={{ fontFamily: "var(--font-display)", fontSize: "1.15rem", color: "var(--ink)" }}>
-            Pas de jaquette trouvée
+            {info.noIsbn ? "Livre sans code-barres" : "Pas de jaquette trouvée"}
           </h3>
         </div>
         <p className="text-sm mb-3" style={{ color: "var(--ink)" }}>
-          {info.title
-            ? <><strong>{info.title}</strong> n'a pas de jaquette en ligne.</>
-            : <>L'objet scanné (code <strong>{info.isbn}</strong>) n'a pas de jaquette en ligne.</>}
+          {info.noIsbn
+            ? <>Photographiez la jaquette du livre. Vous pourrez compléter le titre, l'auteur et les autres infos depuis la fiche détail après la session de scan.</>
+            : info.title
+              ? <><strong>{info.title}</strong> n'a pas de jaquette en ligne.</>
+              : <>L'objet scanné (code <strong>{info.isbn}</strong>) n'a pas de jaquette en ligne.</>}
         </p>
         <p className="text-sm mb-4" style={{ color: "var(--ink-soft)" }}>
-          Prenez {typeLabel} en photo pour avoir un visuel. Cadrez bien l'objet, l'image sera automatiquement réduite avant l'enregistrement.
+          {info.noIsbn
+            ? <>Cadrez bien la couverture, l'image sera automatiquement réduite avant l'enregistrement.</>
+            : <>Prenez {typeLabel} en photo pour avoir un visuel. Cadrez bien l'objet, l'image sera automatiquement réduite avant l'enregistrement.</>}
         </p>
 
         <input
