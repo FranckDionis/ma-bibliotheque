@@ -3994,66 +3994,35 @@ function BatchSetup({ books, structure, onCancel, onStart }) {
 // === SCANNER EN SÉRIE ===
 function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnrichBookById, onChangeShelf, onFinish, showToast }) {
   const [currentSetup, setCurrentSetup] = useState(setup);
-  const [phase, setPhase] = useState("scanning"); // scanning, processing, confirming, paused
+  // Machine à états du scan séquentiel :
+  //   - scanning      : la caméra lit les codes-barres (état par défaut)
+  //   - searching     : un code vient d'être lu, on attend la fin de la lookup
+  //                     → overlay "Recherche…" semi-transparent, caméra ne lit plus
+  //   - duplicate     : doublon détecté (même ISBN déjà en base) → modale de choix
+  //   - photoFallback : pas de jaquette trouvée → modale demande de photographier
+  //   - paused        : pause manuelle (changement d'étagère, etc.)
+  //   - flash         : feedback visuel bref après ajout réussi
+  const [phase, setPhase] = useState("scanning");
   const [lastBook, setLastBook] = useState(null);
   const [batchHistory, setBatchHistory] = useState([]); // livres ajoutés dans cette session
   const [showShelfChange, setShowShelfChange] = useState(false);
   const [cameraStarted, setCameraStarted] = useState(false);
   const [starting, setStarting] = useState(false);
   // Positions déjà attribuées dans cette session de scan, par étagère.
-  // Sert à éviter qu'un scan en cours d'enrichissement ne se voie attribuer
-  // la même position qu'un autre scan parallèle (les livres ne sont pas
-  // toujours immédiatement reflétés dans `books` à cause du realtime).
   // Clé : `${bibId}|${etagere}` — Valeur : Set de positions occupées.
   const sessionTakenRef = useRef(new Map());
-  // Modale "prendre une photo de fallback" : { bookId, isbn, type, title } ou null
-  // Apparaît quand un scan ne permet pas de récupérer de jaquette en ligne.
-  const [photoFallback, setPhotoFallback] = useState(null);
-  // File d'attente des fallbacks photo : si plusieurs scans terminent sans
-  // jaquette pendant qu'on traite le précédent, on les empile pour ne perdre
-  // aucune occasion de photo.
-  const photoFallbackQueueRef = useRef([]);
-  // Ref miroir de l'état "une modale est-elle active OU dans la queue ?".
-  // Mise à jour synchrone (avant tout re-render) pour bloquer instantanément
-  // les nouveaux scans pendant la fermeture de la modale et la transition vers
-  // le fallback suivant. Sinon le callback de scan ZXing voit "photoFallback
-  // est null" pendant 1 frame entre deux modales et accepte un nouveau scan.
-  const photoFallbackActiveRef = useRef(false);
-  // Pousse dans la file. Si rien d'actif, on déclenche immédiatement.
-  const queuePhotoFallback = (info) => {
-    photoFallbackActiveRef.current = true;
-    setPhotoFallback((current) => {
-      if (current) {
-        // Une modale est déjà visible → on empile pour plus tard
-        photoFallbackQueueRef.current.push(info);
-        return current;
-      }
-      return info;
-    });
-  };
-  // Vide la modale, et passe au suivant s'il y en a un en attente.
-  // Important : ne pas générer une transition null → next, on saute direct.
-  // Si la queue est vide, on garde le verrou actif pendant un court délai pour
-  // empêcher la caméra ZXing de re-scanner immédiatement le même code-barres
-  // (l'utilisateur vient de pointer sa caméra vers l'objet pour la photo, le
-  // viseur peut le revoir une fraction de seconde après la fermeture).
-  const dismissPhotoFallback = () => {
-    const next = photoFallbackQueueRef.current.shift() || null;
-    if (next) {
-      photoFallbackActiveRef.current = true;
-      setPhotoFallback(next);
-    } else {
-      // Aucun fallback en attente → on lève le verrou après un délai de grâce
-      // (1,5 s) pour éviter le re-scan instantané du dernier code dans le viseur.
-      setPhotoFallback(null);
-      // Reset aussi le code-barres "récemment vu" pour profiter du dédoublonnage
-      // de 3 s par code, qui n'est plus pertinent après ce détour photo.
-      lastScannedRef.current = { code: null, time: 0 };
-      setTimeout(() => {
-        photoFallbackActiveRef.current = false;
-      }, 1500);
-    }
-  };
+
+  // === DONNÉES DU SCAN EN COURS ===
+  // En mode séquentiel, on ne traite qu'un livre à la fois. `pendingScan`
+  // contient toutes les infos liées au scan actuel pendant les phases
+  // searching / duplicate / photoFallback. À la fin (livre ajouté ou ignoré),
+  // pendingScan repasse à null et on revient à scanning.
+  const [pendingScan, setPendingScan] = useState(null);
+
+  // Ref miroir de "phase non-scanning" : mise à jour synchrone pour que le
+  // callback ZXing voie immédiatement qu'il ne doit plus accepter de codes,
+  // sans attendre le re-render React.
+  const busyRef = useRef(false);
 
   const videoRef = useRef(null);
   const readerRef = useRef(null);
@@ -4064,8 +4033,11 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
 
   const currentBib = structure.bibliotheques.find((b) => b.id === currentSetup.bibliotheque);
 
-  // Tient phaseRef à jour
-  useEffect(() => { phaseRef.current = phase; }, [phase]);
+  // Tient phaseRef + busyRef à jour de manière synchrone
+  useEffect(() => {
+    phaseRef.current = phase;
+    busyRef.current = phase !== "scanning" && phase !== "flash";
+  }, [phase]);
 
   // Démarrage explicite de la caméra par tap utilisateur (essentiel pour iOS)
   const startCamera = async () => {
@@ -4104,12 +4076,14 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
   // Mais on ne tient pas compte de ça dans cet effet : la caméra reste allumée
   // dans tous ces états.
 
-  // Stoppe le scanner SEULEMENT pour les phases vraiment bloquantes (modale, pause).
-  // On stoppe aussi quand la modale "photo de fallback" est ouverte : la caméra
-  // système (input capture) prendra le relais et il y aurait conflit sinon.
+  // Stoppe le scanner pour TOUTES les phases qui ne sont pas "scanning" ou
+  // "flash" (le flash est un feedback visuel bref qui ne change rien à l'état
+  // de la caméra). Phases bloquantes : searching, duplicate, photoFallback,
+  // paused.
   useEffect(() => {
     if (!cameraStarted) return;
-    if (phase === "paused" || photoFallback) {
+    const isBusy = phase !== "scanning" && phase !== "flash";
+    if (isBusy) {
       if (readerRef.current) {
         try { readerRef.current.stop(); } catch (e) { /* ignore */ }
         readerRef.current = null;
@@ -4118,7 +4092,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
     }
     // Si on a déjà un reader actif, on le laisse tourner — pas de redémarrage inutile
     if (readerRef.current) return;
-    // Sinon on redémarre (cas du retour depuis "paused" ou après modale photo)
+    // Sinon on redémarre (cas du retour depuis une phase bloquante)
     let cancelled = false;
     (async () => {
       try {
@@ -4129,16 +4103,16 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
         await reader.startScanning(videoRef.current, (code) => {
           // Accepte tout EAN-13, UPC-A (12 chiffres), ou ISBN-10
           if (!/^\d{10,13}$/.test(code)) return;
+          // Verrou synchrone : si une phase bloquante est active, on rejette
+          // immédiatement, sans attendre que React ait re-rendu.
+          if (busyRef.current) return;
           if (phaseRef.current === "paused") return;
-          // Bloc immédiat si une modale photo est en cours OU s'il en reste
-          // en queue : on évite que la caméra capture le code-barres de
-          // l'objet en cours de photo (qui est encore devant l'objectif).
-          if (photoFallbackActiveRef.current) return;
           const now = Date.now();
           if (lastScannedRef.current.code === code && now - lastScannedRef.current.time < 3000) {
             return;
           }
           lastScannedRef.current = { code, time: now };
+          // Vibreur court (50 ms) à chaque code lu — confirmation tactile
           if (navigator.vibrate) navigator.vibrate(50);
           handleISBNScanned(code);
         });
@@ -4154,182 +4128,198 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
         readerRef.current = null;
       }
     };
-  }, [phase, cameraStarted, photoFallback]);
+  }, [phase, cameraStarted]);
+
+  // Helper : passe à la phase scanning + vibration longue de fin de traitement.
+  // Aussi : reset le code-barres "récemment vu" pour que le prochain scan
+  // du même code soit pris en compte (utile après dédup ou après photo).
+  const finishAndResume = (resetSessionTime = true) => {
+    setPendingScan(null);
+    if (resetSessionTime) {
+      lastScannedRef.current = { code: null, time: 0 };
+    }
+    // Vibreur long (200 ms) pour signaler "prêt à scanner le suivant"
+    if (navigator.vibrate) navigator.vibrate(200);
+    setPhase("scanning");
+  };
 
   const handleISBNScanned = async (code) => {
-    // Mode continu : détection automatique du type d'objet (livre / revue /
-    // jeu Switch / jeu de société) à partir du code-barres, ajout immédiat
-    // d'un placeholder typé, puis enrichissement en arrière-plan via la
-    // source la plus appropriée. La caméra reste active.
+    // Verrou synchrone : si on est déjà en train de traiter un livre, on
+    // refuse tout nouveau scan. Le busyRef est mis à jour par useEffect dès
+    // que phase change ; le test ici est une dernière protection contre les
+    // appels concurrents.
+    if (busyRef.current) return;
+    busyRef.current = true;
 
-    // Garde anti-doublons : si une modale photo de fallback est active ou
-    // qu'il en reste en queue, on refuse tout nouveau scan. Cela coupe court
-    // au cas où le callback de scan aurait laissé passer un code-barres
-    // pendant la transition entre deux modales (ex. plusieurs scans rapides
-    // de magazines sans jaquette).
-    if (photoFallbackActiveRef.current) return;
-    const placeholderId = Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6);
-    const placeholderBib = currentSetup.bibliotheque;
-    const placeholderEtagere = currentSetup.etagere;
+    // === DÉTECTION DE DOUBLON (synchrone, depuis books) ===
+    // Critère : même ISBN/code-barres, peu importe l'emplacement.
+    // Un objet déjà scanné dans la session courante (présent dans batchHistory)
+    // compte aussi comme doublon — utile si l'utilisateur scanne deux fois le
+    // même livre sans s'en rendre compte.
+    const cleanCode = code.replace(/\D/g, "");
+    const findExistingByIsbn = (list) =>
+      list.find((b) => (b.isbn || "").replace(/\D/g, "") === cleanCode);
+    const dupInBase = findExistingByIsbn(books);
+    const dupInSession = findExistingByIsbn(batchHistory);
+    const duplicateOf = dupInBase || dupInSession;
 
-    // === CALCUL DE LA POSITION ===
-    // On cherche la première position libre sur l'étagère sélectionnée, en
-    // tenant compte :
-    //   - des livres déjà présents dans `books` (prop)
-    //   - des positions prises pendant cette session de scan rapide qui ne
-    //     sont pas encore reflétées dans `books` (sessionTakenRef).
-    //
-    // ⚠️ On respecte aussi `currentSetup.position` qui est la valeur "de
-    // départ" choisie par l'utilisateur dans BatchSetup. Si elle est plus
-    // grande que la première position libre auto-calculée, c'est que
-    // l'utilisateur veut explicitement démarrer plus loin (ex. il sait que
-    // les premières positions sont libres mais veut commencer à 5). Dans ce
-    // cas on prend max(setupPosition, autoFreePosition).
-    const shelfKey = `${placeholderBib}|${placeholderEtagere}`;
-    const sessionSet = sessionTakenRef.current.get(shelfKey) || new Set();
-    const extraReserved = Array.from(sessionSet);
-    const autoFree = findFirstFreePosition(books, placeholderBib, placeholderEtagere, extraReserved);
-    // currentSetup.position reflète la "prochaine position pressentie" : au
-    // démarrage = position de départ utilisateur, après chaque scan = la
-    // prochaine cherchée. On le considère comme une borne minimale.
-    const placeholderPosition = Math.max(autoFree, currentSetup.position || 1);
-    // Marque cette position comme prise pour les scans suivants de la session
-    sessionSet.add(placeholderPosition);
-    sessionTakenRef.current.set(shelfKey, sessionSet);
-
-    // Détection du type d'objet d'après le format/préfixe du code-barres
+    // === DÉTECTION DU TYPE + RECONNAISSANCE INTERNE ===
     const detectedType = guessTypeFromBarcode(code);
-
-    // === RECONNAISSANCE INTERNE INSTANTANÉE (sans réseau) ===
-    // 1) Revue connue ?
     let magazineMatch = null;
-    if (detectedType === "revue") {
-      magazineMatch = recognizeMagazine(code);
-    }
-    // 2) Jeu connu (Switch ou société) ?
+    if (detectedType === "revue") magazineMatch = recognizeMagazine(code);
     let gameMatch = null;
     if (detectedType === "jeu-switch" || detectedType === "jeu-societe") {
       gameMatch = recognizeGame(code);
     }
-    // 3) Éditeur de presse identifié par préfixe ?
-    //    (utile quand on a détecté "revue" mais sans match magazineMatch précis)
     let pressMatch = null;
     if (detectedType === "revue" && !magazineMatch) {
       pressMatch = recognizePressPublisher(code);
     }
 
-    // Petit feedback flash brief sans bloquer
-    setPhase("flash");
-    setTimeout(() => {
-      // Si on est encore en "flash" (pas un autre scan entretemps), retour à scanning
-      setPhase((p) => (p === "flash" ? "scanning" : p));
-    }, 300);
+    // === CALCUL DE LA POSITION ===
+    const placeholderBib = currentSetup.bibliotheque;
+    const placeholderEtagere = currentSetup.etagere;
+    const shelfKey = `${placeholderBib}|${placeholderEtagere}`;
+    const sessionSet = sessionTakenRef.current.get(shelfKey) || new Set();
+    const extraReserved = Array.from(sessionSet);
+    const autoFree = findFirstFreePosition(books, placeholderBib, placeholderEtagere, extraReserved);
+    const placeholderPosition = Math.max(autoFree, currentSetup.position || 1);
 
-    // Ajout placeholder immédiat avec le bon type (et titre pré-rempli si la
-    // base interne a déjà reconnu l'objet — revue, jeu, ou éditeur de presse).
+    // Stocke toutes les infos du scan en cours pour les phases suivantes
+    const scanContext = {
+      code,
+      detectedType,
+      magazineMatch,
+      gameMatch,
+      pressMatch,
+      placeholderBib,
+      placeholderEtagere,
+      placeholderPosition,
+      duplicateOf,
+    };
+
+    // === BRANCHE 1 : DOUBLON ===
+    // On bloque la caméra et on demande à l'utilisateur ce qu'il veut faire.
+    if (duplicateOf) {
+      setPendingScan(scanContext);
+      setPhase("duplicate");
+      return; // Le reste du flux dépend de la décision de l'utilisateur
+              // (ajouter quand même → continueAfterDuplicate / ignorer → finishAndResume)
+    }
+
+    // === BRANCHE 2 : NOUVEAU LIVRE ===
+    // Phase "searching" : overlay "Recherche…" semi-transparent, caméra ne lit plus
+    setPendingScan(scanContext);
+    setPhase("searching");
+    await processNewScan(scanContext);
+  };
+
+  // Traite un scan déjà validé comme non-doublon : lance la lookup, puis ajoute
+  // le livre. Si la lookup ne renvoie pas de jaquette, déclenche la modale photo.
+  // Cette fonction est aussi appelée si l'utilisateur a choisi "Ajouter quand
+  // même" sur un doublon.
+  const processNewScan = async (ctx) => {
+    const {
+      code, detectedType, magazineMatch, gameMatch, pressMatch,
+      placeholderBib, placeholderEtagere, placeholderPosition,
+    } = ctx;
+
+    // Lookup en ligne (peut prendre plusieurs secondes)
+    let found = null;
+    try {
+      found = await lookupAnyBarcode(code, detectedType);
+    } catch (e) { /* ignore */ }
+
+    // Construit l'objet à insérer en BDD avec toutes les infos disponibles.
+    // On combine reconnaissance interne (revue / jeu / éditeur de presse) +
+    // résultat de la lookup en ligne.
+    const placeholderId = Date.now().toString() + "-" + Math.random().toString(36).slice(2, 6);
     const placeholder = {
       _placeholderId: placeholderId,
       type: detectedType,
       isbn: code,
-      title: magazineMatch?.title || gameMatch?.title || "",
-      author: "",
-      cover: "",
-      publisher: magazineMatch?.publisher || gameMatch?.publisher || pressMatch?.publisher || "",
+      title: magazineMatch?.title || gameMatch?.title || found?.title || "",
+      author: found?.author || "",
+      cover: found?.cover || "",
+      publisher: magazineMatch?.publisher || gameMatch?.publisher || found?.publisher || pressMatch?.publisher || "",
       bibliotheque: placeholderBib,
       etagere: placeholderEtagere,
       position: placeholderPosition,
       notes: magazineMatch?.ageRange || "",
+      // Champs enrichis si la lookup a renvoyé quelque chose
+      subtitle: found?.subtitle || "",
+      pages: found?.pages || 0,
+      language: found?.language || "",
+      description: found?.description || "",
+      categories: found?.categories || "",
+      rating: found?.rating || 0,
+      ratingsCount: found?.ratingsCount || 0,
+      infoLink: found?.infoLink || "",
+      format: found?.format || "",
+      dimensions: found?.dimensions || "",
+      weight: found?.weight || "",
+      year: found?.year || "",
     };
-    // Plate-forme par défaut pour les jeux Switch
     if (detectedType === "jeu-switch") {
       placeholder.platform = gameMatch?.platform || "Nintendo Switch";
     }
-    // === IMPORTANT : capture l'ID DB renvoyé par onAddBook ===
-    // C'est cet ID (UUID Supabase ou ID local) qui survivra au refresh
-    // realtime et permettra d'enrichir le bon livre par la suite.
-    // Sans ça, le _placeholderId est écrasé quand la souscription Supabase
-    // recharge la liste — et l'enrichissement n'a plus rien à mettre à jour.
+
+    // Insère en BDD et récupère l'ID retourné
     const inserted = await onAddBook(placeholder);
     const dbId = inserted?.id || null;
     const trackedBook = { ...placeholder, id: dbId };
     setLastBook(trackedBook);
     setBatchHistory((h) => [trackedBook, ...h]);
-    // Affiche la prochaine position envisagée (juste après celle qu'on vient
-    // d'attribuer). Le vrai calcul a lieu au prochain scan via
-    // findFirstFreePosition + sessionTakenRef ; cette valeur sert d'abord à
-    // l'UX (afficher "Prochaine position : N") et de borne minimale.
+
+    // Marque la position comme prise dans la session
+    const shelfKey = `${placeholderBib}|${placeholderEtagere}`;
+    const sessionSet = sessionTakenRef.current.get(shelfKey) || new Set();
+    sessionSet.add(placeholderPosition);
+    sessionTakenRef.current.set(shelfKey, sessionSet);
     setCurrentSetup((s) => ({ ...s, position: placeholderPosition + 1 }));
 
-    // Lookup en arrière-plan — l'objet sera mis à jour quand le résultat arrive.
-    // On utilise la source adaptée au type via lookupAnyBarcode.
-    (async () => {
-      let found = null;
-      try {
-        found = await lookupAnyBarcode(code, detectedType);
-      } catch (e) { /* ignore */ }
+    // === PAS DE JAQUETTE → MODALE PHOTO ===
+    if (!placeholder.cover && dbId) {
+      // On garde pendingScan, on enrichit avec bookId pour la photo
+      setPendingScan({ ...ctx, bookId: dbId, trackedBook });
+      setPhase("photoFallback");
+      return;
+    }
 
-      if (found && (found.title || found.cover)) {
-        // Pour une revue/jeu déjà reconnu en local, on garde le titre canonique
-        // de la base interne si la source en ligne en propose un différent.
-        const enrichedFields = {
-          title: magazineMatch?.title || gameMatch?.title || found.title || "",
-          author: found.author || "",
-          cover: found.cover || "",
-          subtitle: found.subtitle || "",
-          pages: found.pages || 0,
-          language: found.language || "",
-          description: found.description || "",
-          categories: found.categories || "",
-          rating: found.rating || 0,
-          ratingsCount: found.ratingsCount || 0,
-          infoLink: found.infoLink || "",
-          format: found.format || "",
-          dimensions: found.dimensions || "",
-          weight: found.weight || "",
-          publisher: magazineMatch?.publisher || gameMatch?.publisher || found.publisher || "",
-          year: found.year || "",
-        };
-        // Mise à jour : on privilégie l'ID DB (insensible au realtime).
-        // Fallback sur l'ancien mécanisme par placeholderId si l'ID est absent.
-        if (dbId && typeof onEnrichBookById === "function") {
-          onEnrichBookById(dbId, enrichedFields);
-        } else if (typeof onEnrichBook === "function") {
-          onEnrichBook(placeholderId, enrichedFields);
-        }
-        // Met aussi à jour notre vue locale (lastBook + batchHistory)
-        setLastBook((curr) =>
-          (curr?.id && curr.id === dbId) || curr?._placeholderId === placeholderId
-            ? { ...curr, ...enrichedFields }
-            : curr
-        );
-        setBatchHistory((h) =>
-          h.map((b) =>
-            (b.id && b.id === dbId) || b._placeholderId === placeholderId
-              ? { ...b, ...enrichedFields }
-              : b
-          )
-        );
-      }
+    // === SUCCÈS COMPLET → FLASH + RETOUR SCANNING ===
+    setPhase("flash");
+    setTimeout(() => {
+      setPhase((p) => (p === "flash" ? "scanning" : p));
+      finishAndResume();
+    }, 350);
+  };
 
-      // === DÉCLENCHEMENT DU FALLBACK PHOTO ===
-      // Si après enrichissement on n'a TOUJOURS pas de jaquette, on propose à
-      // l'utilisateur de prendre une photo de l'objet pour avoir au moins un
-      // visuel. C'est particulièrement utile pour les jeux et revues que les
-      // sources en ligne ne référencent pas. La caméra de scan se met en
-      // pause pendant la prise de photo et reprend après.
-      const finalCover = found?.cover || "";
-      if (!finalCover && dbId) {
-        const fallbackTitle =
-          magazineMatch?.title || gameMatch?.title ||
-          found?.title || pressMatch?.publisher || "";
-        queuePhotoFallback({
-          bookId: dbId,
-          isbn: code,
-          type: detectedType,
-          title: fallbackTitle,
-        });
-      }
-    })();
+  // L'utilisateur a choisi "Ignorer" sur la modale doublon.
+  const handleDuplicateIgnore = () => {
+    finishAndResume();
+  };
+  // L'utilisateur a choisi "Ajouter quand même" sur la modale doublon.
+  const handleDuplicateAddAnyway = async () => {
+    if (!pendingScan) return;
+    setPhase("searching");
+    await processNewScan(pendingScan);
+  };
+
+  // L'utilisateur a pris une photo dans la modale fallback.
+  const handlePhotoFallbackCapture = async (dataUrl) => {
+    if (!pendingScan) return;
+    const { bookId } = pendingScan;
+    const compressed = await compressImageDataUrl(dataUrl);
+    if (typeof onEnrichBookById === "function" && bookId) {
+      onEnrichBookById(bookId, { cover: compressed });
+    }
+    setLastBook((curr) => curr?.id === bookId ? { ...curr, cover: compressed } : curr);
+    setBatchHistory((h) => h.map((b) => b.id === bookId ? { ...b, cover: compressed } : b));
+    finishAndResume();
+  };
+  // L'utilisateur a passé la modale photo (livre déjà ajouté sans jaquette).
+  const handlePhotoFallbackSkip = () => {
+    finishAndResume();
   };
 
   const handleManualISBN = () => {
@@ -4628,7 +4618,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
       {/* Aide & Terminer */}
       <div className="space-y-2">
         <p className="text-center text-xs" style={{ color: "var(--ink-soft)" }}>
-          Pointez la caméra vers chaque code-barres, de gauche à droite. Les livres sont ajoutés automatiquement.
+          Pointez la caméra vers chaque code-barres. La caméra se met en pause pendant la recherche, puis reprend automatiquement.
         </p>
         <button
           onClick={onFinish}
@@ -4639,37 +4629,64 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
         </button>
       </div>
 
-      {/* Modale fallback : prendre une photo de l'objet quand aucune jaquette
-          n'a été trouvée en ligne. La photo est compressée à ~600px / qualité
-          0.7 avant d'être stockée comme couverture.
-          La key={bookId} force le remontage du composant entre deux items
-          successifs de la queue → l'auto-ouverture de l'appareil photo se
-          déclenche bien à chaque nouvel item. */}
-      {photoFallback && (
+      {/* === OVERLAY "RECHERCHE…" === */}
+      {/* Affiché pendant la phase searching : la caméra reste visible derrière
+          mais ne lit plus de codes-barres. L'utilisateur voit clairement que
+          l'app travaille. */}
+      {phase === "searching" && pendingScan && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center pointer-events-none"
+          style={{ background: "rgba(0,0,0,0.55)" }}
+        >
+          <div
+            className="rounded-2xl px-6 py-5 flex items-center gap-3 shadow-lg pointer-events-auto"
+            style={{ background: "var(--cream)" }}
+          >
+            <Loader2 className="w-6 h-6 animate-spin" style={{ color: "var(--leather-dark)" }} />
+            <div>
+              <div className="font-medium" style={{ color: "var(--ink)" }}>
+                Recherche en cours…
+              </div>
+              <div className="text-xs" style={{ color: "var(--ink-soft)" }}>
+                Code <span className="font-mono">{pendingScan.code}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* === MODALE DOUBLON === */}
+      {/* Le code-barres scanné existe déjà dans la base ou dans la session
+          courante. On bloque la caméra et on demande à l'utilisateur s'il
+          veut quand même ajouter ce livre (cas d'un vrai doublon physique :
+          deux exemplaires d'un même titre) ou ignorer. */}
+      {phase === "duplicate" && pendingScan?.duplicateOf && (
+        <DuplicateModal
+          duplicateOf={pendingScan.duplicateOf}
+          structure={structure}
+          onIgnore={handleDuplicateIgnore}
+          onAddAnyway={handleDuplicateAddAnyway}
+        />
+      )}
+
+      {/* === MODALE PHOTO FALLBACK === */}
+      {/* Le livre vient d'être ajouté mais la lookup en ligne n'a pas trouvé
+          de jaquette. On propose de prendre une photo de l'objet pour avoir
+          au moins un visuel. */}
+      {phase === "photoFallback" && pendingScan?.bookId && (
         <PhotoFallbackModal
-          key={photoFallback.bookId}
-          info={photoFallback}
-          onSkip={dismissPhotoFallback}
-          onCapture={async (dataUrl) => {
-            // Capture l'identifiant du livre cible MAINTENANT, avant tout
-            // await — sinon la closure pourrait lire une valeur de
-            // photoFallback déjà remplacée par l'item suivant.
-            const targetId = photoFallback.bookId;
-            const compressed = await compressImageDataUrl(dataUrl);
-            // Persiste la couverture sur le bon livre via son ID DB
-            if (typeof onEnrichBookById === "function" && targetId) {
-              onEnrichBookById(targetId, { cover: compressed });
-            }
-            // Met aussi à jour la vue locale (lastBook + batchHistory)
-            setLastBook((curr) =>
-              curr?.id === targetId ? { ...curr, cover: compressed } : curr
-            );
-            setBatchHistory((h) =>
-              h.map((b) => (b.id === targetId ? { ...b, cover: compressed } : b))
-            );
-            // Passe au fallback suivant en attente, le cas échéant.
-            dismissPhotoFallback();
+          info={{
+            bookId: pendingScan.bookId,
+            isbn: pendingScan.code,
+            type: pendingScan.detectedType,
+            title:
+              pendingScan.magazineMatch?.title ||
+              pendingScan.gameMatch?.title ||
+              pendingScan.trackedBook?.title ||
+              pendingScan.pressMatch?.publisher || "",
           }}
+          onSkip={handlePhotoFallbackSkip}
+          onCapture={handlePhotoFallbackCapture}
         />
       )}
     </div>
@@ -4766,6 +4783,84 @@ function PhotoFallbackModal({ info, onSkip, onCapture }) {
         >
           Passer (continuer le scan)
         </button>
+      </div>
+    </div>
+  );
+}
+
+// === MODALE DOUBLON ===
+// Affichée quand un code-barres scanné correspond à un livre déjà présent
+// dans la bibliothèque (même ISBN, peu importe l'emplacement). Bloque la
+// caméra et demande à l'utilisateur s'il veut quand même ajouter (cas d'un
+// vrai second exemplaire physique) ou ignorer.
+function DuplicateModal({ duplicateOf, structure, onIgnore, onAddAnyway }) {
+  // Trouve le nom de la bibliothèque où se trouve déjà l'objet
+  const bib = structure?.bibliotheques?.find((b) => b.id === duplicateOf.bibliotheque);
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: "rgba(0,0,0,0.6)" }}
+    >
+      <div className="w-full max-w-sm rounded-2xl p-5" style={{ background: "var(--cream)" }}>
+        <div className="flex items-center gap-2 mb-3">
+          <AlertTriangle className="w-6 h-6" style={{ color: "var(--leather-dark)" }} />
+          <h3 style={{ fontFamily: "var(--font-display)", fontSize: "1.15rem", color: "var(--ink)" }}>
+            Déjà dans votre bibliothèque
+          </h3>
+        </div>
+
+        {/* Aperçu du livre déjà existant */}
+        <div className="flex gap-3 mb-4 p-2 rounded-lg" style={{ background: "var(--parchment)" }}>
+          {duplicateOf.cover ? (
+            <img
+              src={duplicateOf.cover}
+              alt=""
+              className="w-12 h-16 object-cover rounded"
+              style={{ background: "var(--cream)" }}
+            />
+          ) : (
+            <div
+              className="w-12 h-16 rounded flex items-center justify-center"
+              style={{ background: "var(--cream)" }}
+            >
+              <BookOpen className="w-5 h-5" style={{ color: "var(--ink-soft)" }} />
+            </div>
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="font-medium truncate" style={{ color: "var(--ink)" }}>
+              {duplicateOf.title || <em>(sans titre)</em>}
+            </div>
+            {duplicateOf.author && (
+              <div className="text-xs truncate" style={{ color: "var(--ink-soft)" }}>
+                {duplicateOf.author}
+              </div>
+            )}
+            <div className="text-xs mt-1" style={{ color: "var(--ink-soft)" }}>
+              {bib?.nom || "?"} · étagère {duplicateOf.etagere} · pos. {duplicateOf.position}
+            </div>
+          </div>
+        </div>
+
+        <p className="text-sm mb-4" style={{ color: "var(--ink-soft)" }}>
+          Ce code-barres existe déjà. Voulez-vous l'ajouter quand même (vous avez deux exemplaires) ou ignorer ce scan ?
+        </p>
+
+        <div className="space-y-2">
+          <button
+            onClick={onIgnore}
+            className="w-full py-3 rounded-xl font-medium"
+            style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+          >
+            Ignorer (passer au suivant)
+          </button>
+          <button
+            onClick={onAddAnyway}
+            className="w-full py-3 rounded-xl font-medium border-2"
+            style={{ borderColor: "var(--leather)", color: "var(--leather-dark)", background: "white" }}
+          >
+            Ajouter quand même
+          </button>
+        </div>
       </div>
     </div>
   );
