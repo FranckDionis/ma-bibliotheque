@@ -220,6 +220,10 @@ function dbToBook(row) {
   };
 }
 
+// Export public pour permettre à App.jsx d'appliquer les payloads realtime
+// (INSERT/UPDATE/DELETE) localement sans re-fetcher toute la liste.
+export { dbToBook };
+
 function bookToDb(book) {
   // IMPORTANT : on ne mappe QUE les champs présents dans l'objet d'entrée.
   // Si on faisait `isbn: book.isbn || null` pour un patch comme {cover: "..."},
