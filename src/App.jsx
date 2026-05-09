@@ -2567,8 +2567,26 @@ function FilterChip({ active, onClick, children }) {
 
 function BookCard({ book, structure, onClick, index }) {
   const bib = structure.bibliotheques.find((b) => b.id === book.bibliotheque);
+  const piece = bib ? structure.pieces.find((p) => p.id === bib.pieceId) : null;
   const itemType = ITEM_TYPES[book.type || "livre"];
-  const isLivre = !book.type || book.type === "livre";
+
+  // Champ "info principal" affiché juste sous le titre, dépendant du type :
+  //   livre  → auteur
+  //   revue  → éditeur (champ `publisher`)
+  //   jeu    → plateforme (Switch) ou rien (jeu de société, déjà couvert
+  //            plus bas par "X joueurs · Y min")
+  let mainInfo = "";
+  if (book.type === "revue") {
+    mainInfo = book.publisher || "";
+  } else if (book.type === "jeu-switch") {
+    mainInfo = book.platform || "";
+  } else if (book.type === "jeu-societe") {
+    mainInfo = ""; // affiché autrement plus bas
+  } else {
+    // livre par défaut
+    mainInfo = book.author || "";
+  }
+
   return (
     <button
       onClick={onClick}
@@ -2579,16 +2597,18 @@ function BookCard({ book, structure, onClick, index }) {
         animationDelay: `${Math.min(index * 50, 400)}ms`,
       }}
     >
-      {/* Badge type pour les non-livres */}
-      {!isLivre && (
-        <div
-          className="absolute top-1 right-1 w-6 h-6 rounded-full flex items-center justify-center"
-          style={{ background: itemType?.color || "var(--leather)", fontSize: "0.85rem" }}
-          title={itemType?.label}
-        >
-          {itemType?.emoji}
-        </div>
-      )}
+      {/* Badge type — toujours affiché, en haut à droite. Pour les livres on
+          utilise une couleur plus discrète pour ne pas saturer la vue. */}
+      <div
+        className="absolute top-1 right-1 w-6 h-6 rounded-full flex items-center justify-center"
+        style={{
+          background: itemType?.color || "var(--leather)",
+          fontSize: "0.85rem",
+        }}
+        title={itemType?.label}
+      >
+        {itemType?.emoji}
+      </div>
       <div className="w-16 h-24 flex-shrink-0 rounded overflow-hidden flex items-center justify-center"
         style={{ background: "var(--parchment)" }}>
         {book.cover ? (
@@ -2610,14 +2630,16 @@ function BookCard({ book, structure, onClick, index }) {
             {book.issueDate}
           </p>
         )}
-        {/* Pour les livres : auteur */}
-        {isLivre && book.author && (
-          <p className="text-sm mb-2 line-clamp-1" style={{ color: "var(--ink-soft)" }}>
-            {book.author}
+        {/* Info principale selon le type : auteur (livre), éditeur (revue),
+            plateforme (jeu Switch). */}
+        {mainInfo && (
+          <p className="text-sm mb-1 line-clamp-1" style={{ color: "var(--ink-soft)" }}>
+            {mainInfo}
           </p>
         )}
-        {/* Pour les jeux : joueurs / durée */}
-        {(book.type === "jeu-societe" || book.type === "jeu-switch") && (book.playersMax > 0 || book.durationMin > 0) && (
+        {/* Pour les jeux de société : joueurs / durée (info plus pertinente
+            que l'éditeur pour cette catégorie). */}
+        {book.type === "jeu-societe" && (book.playersMax > 0 || book.durationMin > 0) && (
           <p className="text-sm mb-1" style={{ color: "var(--ink-soft)" }}>
             {book.playersMax > 0 && (
               book.playersMin > 0 && book.playersMin !== book.playersMax
@@ -2628,13 +2650,36 @@ function BookCard({ book, structure, onClick, index }) {
             {book.durationMin > 0 && `${book.durationMin} min`}
           </p>
         )}
-        <div className="flex items-center gap-1 text-xs" style={{ color: "var(--leather)" }}>
-          <MapPin className="w-3 h-3 flex-shrink-0" />
-          <span className="truncate">
-            {bib ? bib.nom : "Non placé"}
-            {book.etagere && ` · Ét. ${book.etagere}`}
-            {book.position && ` · #${book.position}`}
-          </span>
+        {/* Localisation sur deux lignes :
+              — pièce (avec son étage) sur la première
+              — bibliothèque · étagère · position sur la seconde
+            Si le livre n'est rattaché à rien, on affiche "Non placé". */}
+        <div className="text-xs mt-1" style={{ color: "var(--leather)" }}>
+          {piece ? (
+            <div className="flex items-center gap-1">
+              <span style={{ fontSize: "0.85rem" }}>{piece.icon || "🏠"}</span>
+              <span className="truncate">
+                {piece.nom}{piece.etage ? ` · ${piece.etage}` : ""}
+              </span>
+            </div>
+          ) : (
+            !bib && (
+              <div className="flex items-center gap-1">
+                <MapPin className="w-3 h-3 flex-shrink-0" />
+                <span>Non placé</span>
+              </div>
+            )
+          )}
+          {bib && (
+            <div className="flex items-center gap-1 mt-0.5">
+              <MapPin className="w-3 h-3 flex-shrink-0" />
+              <span className="truncate">
+                {bib.nom}
+                {book.etagere && ` · Ét. ${book.etagere}`}
+                {book.position && ` · #${book.position}`}
+              </span>
+            </div>
+          )}
         </div>
       </div>
       <ChevronRight className="w-5 h-5 self-center flex-shrink-0" style={{ color: "var(--leather)" }} />
