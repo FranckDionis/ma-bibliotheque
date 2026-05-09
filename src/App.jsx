@@ -16,6 +16,7 @@ import {
   subscribeToBooks,
   subscribeToStructure,
   subscribeToLayout,
+  dbToBook,
 } from "./db";
 import AuthScreen from "./AuthScreen";
 import { ITEM_TYPES, ITEM_TYPES_LIST, guessTypeFromBarcode, FIELDS_BY_TYPE, recognizeMagazine, recognizeGame, recognizePressPublisher } from "./itemTypes";
@@ -1117,12 +1118,36 @@ export default function App() {
   useEffect(() => {
     if (!isCloudMode) return;
 
-    const booksSub = subscribeToBooks(async (payload) => {
-      // Stratégie simple et robuste : on recharge la liste complète à chaque changement.
-      // Pour quelques centaines de livres, c'est acceptable.
+    // === SOUSCRIPTION REALTIME — APPLY DELTA ===
+    // ⚠️ CHANGEMENT CRITIQUE pour la consommation de bande passante.
+    // AVANT : à chaque INSERT/UPDATE/DELETE, on re-fetchait TOUTE la liste
+    // des livres. Pour 700 scans avec covers, cela représentait des dizaines
+    // de gigaoctets téléchargés (Σ N pour N de 1 à 700) — quota Supabase
+    // gratuit (5 GB/mois) explosé en quelques heures.
+    // MAINTENANT : on applique directement le delta envoyé par Supabase via
+    // payload.new / payload.old. Aucun re-fetch n'est nécessaire — chaque
+    // event ne coûte que la taille du livre concerné (~50 KB max).
+    const booksSub = subscribeToBooks((payload) => {
       try {
-        const fresh = await fetchBooksRemote();
-        setBooks(fresh);
+        const eventType = payload.eventType || payload.type;
+        if (eventType === "INSERT" && payload.new) {
+          const newBook = dbToBook(payload.new);
+          setBooks((prev) => {
+            // Évite les doublons si l'event arrive après notre propre insertion
+            // locale (cas typique : on vient d'ajouter le livre via insertBookRemote
+            // qui le pousse déjà dans setBooks).
+            if (prev.some((b) => b.id === newBook.id)) return prev;
+            return [newBook, ...prev];
+          });
+        } else if (eventType === "UPDATE" && payload.new) {
+          const updatedBook = dbToBook(payload.new);
+          setBooks((prev) => prev.map((b) =>
+            b.id === updatedBook.id ? { ...b, ...updatedBook } : b
+          ));
+        } else if (eventType === "DELETE" && payload.old) {
+          const deletedId = payload.old.id;
+          setBooks((prev) => prev.filter((b) => b.id !== deletedId));
+        }
       } catch (e) { /* ignore */ }
     });
 
