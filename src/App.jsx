@@ -4404,6 +4404,12 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
   //   - flash         : feedback visuel bref après ajout réussi
   const [phase, setPhase] = useState("scanning");
   const [lastBook, setLastBook] = useState(null);
+  // États pour la modification du dernier livre depuis le bandeau d'aperçu :
+  //   - editingCoverFor : livre dont on souhaite remplacer la couverture
+  //                       par une nouvelle photo (réutilise PhotoFallbackModal)
+  //   - editingTitleFor : livre dont on souhaite corriger le titre au clavier
+  const [editingCoverFor, setEditingCoverFor] = useState(null);
+  const [editingTitleFor, setEditingTitleFor] = useState(null);
   // === SESSION DE SCAN — STRUCTURE LÉGÈRE EN REF ===
   // Avant : `batchHistory` était un useState contenant les objets complets
   // (avec covers base64). Après 20 scans avec quelques photos, ça représentait
@@ -5326,21 +5332,44 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
           background: "white",
           borderColor: "var(--gold-light)",
         }}>
-          <div className="w-12 h-16 rounded overflow-hidden flex-shrink-0 flex items-center justify-center"
-            style={{ background: "var(--parchment)" }}>
+          {/* Vignette de la jaquette — cliquable pour reprendre la photo
+              si la couverture trouvée ne correspond pas au livre réel. */}
+          <button
+            type="button"
+            onClick={() => setEditingCoverFor(lastBook)}
+            aria-label="Modifier la couverture (reprendre la photo)"
+            className="w-20 h-28 rounded overflow-hidden flex-shrink-0 flex items-center justify-center relative group"
+            style={{ background: "var(--parchment)", border: "1px solid var(--gold-light)" }}
+          >
             {lastBook.cover ? (
               <img src={lastBook.cover} alt="" className="w-full h-full object-cover" />
             ) : (
-              <BookOpen className="w-5 h-5" style={{ color: "var(--leather)" }} />
+              <BookOpen className="w-6 h-6" style={{ color: "var(--leather)" }} />
             )}
-          </div>
+            {/* Petit badge appareil photo en surimpression pour indiquer
+                que la vignette est tappable. */}
+            <span
+              className="absolute bottom-1 right-1 rounded-full p-1 flex items-center justify-center"
+              style={{ background: "rgba(0,0,0,0.65)" }}
+            >
+              <Camera className="w-3 h-3" style={{ color: "var(--cream)" }} />
+            </span>
+          </button>
           <div className="flex-1 min-w-0">
             <div className="text-xs" style={{ color: "var(--gold)" }}>
               ✓ Ajouté en position {lastBook.position}
             </div>
-            <div className="font-medium text-sm truncate" style={{ color: "var(--ink)" }}>
+            {/* Titre cliquable — ouvre une modale de saisie pour corriger
+                le titre si la lookup en ligne s'est trompée. */}
+            <button
+              type="button"
+              onClick={() => setEditingTitleFor(lastBook)}
+              className="text-left w-full font-medium text-sm truncate underline decoration-dotted"
+              style={{ color: "var(--ink)", textUnderlineOffset: "3px" }}
+              aria-label="Modifier le titre"
+            >
               {lastBook.title || `ISBN ${lastBook.isbn}`}
-            </div>
+            </button>
             {lastBook.author && (
               <div className="text-xs truncate" style={{ color: "var(--ink-soft)" }}>
                 {lastBook.author}
@@ -5442,6 +5471,50 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
           onCapture={handlePhotoFallbackCapture}
         />
       )}
+
+      {/* Modale de re-capture de couverture pour le dernier livre scanné.
+          Réutilise PhotoFallbackModal qui sait ouvrir l'appareil photo. */}
+      {editingCoverFor && (
+        <PhotoFallbackModal
+          info={{
+            bookId: editingCoverFor.id,
+            isbn: editingCoverFor.isbn,
+            type: editingCoverFor.type,
+            noIsbn: !editingCoverFor.isbn,
+            title: editingCoverFor.title || "",
+          }}
+          onSkip={() => setEditingCoverFor(null)}
+          onCapture={async (dataUrl) => {
+            const target = editingCoverFor;
+            setEditingCoverFor(null);
+            const compressed = await compressImageDataUrl(dataUrl);
+            if (typeof onEnrichBookById === "function" && target?.id) {
+              onEnrichBookById(target.id, { cover: compressed });
+            }
+            // Met à jour la vignette du bandeau immédiatement
+            setLastBook((curr) => curr?.id === target.id ? { ...curr, cover: compressed } : curr);
+            showToast?.("Couverture mise à jour");
+          }}
+        />
+      )}
+
+      {/* Modale de saisie du titre au clavier pour le dernier livre scanné. */}
+      {editingTitleFor && (
+        <TitleEditModal
+          initialTitle={editingTitleFor.title || ""}
+          onCancel={() => setEditingTitleFor(null)}
+          onSave={(newTitle) => {
+            const target = editingTitleFor;
+            setEditingTitleFor(null);
+            const trimmed = (newTitle || "").trim();
+            if (typeof onEnrichBookById === "function" && target?.id) {
+              onEnrichBookById(target.id, { title: trimmed });
+            }
+            setLastBook((curr) => curr?.id === target.id ? { ...curr, title: trimmed } : curr);
+            showToast?.("Titre mis à jour");
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -5539,6 +5612,83 @@ function PhotoFallbackModal({ info, onSkip, onCapture }) {
           style={{ borderColor: "var(--parchment)", color: "var(--ink-soft)", background: "white" }}
         >
           Passer (continuer le scan)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// === MODALE D'ÉDITION RAPIDE DU TITRE ===
+// Permet de corriger au clavier le titre du dernier livre scanné directement
+// depuis le bandeau d'aperçu, sans interrompre la session de scan.
+// Le focus est mis automatiquement sur le champ et le texte présélectionné,
+// pour que l'utilisateur puisse taper directement par-dessus.
+function TitleEditModal({ initialTitle, onCancel, onSave }) {
+  const [value, setValue] = useState(initialTitle || "");
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    // Focus automatique au montage + sélection du texte existant
+    const t = setTimeout(() => {
+      if (inputRef.current) {
+        inputRef.current.focus();
+        inputRef.current.select();
+      }
+    }, 50);
+    return () => clearTimeout(t);
+  }, []);
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      onSave(value);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      onCancel();
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: "rgba(0,0,0,0.6)" }}>
+      <div className="w-full max-w-sm rounded-2xl p-5" style={{ background: "var(--cream)" }}>
+        <div className="flex items-center gap-2 mb-3">
+          <Edit2 className="w-5 h-5" style={{ color: "var(--leather-dark)" }} />
+          <h3 style={{ fontFamily: "var(--font-display)", fontSize: "1.15rem", color: "var(--ink)" }}>
+            Corriger le titre
+          </h3>
+        </div>
+        <p className="text-sm mb-3" style={{ color: "var(--ink-soft)" }}>
+          Saisissez le bon titre du dernier objet ajouté.
+        </p>
+        <input
+          ref={inputRef}
+          type="text"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Titre du livre"
+          className="w-full px-3 py-3 rounded-lg border-2 text-base mb-4"
+          style={{
+            borderColor: "var(--gold-light)",
+            background: "white",
+            color: "var(--ink)",
+            fontFamily: "var(--font-display)",
+          }}
+        />
+        <button
+          onClick={() => onSave(value)}
+          className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 mb-2"
+          style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+        >
+          <Check className="w-5 h-5" /> Enregistrer
+        </button>
+        <button
+          onClick={onCancel}
+          className="w-full py-3 rounded-xl font-medium border-2"
+          style={{ borderColor: "var(--parchment)", color: "var(--ink-soft)", background: "white" }}
+        >
+          Annuler
         </button>
       </div>
     </div>
