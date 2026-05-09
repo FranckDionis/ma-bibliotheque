@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, forwardRef, useImperativeHandle } from "react";
 import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload, LogOut, Cloud, CloudOff } from "lucide-react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
 import { BarcodeFormat, DecodeHintType } from "@zxing/library";
@@ -2195,9 +2195,11 @@ export default function App() {
           <DetailView
             book={selectedBook}
             structure={structure}
+            filteredBooks={filteredBooks}
             onBack={() => setView("home")}
             onEdit={() => setView("edit")}
             onDelete={() => deleteBook(selectedBook.id)}
+            onSelectBook={setSelectedBook}
           />
         )}
         {view === "edit" && selectedBook && (
@@ -2205,12 +2207,14 @@ export default function App() {
             books={books}
             book={selectedBook}
             structure={structure}
+            filteredBooks={filteredBooks}
             onCancel={() => setView("detail")}
             onSave={async (updates) => {
               await updateBook(selectedBook.id, updates);
               setSelectedBook({ ...selectedBook, ...updates });
               setView("detail");
             }}
+            onSelectBook={setSelectedBook}
           />
         )}
       </main>
@@ -3287,7 +3291,10 @@ function CoverScanner({ onCancel, onCapture }) {
 }
 
 // === FORMULAIRE ===
-function BookForm({ books, structure, initial, onCancel, onSubmit, submitLabel }) {
+const BookForm = forwardRef(function BookForm(
+  { books, structure, initial, onCancel, onSubmit, submitLabel, bareMode = false, onDirtyChange },
+  externalRef
+) {
   // Type d'objet (livre/revue/jeu-societe/jeu-switch)
   const [type, setType] = useState(initial.type || "livre");
   const fields = FIELDS_BY_TYPE[type] || FIELDS_BY_TYPE.livre;
@@ -3429,20 +3436,63 @@ function BookForm({ books, structure, initial, onCancel, onSubmit, submitLabel }
     });
   };
 
+  // === DETECTION DES MODIFICATIONS ===
+  // On compare l'état courant aux valeurs initiales pour savoir si quelque
+  // chose a changé. Permet à EditView de demander une confirmation avant
+  // de quitter (bouton retour, précédent, suivant) sans avoir enregistré.
+  const isDirty = (
+    type !== (initial.type || "livre") ||
+    title !== (initial.title || "") ||
+    author !== (initial.author || "") ||
+    isbn !== (initial.isbn || "") ||
+    cover !== (initial.cover || "") ||
+    bibliotheque !== (initial.bibliotheque || structure.bibliotheques[0]?.id || "") ||
+    String(etagere) !== String(initial.etagere || "1") ||
+    String(position) !== String(initial.position || "") ||
+    notes !== (initial.notes || "") ||
+    subtitle !== (initial.subtitle || "") ||
+    String(pages) !== String(initial.pages || "") ||
+    language !== (initial.language || "") ||
+    description !== (initial.description || "") ||
+    categories !== (initial.categories || "") ||
+    parseFloat(rating || 0) !== parseFloat(initial.rating || 0) ||
+    publisher !== (initial.publisher || "") ||
+    year !== (initial.year || "") ||
+    issueNumber !== (initial.issueNumber || "") ||
+    issueDate !== (initial.issueDate || "") ||
+    String(playersMin) !== String(initial.playersMin || "") ||
+    String(playersMax) !== String(initial.playersMax || "") ||
+    String(durationMin) !== String(initial.durationMin || "") ||
+    String(ageMin) !== String(initial.ageMin || "") ||
+    platform !== (initial.platform || "")
+  );
+
+  useEffect(() => {
+    if (typeof onDirtyChange === "function") onDirtyChange(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  // Expose submit() et isDirty au parent (utilisé par EditView pour piloter
+  // le bouton "Enregistrer" placé en haut, et la modale de confirmation).
+  useImperativeHandle(externalRef, () => ({
+    submit,
+    isDirty: () => isDirty,
+    canSubmit: () => !!title.trim(),
+  }), [submit, isDirty, title]);
+
   return (
     <div className="space-y-4">
       <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)" }}>
         Informations du livre
       </h2>
 
-      {/* Couverture */}
+      {/* Couverture — agrandie en mode édition pour faciliter la vérification visuelle */}
       <div className="flex gap-3 items-start">
-        <div className="w-20 h-28 rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0"
+        <div className="w-32 h-44 rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0 shadow-md"
           style={{ background: "var(--parchment)" }}>
           {cover ? (
             <img src={cover} alt="" className="w-full h-full object-cover" />
           ) : (
-            <BookOpen className="w-8 h-8" style={{ color: "var(--leather)" }} />
+            <BookOpen className="w-10 h-10" style={{ color: "var(--leather)" }} />
           )}
         </div>
         <div className="flex-1 space-y-1.5">
@@ -3959,20 +4009,22 @@ function BookForm({ books, structure, initial, onCancel, onSubmit, submitLabel }
         />
       </Field>
 
-      <button
-        onClick={submit}
-        disabled={!title.trim()}
-        className="w-full py-3 rounded-xl font-medium disabled:opacity-50 mt-4"
-        style={{
-          background: "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)",
-          color: "var(--cream)",
-        }}
-      >
-        {submitLabel}
-      </button>
+      {!bareMode && (
+        <button
+          onClick={submit}
+          disabled={!title.trim()}
+          className="w-full py-3 rounded-xl font-medium disabled:opacity-50 mt-4"
+          style={{
+            background: "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)",
+            color: "var(--cream)",
+          }}
+        >
+          {submitLabel}
+        </button>
+      )}
     </div>
   );
-}
+});
 
 function Field({ label, children }) {
   return (
@@ -3984,17 +4036,63 @@ function Field({ label, children }) {
 }
 
 // === DETAIL ===
-function DetailView({ book, structure, onBack, onEdit, onDelete }) {
+function DetailView({ book, structure, filteredBooks, onBack, onEdit, onDelete, onSelectBook }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const bib = structure.bibliotheques.find((b) => b.id === book.bibliotheque);
   const piece = bib ? structure.pieces.find((p) => p.id === bib.pieceId) : null;
   const itemType = ITEM_TYPES[book.type || "livre"];
 
+  // === NAVIGATION PRÉCÉDENT / SUIVANT ===
+  // On cherche la position du livre courant dans la liste filtrée actuellement
+  // affichée. Si le livre n'y est pas (cas rare : ouvert depuis une autre vue
+  // ou filtre changé entre temps), on désactive simplement les flèches.
+  const currentIndex = filteredBooks ? filteredBooks.findIndex((b) => b.id === book.id) : -1;
+  const hasPrev = currentIndex > 0;
+  const hasNext = currentIndex >= 0 && currentIndex < (filteredBooks?.length || 0) - 1;
+  const goPrev = () => { if (hasPrev) onSelectBook(filteredBooks[currentIndex - 1]); };
+  const goNext = () => { if (hasNext) onSelectBook(filteredBooks[currentIndex + 1]); };
+
   return (
     <div>
-      <button onClick={onBack} className="flex items-center gap-1 mb-4" style={{ color: "var(--leather)" }}>
-        <ChevronRight className="w-5 h-5 rotate-180" /> Retour
-      </button>
+      {/* Barre du haut : Retour à gauche, Préc/Modifier/Suiv à droite */}
+      <div className="flex items-center justify-between mb-4 gap-2">
+        <button
+          onClick={onBack}
+          className="flex items-center gap-1"
+          style={{ color: "var(--leather)" }}
+        >
+          <ChevronRight className="w-5 h-5 rotate-180" /> Retour
+        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={goPrev}
+            disabled={!hasPrev}
+            className="px-2 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
+            style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+            aria-label="Livre précédent"
+          >
+            <ChevronRight className="w-4 h-4 rotate-180" />
+            <span className="hidden sm:inline">Préc.</span>
+          </button>
+          <button
+            onClick={onEdit}
+            className="px-3 py-1.5 rounded-lg font-medium flex items-center gap-1 text-sm"
+            style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+          >
+            <Edit2 className="w-4 h-4" /> Modifier
+          </button>
+          <button
+            onClick={goNext}
+            disabled={!hasNext}
+            className="px-2 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
+            style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+            aria-label="Livre suivant"
+          >
+            <span className="hidden sm:inline">Suiv.</span>
+            <ChevronRight className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
 
       <div className="text-center mb-6">
         <div className="inline-block w-40 h-56 rounded-lg overflow-hidden shadow-lg mb-4"
@@ -4167,20 +4265,14 @@ function DetailView({ book, structure, onBack, onEdit, onDelete }) {
         </a>
       )}
 
-      <div className="flex gap-3 mt-6">
-        <button
-          onClick={onEdit}
-          className="flex-1 py-3 rounded-xl font-medium flex items-center justify-center gap-2"
-          style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
-        >
-          <Edit2 className="w-4 h-4" /> Modifier
-        </button>
+      {/* Bouton supprimer en bas (le bouton Modifier a été déplacé en haut). */}
+      <div className="flex justify-end mt-6">
         <button
           onClick={() => setConfirmDelete(true)}
           className="px-4 py-3 rounded-xl border-2 flex items-center gap-2"
           style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
         >
-          <Trash2 className="w-4 h-4" />
+          <Trash2 className="w-4 h-4" /> Supprimer
         </button>
       </div>
 
@@ -5866,20 +5958,152 @@ function DuplicateModal({ duplicateOf, structure, newLocation, onIgnore, onAddAn
 }
 
 
-function EditView({ books, book, structure, onCancel, onSave }) {
+function EditView({ books, book, structure, filteredBooks, onCancel, onSave, onSelectBook }) {
+  const formRef = useRef(null);
+  const [isDirty, setIsDirty] = useState(false);
+  // Action en attente quand l'utilisateur tente de quitter avec des
+  // modifications non enregistrées : "back" | "prev" | "next" | null
+  const [pendingNav, setPendingNav] = useState(null);
+
+  const currentIndex = filteredBooks ? filteredBooks.findIndex((b) => b.id === book.id) : -1;
+  const hasPrev = currentIndex > 0;
+  const hasNext = currentIndex >= 0 && currentIndex < (filteredBooks?.length || 0) - 1;
+
+  // Effectue l'action de navigation demandée (sans confirmation supplémentaire).
+  const performNav = (action) => {
+    if (action === "back") onCancel();
+    else if (action === "prev" && hasPrev) onSelectBook(filteredBooks[currentIndex - 1]);
+    else if (action === "next" && hasNext) onSelectBook(filteredBooks[currentIndex + 1]);
+  };
+
+  // Tentative de navigation : si modifié, on ouvre la modale de confirmation,
+  // sinon on part directement.
+  const tryNav = (action) => {
+    if (isDirty) setPendingNav(action);
+    else performNav(action);
+  };
+
+  const handleSaveTop = () => {
+    if (formRef.current?.canSubmit()) formRef.current.submit();
+  };
+
+  // Réponses possibles à la modale "modifications non enregistrées" :
+  //   - Enregistrer : on déclenche le submit, qui appellera onSave puis
+  //     fera revenir à la vue détail (réinitialisant la nav). On annule
+  //     pendingNav pour ne pas re-naviguer ensuite.
+  //   - Annuler les modifs : on quitte l'édition selon l'action demandée
+  //     sans sauvegarder (les changements en mémoire sont perdus).
+  //   - Continuer à modifier : on ferme juste la modale.
+  const confirmSaveAndNav = () => {
+    setPendingNav(null);
+    if (formRef.current?.canSubmit()) formRef.current.submit();
+  };
+  const confirmDiscardAndNav = () => {
+    const action = pendingNav;
+    setPendingNav(null);
+    performNav(action);
+  };
+
   return (
     <div>
-      <button onClick={onCancel} className="flex items-center gap-1 mb-4" style={{ color: "var(--leather)" }}>
-        <X className="w-5 h-5" /> Annuler
-      </button>
+      {/* Barre du haut : Retour à gauche, Préc/Enregistrer/Suiv à droite */}
+      <div className="flex items-center justify-between mb-4 gap-2">
+        <button
+          onClick={() => tryNav("back")}
+          className="flex items-center gap-1"
+          style={{ color: "var(--leather)" }}
+        >
+          <ChevronRight className="w-5 h-5 rotate-180" /> Retour
+        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => tryNav("prev")}
+            disabled={!hasPrev}
+            className="px-2 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
+            style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+            aria-label="Livre précédent"
+          >
+            <ChevronRight className="w-4 h-4 rotate-180" />
+            <span className="hidden sm:inline">Préc.</span>
+          </button>
+          <button
+            onClick={handleSaveTop}
+            className="px-3 py-1.5 rounded-lg font-medium flex items-center gap-1 text-sm"
+            style={{
+              background: isDirty
+                ? "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)"
+                : "var(--parchment)",
+              color: isDirty ? "var(--cream)" : "var(--ink-soft)",
+            }}
+          >
+            <Save className="w-4 h-4" /> Enregistrer
+          </button>
+          <button
+            onClick={() => tryNav("next")}
+            disabled={!hasNext}
+            className="px-2 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
+            style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+            aria-label="Livre suivant"
+          >
+            <span className="hidden sm:inline">Suiv.</span>
+            <ChevronRight className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
       <BookForm
+        ref={formRef}
         books={books}
         structure={structure}
         initial={book}
         onCancel={onCancel}
         onSubmit={onSave}
         submitLabel="Enregistrer"
+        bareMode={true}
+        onDirtyChange={setIsDirty}
       />
+
+      {/* Modale de confirmation : modifications non enregistrées */}
+      {pendingNav && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4"
+          style={{ background: "rgba(0,0,0,0.5)" }}>
+          <div className="w-full max-w-sm rounded-2xl p-6" style={{ background: "var(--cream)" }}>
+            <h3 style={{ fontFamily: "var(--font-display)", fontSize: "1.25rem", color: "var(--ink)", marginBottom: "0.5rem" }}>
+              Modifications non enregistrées
+            </h3>
+            <p className="text-sm mb-4" style={{ color: "var(--ink-soft)" }}>
+              Voulez-vous enregistrer ou annuler les modifications avant de quitter cette fiche ?
+            </p>
+            <div className="space-y-2">
+              <button
+                onClick={confirmSaveAndNav}
+                disabled={!formRef.current?.canSubmit()}
+                className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 disabled:opacity-50"
+                style={{
+                  background: "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)",
+                  color: "var(--cream)",
+                }}
+              >
+                <Save className="w-4 h-4" /> Enregistrer
+              </button>
+              <button
+                onClick={confirmDiscardAndNav}
+                className="w-full py-3 rounded-xl font-medium border-2"
+                style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
+              >
+                Annuler les modifications
+              </button>
+              <button
+                onClick={() => setPendingNav(null)}
+                className="w-full py-3 rounded-xl font-medium border-2"
+                style={{ borderColor: "var(--parchment)", color: "var(--ink)" }}
+              >
+                Continuer à modifier
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
