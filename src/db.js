@@ -27,30 +27,51 @@ const LIGHT_COLUMNS = [
 
 // Lit tous les livres de la base (SANS les couvertures pour rester léger).
 // Les couvertures sont chargées à la demande par fetchBookCovers().
+//
+// IMPORTANT : Supabase plafonne par défaut chaque requête à 1000 lignes.
+// On boucle donc avec .range(from, to) pour récupérer toute la table,
+// même au-delà de 1000 livres.
 export async function fetchBooks() {
   if (!supabase) return [];
-  const { data, error } = await supabase
-    .from("books")
-    .select(LIGHT_COLUMNS)
-    .order("created_at", { ascending: false });
-  if (error) throw error;
+  const PAGE_SIZE = 1000;
+  let allRows = [];
+  let from = 0;
+  while (true) {
+    const to = from + PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from("books")
+      .select(LIGHT_COLUMNS)
+      .order("created_at", { ascending: false })
+      .range(from, to);
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    allRows = allRows.concat(data);
+    if (data.length < PAGE_SIZE) break; // dernière page
+    from += PAGE_SIZE;
+  }
   // Convertit les colonnes snake_case en camelCase pour rester cohérent avec le reste de l'app
-  return (data || []).map(dbToBook);
+  return allRows.map(dbToBook);
 }
 
 // Charge les couvertures de plusieurs livres en une requête.
 // Renvoie un Map<id, coverDataUrl>. Les ids absents = pas de cover en base.
+// Si l'appelant fournit un grand nombre d'ids, on découpe pour rester sous
+// la limite de 1000 lignes par requête.
 export async function fetchBookCovers(ids) {
   if (!supabase) return new Map();
   if (!Array.isArray(ids) || ids.length === 0) return new Map();
-  const { data, error } = await supabase
-    .from("books")
-    .select("id,cover")
-    .in("id", ids);
-  if (error) throw error;
   const map = new Map();
-  for (const row of data || []) {
-    if (row.cover) map.set(row.id, row.cover);
+  const CHUNK = 500; // marge confortable sous la limite Supabase
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const { data, error } = await supabase
+      .from("books")
+      .select("id,cover")
+      .in("id", slice);
+    if (error) throw error;
+    for (const row of data || []) {
+      if (row.cover) map.set(row.id, row.cover);
+    }
   }
   return map;
 }
