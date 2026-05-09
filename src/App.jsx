@@ -8,6 +8,7 @@ import {
   saveStructureRemote,
   saveLayoutRemote,
   fetchBooks as fetchBooksRemote,
+  fetchBookCovers as fetchBookCoversRemote,
   fetchStructure as fetchStructureRemote,
   fetchLayout as fetchLayoutRemote,
   insertBook as insertBookRemote,
@@ -1012,6 +1013,36 @@ export default function App() {
           ]);
           if (cancelled) return;
           setBooks(remoteBooks);
+
+          // === CHARGEMENT PROGRESSIF DES COUVERTURES ===
+          // fetchBooksRemote() ne charge pas la colonne `cover` (trop lourde
+          // pour 800+ livres). On les rapatrie ici en tâche de fond, par
+          // paquets, et on met à jour le state au fur et à mesure pour que
+          // les images apparaissent progressivement.
+          (async () => {
+            const COVER_BATCH = 30;
+            const ids = remoteBooks.map((b) => b.id).filter(Boolean);
+            for (let i = 0; i < ids.length; i += COVER_BATCH) {
+              if (cancelled) return;
+              const slice = ids.slice(i, i + COVER_BATCH);
+              try {
+                const covers = await fetchBookCoversRemote(slice);
+                if (cancelled) return;
+                if (covers.size > 0) {
+                  setBooks((prev) => prev.map((b) =>
+                    covers.has(b.id) ? { ...b, cover: covers.get(b.id) } : b
+                  ));
+                }
+              } catch (e) {
+                // Si un lot échoue, on continue avec le suivant — l'app
+                // reste utilisable, juste sans certaines couvertures.
+                console.warn("Lot de couvertures non chargé:", e?.message);
+              }
+              // Petite pause pour laisser le thread principal respirer
+              // (UI fluide pendant le chargement de fond).
+              await new Promise((r) => setTimeout(r, 50));
+            }
+          })();
           if (remoteStructure && (remoteStructure.pieces?.length || 0) > 0) {
             setStructure({
               pieces: remoteStructure.pieces || INITIAL_PIECES,
