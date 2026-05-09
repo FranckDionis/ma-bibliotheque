@@ -1488,23 +1488,31 @@ export default function App() {
       return;
     }
 
-    // === LECTURE DES LIVRES LOCAUX RÉELS ===
-    // En mode cloud, le state `books` reflète la BDD distante (chargée au
-    // démarrage et maintenue par la subscription realtime). Le state n'est
-    // donc PAS la source à migrer. Il faut lire directement window.storage,
-    // qui contient les livres saisis pendant une éventuelle session
-    // antérieure "Continuer sans compte".
-    let localBooks = [];
+    // === LECTURE DES LIVRES À MIGRER ===
+    // On considère TOUT ce qui est actuellement affiché dans l'app (state
+    // `books`) comme à migrer. Cela couvre :
+    //   - les livres venant du localStorage (mode "Continuer sans compte")
+    //   - les livres importés via une sauvegarde JSON après connexion
+    //   - les livres déjà côté cloud (qui seront filtrés par l'anti-doublons)
+    // En complément, on lit aussi le localStorage au cas où des livres y seraient
+    // restés et n'auraient pas été repris dans le state.
+    let localBooks = [...(books || [])];
     try {
       const result = await window.storage.get(STORAGE_KEY);
       if (result?.value) {
         const parsed = JSON.parse(result.value);
-        if (Array.isArray(parsed)) localBooks = parsed;
+        if (Array.isArray(parsed)) {
+          // Fusionne sans doublons d'id
+          const knownIds = new Set(localBooks.map((b) => b.id));
+          for (const b of parsed) {
+            if (!knownIds.has(b.id)) localBooks.push(b);
+          }
+        }
       }
-    } catch (e) { /* pas de stockage → rien à migrer */ }
+    } catch (e) { /* pas de stockage → on garde juste le state */ }
 
     if (localBooks.length === 0) {
-      showToast("Aucun livre local à migrer", "error");
+      showToast("Aucun livre à migrer", "error");
       return;
     }
 
@@ -6879,12 +6887,12 @@ function SettingsModal({
                 </button>
 
                 {/* Bouton de migration des livres locaux vers la base partagée.
-                    On ne l'affiche QUE si window.storage contient encore des
-                    livres : typiquement vestige d'une session "Continuer sans
-                    compte" antérieure à la connexion. Pour la majorité des
-                    utilisateurs (qui se connectent dès le départ), tout est
-                    déjà sync en live et ce bouton serait trompeur. */}
-                {localBooksCount > 0 && (
+                    Affiché si window.storage contient des livres, OU si le
+                    state `books` contient des livres potentiellement non
+                    synchronisés (cas d'un import JSON après connexion).
+                    L'anti-doublons côté handleMigrateToCloud évitera de
+                    réinsérer ce qui est déjà en base. */}
+                {(localBooksCount > 0 || books.length > 0) && (
                   <div className="pt-2 border-t" style={{ borderColor: "var(--gold)" }}>
                     {migrating ? (
                       <div className="space-y-2">
@@ -6905,7 +6913,11 @@ function SettingsModal({
                     ) : (
                       <>
                         <p className="text-xs mb-2" style={{ color: "var(--ink)" }}>
-                          <strong>{localBooksCount} livre{localBooksCount > 1 ? "s" : ""}</strong> {localBooksCount > 1 ? "sont stockés" : "est stocké"} sur cet appareil (hors base partagée), probablement avant votre connexion. {localBooksCount > 1 ? "Migrez-les" : "Migrez-le"} pour {localBooksCount > 1 ? "les" : "le"} rendre accessible{localBooksCount > 1 ? "s" : ""} à toute la famille.
+                          {localBooksCount > 0 ? (
+                            <><strong>{localBooksCount} livre{localBooksCount > 1 ? "s" : ""}</strong> {localBooksCount > 1 ? "sont stockés" : "est stocké"} sur cet appareil (hors base partagée), probablement avant votre connexion. {localBooksCount > 1 ? "Migrez-les" : "Migrez-le"} pour {localBooksCount > 1 ? "les" : "le"} rendre accessible{localBooksCount > 1 ? "s" : ""} à toute la famille.</>
+                          ) : (
+                            <>Forcer l'envoi vers la base partagée des <strong>{books.length} objet{books.length > 1 ? "s" : ""}</strong> actuellement affiché{books.length > 1 ? "s" : ""} dans l'app. Utile après un import de sauvegarde JSON. Les doublons (même ISBN) déjà présents en base seront ignorés.</>
+                          )}
                         </p>
                         <button
                           onClick={onMigrateToCloud}
