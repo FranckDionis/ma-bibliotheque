@@ -9,16 +9,50 @@ import { supabase } from "./supabase";
 
 // === BOOKS ===
 
-// Lit tous les livres de la base
+// Liste des colonnes "légères" (toutes sauf `cover` qui peut peser
+// plusieurs centaines de Ko en base64). Charger 800+ livres avec
+// leurs couvertures peut représenter des dizaines de Mo et faire
+// échouer la requête HTTP avec un 500. Les couvertures sont donc
+// chargées séparément, à la demande, via fetchBookCovers().
+const LIGHT_COLUMNS = [
+  "id", "type", "isbn", "title", "subtitle", "author",
+  "bibliotheque", "etagere", "position",
+  "notes", "pages", "language", "description", "categories",
+  "rating", "ratings_count", "info_link",
+  "format", "dimensions", "weight", "publisher", "year",
+  "issue_number", "issue_date",
+  "players_min", "players_max", "duration_min", "age_min", "platform",
+  "created_at", "updated_at",
+].join(",");
+
+// Lit tous les livres de la base (SANS les couvertures pour rester léger).
+// Les couvertures sont chargées à la demande par fetchBookCovers().
 export async function fetchBooks() {
   if (!supabase) return [];
   const { data, error } = await supabase
     .from("books")
-    .select("*")
+    .select(LIGHT_COLUMNS)
     .order("created_at", { ascending: false });
   if (error) throw error;
   // Convertit les colonnes snake_case en camelCase pour rester cohérent avec le reste de l'app
   return (data || []).map(dbToBook);
+}
+
+// Charge les couvertures de plusieurs livres en une requête.
+// Renvoie un Map<id, coverDataUrl>. Les ids absents = pas de cover en base.
+export async function fetchBookCovers(ids) {
+  if (!supabase) return new Map();
+  if (!Array.isArray(ids) || ids.length === 0) return new Map();
+  const { data, error } = await supabase
+    .from("books")
+    .select("id,cover")
+    .in("id", ids);
+  if (error) throw error;
+  const map = new Map();
+  for (const row of data || []) {
+    if (row.cover) map.set(row.id, row.cover);
+  }
+  return map;
 }
 
 // Insère un nouveau livre
