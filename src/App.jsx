@@ -926,6 +926,11 @@ export default function App() {
   const [filterPiece, setFilterPiece] = useState("all");
   const [filterEtagere, setFilterEtagere] = useState("all");
   const [selectedBook, setSelectedBook] = useState(null);
+  // Liste figée des IDs servant à la navigation Préc./Suiv. dans DetailView
+  // et EditView. Capturée au moment d'ouvrir une fiche pour éviter qu'elle
+  // ne change si le filtre est modifié en arrière-plan ou si l'enregistrement
+  // d'une modification (titre, position) sort le livre du filtre actif.
+  const [navigationIds, setNavigationIds] = useState([]);
   const [toast, setToast] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   // Quand l'utilisateur lance un scan rapide depuis le plan (bouton + sur une
@@ -2135,7 +2140,14 @@ export default function App() {
             setFilterEtagere={setFilterEtagere}
             filterType={filterType}
             setFilterType={setFilterType}
-            onSelectBook={(b) => { setSelectedBook(b); setView("detail"); }}
+            onSelectBook={(b) => {
+              // On ouvre la fiche en figeant la liste filtrée actuelle comme
+              // base de navigation Préc./Suiv. — l'ordre reflète exactement
+              // ce que l'utilisateur voyait à l'écran.
+              setSelectedBook(b);
+              setNavigationIds(filteredBooks.map((x) => x.id));
+              setView("detail");
+            }}
             onAdd={() => setView("add")}
           />
         )}
@@ -2148,7 +2160,19 @@ export default function App() {
             layout={layout}
             saveLayout={saveLayout}
             showToast={showToast}
-            onSelectBook={(b) => { setSelectedBook(b); setView("detail"); }}
+            onSelectBook={(b) => {
+              // Depuis le plan, on navigue parmi les livres de la même étagère,
+              // dans l'ordre de leur position physique.
+              setSelectedBook(b);
+              const sameShelf = books
+                .filter((x) =>
+                  x.bibliotheque === b.bibliotheque &&
+                  Number(x.etagere) === Number(b.etagere)
+                )
+                .sort((a, c) => (Number(a.position) || 0) - (Number(c.position) || 0));
+              setNavigationIds(sameShelf.map((x) => x.id));
+              setView("detail");
+            }}
             onFilterBib={(bibId) => {
               // Aligne aussi le filtre pièce sur celle de la bibliothèque
               // ciblée, pour que la cascade de chips reste cohérente quand
@@ -2195,7 +2219,8 @@ export default function App() {
           <DetailView
             book={selectedBook}
             structure={structure}
-            filteredBooks={filteredBooks}
+            navigationIds={navigationIds}
+            allBooks={books}
             onBack={() => setView("home")}
             onEdit={() => setView("edit")}
             onDelete={() => deleteBook(selectedBook.id)}
@@ -2207,7 +2232,8 @@ export default function App() {
             books={books}
             book={selectedBook}
             structure={structure}
-            filteredBooks={filteredBooks}
+            navigationIds={navigationIds}
+            allBooks={books}
             onCancel={() => setView("detail")}
             onSave={async (updates) => {
               await updateBook(selectedBook.id, updates);
@@ -4036,47 +4062,57 @@ function Field({ label, children }) {
 }
 
 // === DETAIL ===
-function DetailView({ book, structure, filteredBooks, onBack, onEdit, onDelete, onSelectBook }) {
+function DetailView({ book, structure, navigationIds, allBooks, onBack, onEdit, onDelete, onSelectBook }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const bib = structure.bibliotheques.find((b) => b.id === book.bibliotheque);
   const piece = bib ? structure.pieces.find((p) => p.id === bib.pieceId) : null;
   const itemType = ITEM_TYPES[book.type || "livre"];
 
   // === NAVIGATION PRÉCÉDENT / SUIVANT ===
-  // On cherche la position du livre courant dans la liste filtrée actuellement
-  // affichée. Si le livre n'y est pas (cas rare : ouvert depuis une autre vue
-  // ou filtre changé entre temps), on désactive simplement les flèches.
-  const currentIndex = filteredBooks ? filteredBooks.findIndex((b) => b.id === book.id) : -1;
+  // navigationIds = liste des IDs figée au moment d'ouvrir la première fiche
+  // de cette session de navigation. Stable même si le filtre change ou si on
+  // modifie le livre courant. allBooks sert juste à retrouver l'objet à partir
+  // de son ID quand on saute à côté.
+  const currentIndex = navigationIds ? navigationIds.indexOf(book.id) : -1;
   const hasPrev = currentIndex > 0;
-  const hasNext = currentIndex >= 0 && currentIndex < (filteredBooks?.length || 0) - 1;
-  const goPrev = () => { if (hasPrev) onSelectBook(filteredBooks[currentIndex - 1]); };
-  const goNext = () => { if (hasNext) onSelectBook(filteredBooks[currentIndex + 1]); };
+  const hasNext = currentIndex >= 0 && currentIndex < (navigationIds?.length || 0) - 1;
+  const goPrev = () => {
+    if (!hasPrev) return;
+    const target = allBooks.find((b) => b.id === navigationIds[currentIndex - 1]);
+    if (target) onSelectBook(target);
+  };
+  const goNext = () => {
+    if (!hasNext) return;
+    const target = allBooks.find((b) => b.id === navigationIds[currentIndex + 1]);
+    if (target) onSelectBook(target);
+  };
 
   return (
     <div>
-      {/* Barre du haut : Retour à gauche, Préc/Modifier/Suiv à droite */}
-      <div className="flex items-center justify-between mb-4 gap-2">
+      {/* Barre du haut sur deux niveaux : Retour à gauche, puis Préc/Modifier/Suiv
+          centrés sous une ligne propre, pour ne pas comprimer sur mobile. */}
+      <div className="mb-4">
         <button
           onClick={onBack}
-          className="flex items-center gap-1"
+          className="flex items-center gap-1 mb-3"
           style={{ color: "var(--leather)" }}
         >
           <ChevronRight className="w-5 h-5 rotate-180" /> Retour
         </button>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center justify-center gap-2">
           <button
             onClick={goPrev}
             disabled={!hasPrev}
-            className="px-2 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
+            className="px-3 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
             style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
             aria-label="Livre précédent"
           >
             <ChevronRight className="w-4 h-4 rotate-180" />
-            <span className="hidden sm:inline">Préc.</span>
+            <span>Préc.</span>
           </button>
           <button
             onClick={onEdit}
-            className="px-3 py-1.5 rounded-lg font-medium flex items-center gap-1 text-sm"
+            className="px-4 py-1.5 rounded-lg font-medium flex items-center gap-1 text-sm"
             style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
           >
             <Edit2 className="w-4 h-4" /> Modifier
@@ -4084,11 +4120,11 @@ function DetailView({ book, structure, filteredBooks, onBack, onEdit, onDelete, 
           <button
             onClick={goNext}
             disabled={!hasNext}
-            className="px-2 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
+            className="px-3 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
             style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
             aria-label="Livre suivant"
           >
-            <span className="hidden sm:inline">Suiv.</span>
+            <span>Suiv.</span>
             <ChevronRight className="w-4 h-4" />
           </button>
         </div>
@@ -5958,22 +5994,28 @@ function DuplicateModal({ duplicateOf, structure, newLocation, onIgnore, onAddAn
 }
 
 
-function EditView({ books, book, structure, filteredBooks, onCancel, onSave, onSelectBook }) {
+function EditView({ books, book, structure, navigationIds, allBooks, onCancel, onSave, onSelectBook }) {
   const formRef = useRef(null);
   const [isDirty, setIsDirty] = useState(false);
   // Action en attente quand l'utilisateur tente de quitter avec des
   // modifications non enregistrées : "back" | "prev" | "next" | null
   const [pendingNav, setPendingNav] = useState(null);
 
-  const currentIndex = filteredBooks ? filteredBooks.findIndex((b) => b.id === book.id) : -1;
+  const currentIndex = navigationIds ? navigationIds.indexOf(book.id) : -1;
   const hasPrev = currentIndex > 0;
-  const hasNext = currentIndex >= 0 && currentIndex < (filteredBooks?.length || 0) - 1;
+  const hasNext = currentIndex >= 0 && currentIndex < (navigationIds?.length || 0) - 1;
 
   // Effectue l'action de navigation demandée (sans confirmation supplémentaire).
   const performNav = (action) => {
     if (action === "back") onCancel();
-    else if (action === "prev" && hasPrev) onSelectBook(filteredBooks[currentIndex - 1]);
-    else if (action === "next" && hasNext) onSelectBook(filteredBooks[currentIndex + 1]);
+    else if (action === "prev" && hasPrev) {
+      const target = allBooks.find((b) => b.id === navigationIds[currentIndex - 1]);
+      if (target) onSelectBook(target);
+    }
+    else if (action === "next" && hasNext) {
+      const target = allBooks.find((b) => b.id === navigationIds[currentIndex + 1]);
+      if (target) onSelectBook(target);
+    }
   };
 
   // Tentative de navigation : si modifié, on ouvre la modale de confirmation,
@@ -6006,29 +6048,30 @@ function EditView({ books, book, structure, filteredBooks, onCancel, onSave, onS
 
   return (
     <div>
-      {/* Barre du haut : Retour à gauche, Préc/Enregistrer/Suiv à droite */}
-      <div className="flex items-center justify-between mb-4 gap-2">
+      {/* Barre du haut sur deux niveaux : Retour à gauche, puis Préc/Enregistrer/Suiv
+          centrés sous une ligne propre, pour ne pas comprimer sur mobile. */}
+      <div className="mb-4">
         <button
           onClick={() => tryNav("back")}
-          className="flex items-center gap-1"
+          className="flex items-center gap-1 mb-3"
           style={{ color: "var(--leather)" }}
         >
           <ChevronRight className="w-5 h-5 rotate-180" /> Retour
         </button>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center justify-center gap-2">
           <button
             onClick={() => tryNav("prev")}
             disabled={!hasPrev}
-            className="px-2 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
+            className="px-3 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
             style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
             aria-label="Livre précédent"
           >
             <ChevronRight className="w-4 h-4 rotate-180" />
-            <span className="hidden sm:inline">Préc.</span>
+            <span>Préc.</span>
           </button>
           <button
             onClick={handleSaveTop}
-            className="px-3 py-1.5 rounded-lg font-medium flex items-center gap-1 text-sm"
+            className="px-4 py-1.5 rounded-lg font-medium flex items-center gap-1 text-sm"
             style={{
               background: isDirty
                 ? "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)"
@@ -6041,11 +6084,11 @@ function EditView({ books, book, structure, filteredBooks, onCancel, onSave, onS
           <button
             onClick={() => tryNav("next")}
             disabled={!hasNext}
-            className="px-2 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
+            className="px-3 py-1.5 rounded-lg flex items-center gap-1 text-sm disabled:opacity-30"
             style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
             aria-label="Livre suivant"
           >
-            <span className="hidden sm:inline">Suiv.</span>
+            <span>Suiv.</span>
             <ChevronRight className="w-4 h-4" />
           </button>
         </div>
