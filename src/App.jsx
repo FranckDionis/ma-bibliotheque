@@ -21,6 +21,13 @@ import {
 } from "./db";
 import AuthScreen from "./AuthScreen";
 import { ITEM_TYPES, ITEM_TYPES_LIST, guessTypeFromBarcode, FIELDS_BY_TYPE, recognizeMagazine, recognizeGame, recognizePressPublisher } from "./itemTypes";
+import {
+  getCachedCovers,
+  setCachedCovers,
+  deleteCachedCover,
+  clearCoverCache,
+  getCachedCoverIds,
+} from "./coverCache";
 
 // === ADAPTATEUR DE STOCKAGE ===
 // Utilise localStorage du navigateur (les données restent sur l'iPhone, dans le navigateur).
@@ -1019,32 +1026,56 @@ export default function App() {
           if (cancelled) return;
           setBooks(remoteBooks);
 
-          // === CHARGEMENT PROGRESSIF DES COUVERTURES ===
+          // === CHARGEMENT DES COUVERTURES AVEC CACHE LOCAL ===
           // fetchBooksRemote() ne charge pas la colonne `cover` (trop lourde
-          // pour 800+ livres). On les rapatrie ici en tâche de fond, par
-          // paquets, et on met à jour le state au fur et à mesure pour que
-          // les images apparaissent progressivement.
+          // pour 800+ livres). Pour économiser massivement la bande passante
+          // Supabase, on utilise un cache IndexedDB local :
+          //   1. On lit d'abord toutes les couvertures déjà en cache (instant)
+          //   2. On affiche immédiatement les livres avec leurs covers cachées
+          //   3. On ne télécharge depuis Supabase QUE les ids non cachés
+          //      (typiquement : zéro, sauf au tout premier démarrage ou
+          //      quand de nouveaux livres ont été ajoutés depuis)
+          //   4. On met le cache à jour avec les nouvelles couvertures
           (async () => {
-            const COVER_BATCH = 30;
             const ids = remoteBooks.map((b) => b.id).filter(Boolean);
-            for (let i = 0; i < ids.length; i += COVER_BATCH) {
+
+            // 1. Lecture du cache local
+            let cached = new Map();
+            try {
+              cached = await getCachedCovers(ids);
+            } catch (e) {
+              console.warn("Cache de couvertures non lisible:", e?.message);
+            }
+            if (cancelled) return;
+            if (cached.size > 0) {
+              setBooks((prev) => prev.map((b) =>
+                cached.has(b.id) ? { ...b, cover: cached.get(b.id) } : b
+              ));
+            }
+
+            // 2. Téléchargement des couvertures manquantes uniquement
+            const missingIds = ids.filter((id) => !cached.has(id));
+            if (missingIds.length === 0) return; // tout est en cache, rien à faire
+
+            console.log(`Téléchargement de ${missingIds.length} couvertures manquantes (sur ${ids.length} livres)`);
+            const COVER_BATCH = 30;
+            for (let i = 0; i < missingIds.length; i += COVER_BATCH) {
               if (cancelled) return;
-              const slice = ids.slice(i, i + COVER_BATCH);
+              const slice = missingIds.slice(i, i + COVER_BATCH);
               try {
                 const covers = await fetchBookCoversRemote(slice);
                 if (cancelled) return;
                 if (covers.size > 0) {
+                  // Met à jour le state ET le cache pour les prochains démarrages
                   setBooks((prev) => prev.map((b) =>
                     covers.has(b.id) ? { ...b, cover: covers.get(b.id) } : b
                   ));
+                  // Persiste en arrière-plan (non bloquant pour l'UI)
+                  setCachedCovers(covers).catch(() => {});
                 }
               } catch (e) {
-                // Si un lot échoue, on continue avec le suivant — l'app
-                // reste utilisable, juste sans certaines couvertures.
                 console.warn("Lot de couvertures non chargé:", e?.message);
               }
-              // Petite pause pour laisser le thread principal respirer
-              // (UI fluide pendant le chargement de fond).
               await new Promise((r) => setTimeout(r, 50));
             }
           })();
@@ -1175,14 +1206,28 @@ export default function App() {
             if (prev.some((b) => b.id === newBook.id)) return prev;
             return [newBook, ...prev];
           });
+          // Met en cache la couverture du nouveau livre pour les prochaines sessions
+          if (newBook.cover && newBook.id) {
+            setCachedCovers({ [newBook.id]: newBook.cover }).catch(() => {});
+          }
         } else if (eventType === "UPDATE" && payload.new) {
           const updatedBook = dbToBook(payload.new);
           setBooks((prev) => prev.map((b) =>
             b.id === updatedBook.id ? { ...b, ...updatedBook } : b
           ));
+          // Synchronise le cache : la couverture a peut-être changé
+          if (updatedBook.id) {
+            if (updatedBook.cover) {
+              setCachedCovers({ [updatedBook.id]: updatedBook.cover }).catch(() => {});
+            } else {
+              deleteCachedCover(updatedBook.id).catch(() => {});
+            }
+          }
         } else if (eventType === "DELETE" && payload.old) {
           const deletedId = payload.old.id;
           setBooks((prev) => prev.filter((b) => b.id !== deletedId));
+          // Nettoie le cache pour libérer de la place
+          deleteCachedCover(deletedId).catch(() => {});
         }
       } catch (e) { /* ignore */ }
     });
@@ -2266,6 +2311,7 @@ export default function App() {
           migrating={migrating}
           onCleanEmptyBooks={handleCleanEmptyBooks}
           emptyBooksCount={findEmptyBooks(books).length}
+          showToast={showToast}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -7290,6 +7336,7 @@ function SettingsModal({
   migrating,
   onCleanEmptyBooks,
   emptyBooksCount,
+  showToast,
   onClose,
 }) {
   const fileRef = useRef(null);
@@ -7377,6 +7424,26 @@ function SettingsModal({
                   style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
                 >
                   <LogOut className="w-4 h-4" /> Se déconnecter
+                </button>
+
+                {/* Vidage du cache local des couvertures.
+                    Le cache économise la bande passante Supabase en stockant
+                    les images dans IndexedDB côté navigateur. Si jamais elles
+                    apparaissent corrompues ou obsolètes, ce bouton force un
+                    rechargement complet depuis la base au prochain démarrage. */}
+                <button
+                  onClick={async () => {
+                    try {
+                      await clearCoverCache();
+                      showToast?.("Cache vidé — rechargez l'app pour retélécharger les couvertures");
+                    } catch (e) {
+                      showToast?.(`Erreur : ${e.message}`, "error");
+                    }
+                  }}
+                  className="w-full py-2 rounded-lg text-xs font-medium border flex items-center justify-center gap-1.5 mb-2"
+                  style={{ borderColor: "var(--gold)", color: "var(--leather-dark)" }}
+                >
+                  Vider le cache local des couvertures
                 </button>
 
                 {/* Bouton de migration des livres locaux vers la base partagée.
