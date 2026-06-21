@@ -22,6 +22,7 @@ const LIGHT_COLUMNS = [
   "format", "dimensions", "weight", "publisher", "year",
   "issue_number", "issue_date",
   "players_min", "players_max", "duration_min", "age_min", "platform",
+  "genre",
   "created_at", "updated_at",
 ].join(",");
 
@@ -272,6 +273,7 @@ function dbToBook(row) {
     durationMin: row.duration_min || 0,       // durée en minutes (jeux)
     ageMin: row.age_min || 0,                 // âge minimum (jeux)
     platform: row.platform || "",             // ex: "Nintendo Switch" pour les jeux
+    genre: row.genre || [],                   // catégories bibliothèque virtuelle (text[])
   };
 }
 
