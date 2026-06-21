@@ -1213,9 +1213,16 @@ export default function App() {
           }
         } else if (eventType === "UPDATE" && payload.new) {
           const updatedBook = dbToBook(payload.new);
-          setBooks((prev) => prev.map((b) =>
-            b.id === updatedBook.id ? { ...b, ...updatedBook } : b
-          ));
+          setBooks((prev) => prev.map((b) => {
+            if (b.id !== updatedBook.id) return b;
+            // Le payload realtime peut ne pas contenir genre (colonne absente de
+            // la publication) — dans ce cas on conserve le genre local existant.
+            const merged = { ...b, ...updatedBook };
+            if ((!updatedBook.genre || updatedBook.genre.length === 0) && b.genre && b.genre.length > 0) {
+              merged.genre = b.genre;
+            }
+            return merged;
+          }));
           // Synchronise le cache : la couverture a peut-être changé
           if (updatedBook.id) {
             if (updatedBook.cover) {
@@ -6224,6 +6231,7 @@ function EditView({ books, book, structure, navigationIds, allBooks, onCancel, o
       </div>
 
       <BookForm
+        key={book.id}
         ref={formRef}
         books={books}
         structure={structure}
@@ -8028,11 +8036,139 @@ function BiblioBookCard({ book, onClick, index }) {
 }
 
 // ── Composant principal ───────────────────────────────────────
+// ── Vue étagère bois ─────────────────────────────────────────
+function BookOnShelf({ book, height = 110, onClick }) {
+  const genre = (book.genre || [])[0] || "À classer";
+  const { bg, text } = getGenreColor(genre);
+
+  if (book.cover) {
+    const width = Math.round(height * 0.65);
+    return (
+      <div
+        onClick={onClick}
+        title={`${book.title || ""}${book.author ? " — " + book.author : ""}`}
+        style={{
+          width: `${width}px`, minWidth: `${width}px`, height: `${height}px`,
+          borderRadius: "2px 4px 4px 2px", cursor: "pointer", overflow: "hidden",
+          boxShadow: "inset -2px 0 4px rgba(0,0,0,0.2), 2px 0 5px rgba(0,0,0,0.25)",
+          flexShrink: 0, transition: "transform 0.15s, box-shadow 0.15s",
+          position: "relative",
+        }}
+        onTouchStart={e => { e.currentTarget.style.transform = "translateY(-6px)"; e.currentTarget.style.zIndex="10"; }}
+        onTouchEnd={e => { e.currentTarget.style.transform = ""; e.currentTarget.style.zIndex=""; }}
+      >
+        <img src={book.cover} alt={book.title}
+          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+          onError={e => { e.target.style.display = "none"; }}
+        />
+      </div>
+    );
+  }
+  // Pas de couverture → dos coloré avec titre vertical
+  const shortTitle = (book.title || "?").length > 22
+    ? (book.title || "?").substring(0, 20) + "…"
+    : (book.title || "?");
+  return (
+    <div
+      onClick={onClick}
+      title={`${book.title || ""}${book.author ? " — " + book.author : ""}`}
+      style={{
+        width: "28px", minWidth: "28px", height: `${height}px`,
+        background: bg, borderRadius: "2px 4px 4px 2px",
+        cursor: "pointer", display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center", padding: "4px 2px",
+        boxShadow: "inset -2px 0 4px rgba(0,0,0,0.2), inset 2px 0 2px rgba(255,255,255,0.06), 2px 0 5px rgba(0,0,0,0.25)",
+        position: "relative", overflow: "hidden", flexShrink: 0,
+        transition: "transform 0.15s, box-shadow 0.15s",
+      }}
+      onTouchStart={e => { e.currentTarget.style.transform = "translateY(-6px)"; e.currentTarget.style.zIndex="10"; }}
+      onTouchEnd={e => { e.currentTarget.style.transform = ""; e.currentTarget.style.zIndex=""; }}
+    >
+      <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: "3px",
+        background: "rgba(255,255,255,0.1)", borderRadius: "2px 0 0 2px" }} />
+      <div style={{
+        writingMode: "vertical-rl", textOrientation: "mixed",
+        transform: "rotate(180deg)", color: text,
+        fontSize: "8px", fontFamily: "Georgia, serif", fontWeight: "600",
+        lineHeight: 1.2, textAlign: "center",
+        overflow: "hidden", maxHeight: `${height - 12}px`,
+      }}>
+        {shortTitle}
+      </div>
+    </div>
+  );
+}
+
+function WoodShelf({ books, onSelectBook }) {
+  const SHELF_H = 110;
+  return (
+    <div style={{ position: "relative", marginBottom: "14px" }}>
+      {/* Ombre du dessus */}
+      <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: "5px",
+        background: "linear-gradient(180deg, rgba(0,0,0,0.12) 0%, transparent 100%)", zIndex: 1 }} />
+      {/* Livres */}
+      <div style={{
+        display: "flex", alignItems: "flex-end", gap: "2px",
+        padding: "6px 14px 0 14px",
+        minHeight: `${SHELF_H + 6}px`,
+        overflowX: "auto", overflowY: "visible",
+        WebkitOverflowScrolling: "touch",
+        scrollbarWidth: "none",
+        msOverflowStyle: "none",
+      }}>
+        {books.map(book => (
+          <BookOnShelf key={book.id} book={book} height={SHELF_H} onClick={() => onSelectBook(book)} />
+        ))}
+        {books.length === 0 && (
+          <div style={{ color: "var(--leather-light)", fontSize: "12px", fontStyle: "italic", padding: "8px 0" }}>
+            Étagère vide
+          </div>
+        )}
+      </div>
+      {/* Planche bois */}
+      <div style={{
+        height: "13px", marginLeft: "6px", marginRight: "6px",
+        background: "linear-gradient(180deg, #9b7520 0%, #7a5510 40%, #603d08 100%)",
+        borderRadius: "0 0 2px 2px",
+        boxShadow: "0 4px 8px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.12)",
+      }} />
+    </div>
+  );
+}
+
+function ShelfView({ books, onSelectBook }) {
+  const PER_SHELF = 16;
+  const shelves = [];
+  for (let i = 0; i < books.length; i += PER_SHELF) shelves.push(books.slice(i, i + PER_SHELF));
+  return (
+    <div style={{
+      background: "linear-gradient(180deg, #ede0c4 0%, #e2d4b0 100%)",
+      minHeight: "60vh", padding: "12px 0 4px", position: "relative",
+    }}>
+      {/* Montants latéraux */}
+      <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: "7px",
+        background: "linear-gradient(90deg, #4a2e06 0%, #7a5510 100%)", zIndex: 2 }} />
+      <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: "7px",
+        background: "linear-gradient(270deg, #4a2e06 0%, #7a5510 100%)", zIndex: 2 }} />
+      {shelves.length > 0
+        ? shelves.map((shelf, i) => <WoodShelf key={i} books={shelf} onSelectBook={onSelectBook} />)
+        : <div style={{ textAlign: "center", padding: "40px 20px", color: "var(--leather-light)", fontStyle: "italic" }}>
+            Aucun ouvrage
+          </div>
+      }
+      <div style={{ textAlign: "center", padding: "4px", color: "var(--leather-light)", fontSize: "11px" }}>
+        {shelves.length} étagère{shelves.length > 1 ? "s" : ""} · {books.length} ouvrage{books.length > 1 ? "s" : ""}
+      </div>
+    </div>
+  );
+}
+
+// ── Composant principal ───────────────────────────────────────
 function BibliothequeView({ books, onSelectBook }) {
   const [selectedCat, setSelectedCat] = useState(null);
   const [selectedSub, setSelectedSub] = useState(null);
+  const [viewMode, setViewMode] = useState("list"); // "list" | "shelves"
 
-  // Livres triés par série puis titre
   const displayBooks = React.useMemo(() => {
     if (!selectedCat) return [];
     const raw = selectedSub
@@ -8041,7 +8177,7 @@ function BibliothequeView({ books, onSelectBook }) {
     return sortBySeriesThenTitle(raw);
   }, [books, selectedCat, selectedSub]);
 
-  // ── Vue : grille des catégories ──────────────────────────
+  // ── Grille des catégories ─────────────────────────────────
   if (!selectedCat) {
     const catsWithBooks = MAIN_CATEGORIES.filter(c => countForCategory(books, c) > 0);
     return (
@@ -8054,26 +8190,21 @@ function BibliothequeView({ books, onSelectBook }) {
             {books.filter(b => b.genre && b.genre.length).length} ouvrages classifiés
           </p>
         </div>
-
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px" }}>
           {catsWithBooks.map(cat => {
             const count = countForCategory(books, cat);
             const { bg, text } = getGenreColor(cat.key);
             return (
-              <button
-                key={cat.key}
+              <button key={cat.key}
                 onClick={() => { setSelectedCat(cat); setSelectedSub(null); }}
                 style={{
-                  background: bg, color: text,
-                  border: "none", borderRadius: "10px",
+                  background: bg, color: text, border: "none", borderRadius: "10px",
                   padding: "14px 8px", cursor: "pointer",
-                  display: "flex", flexDirection: "column",
-                  alignItems: "center", gap: "6px",
-                  boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
-                  minHeight: "90px", justifyContent: "center",
-                  textAlign: "center",
+                  display: "flex", flexDirection: "column", alignItems: "center", gap: "6px",
+                  boxShadow: "0 2px 8px rgba(0,0,0,0.2)", minHeight: "90px",
+                  justifyContent: "center", textAlign: "center",
                 }}
-                onTouchStart={e => e.currentTarget.style.transform = "scale(0.96)"}
+                onTouchStart={e => e.currentTarget.style.transform = "scale(0.95)"}
                 onTouchEnd={e => e.currentTarget.style.transform = ""}
               >
                 <span style={{ fontSize: "24px" }}>{cat.emoji}</span>
@@ -8091,14 +8222,14 @@ function BibliothequeView({ books, onSelectBook }) {
     );
   }
 
-  // ── Vue : liste de livres d'une catégorie ────────────────
+  // ── Vue d'une catégorie ───────────────────────────────────
   const hasSubs    = selectedCat.subs && selectedCat.subs.length > 0;
   const activeSubs = hasSubs ? selectedCat.subs.filter(s => booksForGenre(books, s).length > 0) : [];
   const { bg: headerBg, text: headerText } = getGenreColor(selectedSub || selectedCat.key);
 
   return (
     <div style={{ paddingBottom: "100px" }}>
-      {/* Header */}
+      {/* Header sticky */}
       <div style={{
         padding: "14px 16px 10px",
         background: `linear-gradient(135deg, ${headerBg} 0%, ${headerBg}dd 100%)`,
@@ -8106,43 +8237,54 @@ function BibliothequeView({ books, onSelectBook }) {
         position: "sticky", top: 0, zIndex: 10,
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-          <button
-            onClick={() => { setSelectedCat(null); setSelectedSub(null); }}
+          {/* Retour */}
+          <button onClick={() => { setSelectedCat(null); setSelectedSub(null); }}
             style={{
               background: "rgba(255,255,255,0.2)", border: "none", borderRadius: "50%",
               width: "34px", height: "34px", cursor: "pointer",
               display: "flex", alignItems: "center", justifyContent: "center",
               color: headerText, fontSize: "18px", flexShrink: 0,
-            }}
-          >
-            ←
-          </button>
+            }}>←</button>
+
           <div style={{ flex: 1 }}>
-            <h2 style={{
-              margin: 0, fontSize: "17px", fontWeight: "700",
-              fontFamily: "var(--font-display)", color: headerText,
-            }}>
+            <h2 style={{ margin: 0, fontSize: "17px", fontWeight: "700",
+              fontFamily: "var(--font-display)", color: headerText }}>
               {selectedCat.emoji} {selectedSub ? selectedSub.split("/")[1] : selectedCat.label}
             </h2>
             <p style={{ margin: "2px 0 0", fontSize: "12px", color: headerText, opacity: 0.75 }}>
               {displayBooks.length} ouvrage{displayBooks.length > 1 ? "s" : ""}
             </p>
           </div>
+
+          {/* Toggle vue liste / étagères */}
+          <div style={{ display: "flex", borderRadius: "20px", overflow: "hidden",
+            background: "rgba(0,0,0,0.2)", padding: "2px", gap: "2px" }}>
+            <button onClick={() => setViewMode("list")} style={{
+              background: viewMode === "list" ? "rgba(255,255,255,0.9)" : "transparent",
+              color: viewMode === "list" ? headerBg : headerText,
+              border: "none", borderRadius: "16px", padding: "5px 10px",
+              cursor: "pointer", fontSize: "15px", lineHeight: 1,
+            }}>☰</button>
+            <button onClick={() => setViewMode("shelves")} style={{
+              background: viewMode === "shelves" ? "rgba(255,255,255,0.9)" : "transparent",
+              color: viewMode === "shelves" ? headerBg : headerText,
+              border: "none", borderRadius: "16px", padding: "5px 10px",
+              cursor: "pointer", fontSize: "15px", lineHeight: 1,
+            }}>📚</button>
+          </div>
         </div>
 
         {/* Chips sous-catégories */}
         {activeSubs.length > 0 && (
-          <div style={{ display: "flex", gap: "6px", marginTop: "10px", overflowX: "auto", paddingBottom: "2px" }}>
-            <button
-              onClick={() => setSelectedSub(null)}
-              style={{
-                background: !selectedSub ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.2)",
-                color: !selectedSub ? headerBg : headerText,
-                border: "none", borderRadius: "20px", padding: "5px 12px",
-                fontSize: "11px", fontWeight: "600", cursor: "pointer",
-                whiteSpace: "nowrap", flexShrink: 0,
-              }}
-            >
+          <div style={{ display: "flex", gap: "6px", marginTop: "10px",
+            overflowX: "auto", paddingBottom: "2px" }}>
+            <button onClick={() => setSelectedSub(null)} style={{
+              background: !selectedSub ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.2)",
+              color: !selectedSub ? headerBg : headerText,
+              border: "none", borderRadius: "20px", padding: "5px 12px",
+              fontSize: "11px", fontWeight: "600", cursor: "pointer",
+              whiteSpace: "nowrap", flexShrink: 0,
+            }}>
               Tous ({booksForCategory(books, selectedCat).length})
             </button>
             {activeSubs.map(sub => {
@@ -8150,17 +8292,13 @@ function BibliothequeView({ books, onSelectBook }) {
               const subCount = booksForGenre(books, sub).length;
               const isActive = selectedSub === sub;
               return (
-                <button
-                  key={sub}
-                  onClick={() => setSelectedSub(sub)}
-                  style={{
-                    background: isActive ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.2)",
-                    color: isActive ? getGenreColor(sub).bg : headerText,
-                    border: "none", borderRadius: "20px", padding: "5px 12px",
-                    fontSize: "11px", fontWeight: "600", cursor: "pointer",
-                    whiteSpace: "nowrap", flexShrink: 0,
-                  }}
-                >
+                <button key={sub} onClick={() => setSelectedSub(sub)} style={{
+                  background: isActive ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.2)",
+                  color: isActive ? getGenreColor(sub).bg : headerText,
+                  border: "none", borderRadius: "20px", padding: "5px 12px",
+                  fontSize: "11px", fontWeight: "600", cursor: "pointer",
+                  whiteSpace: "nowrap", flexShrink: 0,
+                }}>
                   {subLabel} ({subCount})
                 </button>
               );
@@ -8169,21 +8307,21 @@ function BibliothequeView({ books, onSelectBook }) {
         )}
       </div>
 
-      {/* Liste de livres */}
-      <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "8px" }}>
-        {displayBooks.length > 0 ? displayBooks.map((book, i) => (
-          <BiblioBookCard
-            key={book.id}
-            book={book}
-            index={i}
-            onClick={() => onSelectBook(book)}
-          />
-        )) : (
-          <div style={{ textAlign: "center", padding: "60px 20px", color: "var(--leather-light)", fontStyle: "italic" }}>
-            Aucun ouvrage dans cette catégorie
-          </div>
-        )}
-      </div>
+      {/* Contenu selon le mode */}
+      {viewMode === "shelves" ? (
+        <ShelfView books={displayBooks} onSelectBook={onSelectBook} />
+      ) : (
+        <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "8px" }}>
+          {displayBooks.length > 0 ? displayBooks.map((book, i) => (
+            <BiblioBookCard key={book.id} book={book} index={i} onClick={() => onSelectBook(book)} />
+          )) : (
+            <div style={{ textAlign: "center", padding: "60px 20px",
+              color: "var(--leather-light)", fontStyle: "italic" }}>
+              Aucun ouvrage dans cette catégorie
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
