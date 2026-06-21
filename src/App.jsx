@@ -922,6 +922,7 @@ export default function App() {
   const [structure, setStructure] = useState(INITIAL_STRUCTURE);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("home"); // home, search, add, library, detail, edit, bibliotheque
+  const [previousView, setPreviousView] = useState("home"); // pour le retour arrière contextuel
   const [searchQuery, setSearchQuery] = useState("");
   const [filterBib, setFilterBib] = useState("all");
   const [filterType, setFilterType] = useState("all");
@@ -2190,6 +2191,7 @@ export default function App() {
               // base de navigation Préc./Suiv. — l'ordre reflète exactement
               // ce que l'utilisateur voyait à l'écran.
               setSelectedBook(b);
+              setPreviousView("home");
               setNavigationIds(filteredBooks.map((x) => x.id));
               setView("detail");
             }}
@@ -2209,6 +2211,7 @@ export default function App() {
               // Depuis le plan, on navigue parmi les livres de la même étagère,
               // dans l'ordre de leur position physique.
               setSelectedBook(b);
+              setPreviousView("library");
               const sameShelf = books
                 .filter((x) =>
                   x.bibliotheque === b.bibliotheque &&
@@ -2247,6 +2250,7 @@ export default function App() {
             books={books}
             onSelectBook={(b) => {
               setSelectedBook(b);
+              setPreviousView("bibliotheque");
               setNavigationIds(books.filter(x => (x.genre || []).some(g => (b.genre || []).some(bg => g === bg))).map(x => x.id));
               setView("detail");
             }}
@@ -2276,7 +2280,7 @@ export default function App() {
             structure={structure}
             navigationIds={navigationIds}
             allBooks={books}
-            onBack={() => setView("home")}
+            onBack={() => setView(previousView || "home")}
             onEdit={() => setView("edit")}
             onDelete={() => deleteBook(selectedBook.id)}
             onSelectBook={setSelectedBook}
@@ -3430,6 +3434,7 @@ const BookForm = forwardRef(function BookForm(
   const [language, setLanguage] = useState(initial.language || "");
   const [description, setDescription] = useState(initial.description || "");
   const [categories, setCategories] = useState(initial.categories || "");
+  const [genre, setGenre] = useState(initial.genre || []);
   const [rating, setRating] = useState(initial.rating || 0);
   const [ratingsCount, setRatingsCount] = useState(initial.ratingsCount || 0);
   const [infoLink, setInfoLink] = useState(initial.infoLink || "");
@@ -3521,6 +3526,7 @@ const BookForm = forwardRef(function BookForm(
       durationMin: parseInt(durationMin) || 0,
       ageMin: parseInt(ageMin) || 0,
       platform: platform.trim(),
+      genre: genre,
     });
   };
 
@@ -4043,6 +4049,50 @@ const BookForm = forwardRef(function BookForm(
             </Field>
           )}
 
+          {/* Genres bibliothèque virtuelle */}
+          <Field label="📚 Bibliothèque virtuelle">
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "6px" }}>
+              {genre.length > 0 ? genre.map((g, i) => {
+                const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
+                const label = g.includes("/") ? g.split("/")[1] : g;
+                return (
+                  <span key={i} style={{
+                    display: "inline-flex", alignItems: "center", gap: "4px",
+                    padding: "3px 8px", borderRadius: "12px", fontSize: "11px",
+                    fontWeight: "600", background: colors.bg, color: colors.text,
+                  }}>
+                    {label}
+                    <button
+                      onClick={() => setGenre(genre.filter((_, j) => j !== i))}
+                      style={{ background: "none", border: "none", cursor: "pointer",
+                        color: colors.text, fontSize: "13px", padding: "0", lineHeight: 1 }}
+                    >×</button>
+                  </span>
+                );
+              }) : (
+                <span style={{ fontSize: "12px", color: "var(--ink-soft)", fontStyle: "italic" }}>Aucune catégorie</span>
+              )}
+            </div>
+            <select
+              value=""
+              onChange={e => {
+                const val = e.target.value;
+                if (val && !genre.includes(val)) setGenre([...genre, val]);
+                e.target.value = "";
+              }}
+              style={{
+                width: "100%", padding: "10px", borderRadius: "8px",
+                border: "2px solid var(--parchment)", background: "white",
+                color: "var(--ink)", fontSize: "13px",
+              }}
+            >
+              <option value="">+ Ajouter une catégorie…</option>
+              {Object.keys(GENRE_COLORS).filter(g => !genre.includes(g) && g !== "À classer").map(g => (
+                <option key={g} value={g}>{g}</option>
+              ))}
+            </select>
+          </Field>
+
           {/* Résumé */}
           {fields.showDescription && (
             <Field label={type === "revue" ? "Dossier / Sujet du n°" : type === "jeu-societe" || type === "jeu-switch" ? "Description" : "Résumé"}>
@@ -4250,6 +4300,23 @@ function DetailView({ book, structure, navigationIds, allBooks, onBack, onEdit, 
                 {c.trim()}
               </span>
             ))}
+          </div>
+        )}
+        {/* Genres bibliothèque virtuelle */}
+        {book.genre && book.genre.length > 0 && (
+          <div className="mt-2 flex flex-wrap justify-center gap-1.5">
+            {book.genre.map((g, i) => {
+              const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
+              const label = g.includes("/") ? g.split("/")[1] : g;
+              return (
+                <span key={i} style={{
+                  padding: "2px 10px", borderRadius: "12px", fontSize: "11px",
+                  fontWeight: "600", background: colors.bg, color: colors.text,
+                }}>
+                  {label}
+                </span>
+              );
+            })}
           </div>
         )}
       </div>
@@ -7722,59 +7789,60 @@ function SettingsModal({
   );
 }
 
+
 // ═══════════════════════════════════════════════════════════════
 // MA BIBLIOTHÈQUE VIRTUELLE
-// Navigation : grille de catégories → rayonnage visuel
+// Navigation : grille de catégories → rayonnage visuel (BookCard)
 // ═══════════════════════════════════════════════════════════════
 
-// Palette de couleurs par catégorie (dos de livre)
+// Palette de couleurs par catégorie
 const GENRE_COLORS = {
-  "Arts & Culture":                          { bg: "#7c5c8a", text: "#f0e6f6" },
-  "Littérature classique":                   { bg: "#4a230a", text: "#f4ecd8" },
-  "Littérature classique/Romans classiques": { bg: "#5a2d0c", text: "#f4ecd8" },
-  "Littérature classique/Théâtre & Poésie":  { bg: "#6b3410", text: "#f4ecd8" },
-  "Romans adultes":                          { bg: "#8b4a1a", text: "#f4ecd8" },
-  "Romans adultes/Contemporain français":    { bg: "#9b5a1a", text: "#fdf6e8" },
-  "Romans adultes/Étranger":                 { bg: "#7a3d10", text: "#fdf6e8" },
-  "Romans adultes/Policier & Thriller":      { bg: "#2c2c3a", text: "#e8e8f0" },
-  "BD/BD adulte":                            { bg: "#d4870a", text: "#1a0a00" },
-  "BD/BD enfant":                            { bg: "#e8a020", text: "#1a0a00" },
-  "Albums petite enfance/0 – 3 ans":         { bg: "#e8c0d0", text: "#3a1020" },
-  "Albums petite enfance/3 – 6 ans":         { bg: "#d4a8c0", text: "#2a0818" },
-  "Romans jeunesse/6 – 10 ans":             { bg: "#2a7a3a", text: "#e8f8ec" },
-  "Romans jeunesse/10 – 14 ans":            { bg: "#1e5c2c", text: "#e8f8ec" },
-  "Lecture scolaire CP–CM2/Méthode de lecture": { bg: "#1a6080", text: "#e0f4ff" },
-  "Lecture scolaire CP–CM2/Romans faciles":     { bg: "#1e7890", text: "#e0f4ff" },
-  "Lecture scolaire CP–CM2/Maternelle & activités": { bg: "#2890a8", text: "#e0f4ff" },
-  "Scolaire collège & lycée/Manuels & cahiers":     { bg: "#1c3a6e", text: "#dce8ff" },
-  "Scolaire collège & lycée/Révisions & examens":   { bg: "#142e58", text: "#dce8ff" },
-  "Musique":                                 { bg: "#5c2d6e", text: "#f0e0ff" },
-  "Langues étrangères":                      { bg: "#2d5c6e", text: "#e0f4ff" },
-  "Langues étrangères/Anglais · Espagnol · Allemand…": { bg: "#1e4a5c", text: "#e0f4ff" },
-  "Langues étrangères/Russe · Hébreu · Japonais…":     { bg: "#2a3d5c", text: "#e0f4ff" },
-  "Cuisine & Nutrition/Recettes":            { bg: "#8b2020", text: "#ffe8e8" },
-  "Cuisine & Nutrition/Minceur & nutrition": { bg: "#6e4a20", text: "#fff0e0" },
-  "Sciences & Nature/Animaux & nature":      { bg: "#2a5a2a", text: "#e8ffe8" },
-  "Sciences & Nature/Corps humain & biologie": { bg: "#1e4a3a", text: "#e0fff4" },
-  "Sciences & Nature/Espace & univers":      { bg: "#1a1a3a", text: "#e0e8ff" },
-  "Histoire & Civilisations":                { bg: "#5a4a20", text: "#fff8e0" },
-  "Judaïsme & Shoah":                        { bg: "#1a1a2a", text: "#e8e8ff" },
-  "Religion & Spiritualité":                 { bg: "#4a3a6e", text: "#f0ecff" },
-  "Développement perso/Autisme · DYS · TDA": { bg: "#2a5a6e", text: "#e0f4ff" },
-  "Développement perso/Psychologie & mémoire": { bg: "#3a4a6e", text: "#e0e8ff" },
-  "Droit & Société":                         { bg: "#2a2a4a", text: "#e8e8ff" },
-  "Loisirs créatifs":                        { bg: "#c04a6e", text: "#fff0f4" },
-  "Revues & magazines":                      { bg: "#888888", text: "#f8f8f8" },
-  "Jeux de société":                         { bg: "#d4670a", text: "#fff4e0" },
-  "Jeux vidéo (Switch)":                     { bg: "#cc0000", text: "#ffffff" },
-  "À classer":                               { bg: "#aaaaaa", text: "#222222" },
+  "Arts & Culture":                          { bg: "#7c5c8a", text: "#f0e6f6", light: "#f0e6f6" },
+  "Littérature classique":                   { bg: "#4a230a", text: "#f4ecd8", light: "#f9f0e6" },
+  "Littérature classique/Romans classiques": { bg: "#5a2d0c", text: "#f4ecd8", light: "#f9f0e6" },
+  "Littérature classique/Théâtre & Poésie":  { bg: "#6b3410", text: "#f4ecd8", light: "#f9f0e6" },
+  "Romans adultes":                          { bg: "#8b4a1a", text: "#f4ecd8", light: "#fdf0e6" },
+  "Romans adultes/Contemporain français":    { bg: "#9b5a1a", text: "#fdf6e8", light: "#fdf0e6" },
+  "Romans adultes/Étranger":                 { bg: "#7a3d10", text: "#fdf6e8", light: "#fdf0e6" },
+  "Romans adultes/Policier & Thriller":      { bg: "#2c2c3a", text: "#e8e8f0", light: "#f0f0f8" },
+  "BD/BD adulte":                            { bg: "#d4870a", text: "#1a0a00", light: "#fff8e0" },
+  "BD/BD enfant":                            { bg: "#e8a020", text: "#1a0a00", light: "#fffae0" },
+  "Albums petite enfance/0 – 3 ans":         { bg: "#e8c0d0", text: "#3a1020", light: "#fff0f6" },
+  "Albums petite enfance/3 – 6 ans":         { bg: "#d4a8c0", text: "#2a0818", light: "#fff0f6" },
+  "Romans jeunesse/6 – 10 ans":             { bg: "#2a7a3a", text: "#e8f8ec", light: "#edfff1" },
+  "Romans jeunesse/10 – 14 ans":            { bg: "#1e5c2c", text: "#e8f8ec", light: "#edfff1" },
+  "Lecture scolaire CP–CM2/Méthode de lecture": { bg: "#1a6080", text: "#e0f4ff", light: "#e8f8ff" },
+  "Lecture scolaire CP–CM2/Romans faciles":     { bg: "#1e7890", text: "#e0f4ff", light: "#e8f8ff" },
+  "Lecture scolaire CP–CM2/Maternelle & activités": { bg: "#2890a8", text: "#e0f4ff", light: "#e8f8ff" },
+  "Scolaire collège & lycée/Manuels & cahiers":     { bg: "#1c3a6e", text: "#dce8ff", light: "#eaf0ff" },
+  "Scolaire collège & lycée/Révisions & examens":   { bg: "#142e58", text: "#dce8ff", light: "#eaf0ff" },
+  "Musique":                                 { bg: "#5c2d6e", text: "#f0e0ff", light: "#f8f0ff" },
+  "Langues étrangères":                      { bg: "#2d5c6e", text: "#e0f4ff", light: "#e8f8ff" },
+  "Langues étrangères/Anglais · Espagnol · Allemand…": { bg: "#1e4a5c", text: "#e0f4ff", light: "#e8f8ff" },
+  "Langues étrangères/Russe · Hébreu · Japonais…":     { bg: "#2a3d5c", text: "#e0f4ff", light: "#e8f8ff" },
+  "Cuisine & Nutrition/Recettes":            { bg: "#8b2020", text: "#ffe8e8", light: "#fff0f0" },
+  "Cuisine & Nutrition/Minceur & nutrition": { bg: "#6e4a20", text: "#fff0e0", light: "#fff8f0" },
+  "Sciences & Nature/Animaux & nature":      { bg: "#2a5a2a", text: "#e8ffe8", light: "#f0fff0" },
+  "Sciences & Nature/Corps humain & biologie": { bg: "#1e4a3a", text: "#e0fff4", light: "#edfff8" },
+  "Sciences & Nature/Espace & univers":      { bg: "#1a1a3a", text: "#e0e8ff", light: "#edf0ff" },
+  "Histoire & Civilisations":                { bg: "#5a4a20", text: "#fff8e0", light: "#fffcf0" },
+  "Judaïsme & Shoah":                        { bg: "#1a1a2a", text: "#e8e8ff", light: "#f0f0ff" },
+  "Religion & Spiritualité":                 { bg: "#4a3a6e", text: "#f0ecff", light: "#f8f4ff" },
+  "Développement perso/Autisme · DYS · TDA": { bg: "#2a5a6e", text: "#e0f4ff", light: "#e8f8ff" },
+  "Développement perso/Psychologie & mémoire": { bg: "#3a4a6e", text: "#e0e8ff", light: "#edf0ff" },
+  "Droit & Société":                         { bg: "#2a2a4a", text: "#e8e8ff", light: "#f0f0ff" },
+  "Loisirs créatifs":                        { bg: "#c04a6e", text: "#fff0f4", light: "#fff4f8" },
+  "Revues & magazines":                      { bg: "#666666", text: "#f8f8f8", light: "#f4f4f4" },
+  "Jeux de société":                         { bg: "#d4670a", text: "#fff4e0", light: "#fff8f0" },
+  "Jeux vidéo (Switch)":                     { bg: "#cc0000", text: "#ffffff", light: "#fff0f0" },
+  "À classer":                               { bg: "#aaaaaa", text: "#222222", light: "#f4f4f4" },
 };
 
 function getGenreColor(genre) {
-  return GENRE_COLORS[genre] || { bg: "#6b3410", text: "#f4ecd8" };
+  return GENRE_COLORS[genre] || { bg: "#6b3410", text: "#f4ecd8", light: "#fdf0e6" };
 }
 
-// Catégories principales (pour la grille)
+// Catégories principales
 const MAIN_CATEGORIES = [
   { key: "Littérature classique", label: "Littérature classique", emoji: "📜", subs: ["Littérature classique/Romans classiques", "Littérature classique/Théâtre & Poésie"] },
   { key: "Romans adultes",        label: "Romans adultes",        emoji: "📖", subs: ["Romans adultes/Contemporain français", "Romans adultes/Étranger", "Romans adultes/Policier & Thriller"] },
@@ -7800,192 +7868,63 @@ const MAIN_CATEGORIES = [
   { key: "À classer",             label: "À classer",             emoji: "📦", subs: [] },
 ];
 
-// Dos de livre SVG (style livre vu de dos sans couverture)
-function BookSpine({ book, width = 32, height = 120, onClick }) {
-  const genre = book.genre?.[0] || "À classer";
-  const { bg, text } = getGenreColor(genre);
-  const title = book.title || "?";
-  const author = book.author || "";
+// ── Détection de série ────────────────────────────────────────
+// Extrait le préfixe de série d'un titre pour regrouper et trier
+// ex: "Juliette fait du vélo" → "juliette"
+//     "Ratus et ses amis" → "ratus"
+//     "Le Club des cinq - tome 3" → "le club des cinq"
+const KNOWN_SERIES = [
+  "ratus","juliette","t'choupi","tchoupi","petit ours brun","jojo lapin",
+  "martine","charlotte aux fraises","dora","tom-tom et nana","tom tom et nana",
+  "oksa pollock","les petits vétérinaires","princesse academy","la cabane magique",
+  "le club des cinq","astérix","lucky luke","les schtroumpfs","tintin",
+  "boule et bill","gaston","iznogoud","spirou","les colombes du roi-soleil",
+  "quatre soeurs","ribambelle","balthazar","super-mamie","ralette",
+  "les aventures de loupio","j'aime lire","astrapi","les belles histoires",
+  "popi","okapi","les petites filles modèles",
+];
 
-  // Texte tronqué pour le dos
-  const shortTitle = title.length > 28 ? title.substring(0, 26) + "…" : title;
-  const shortAuthor = author.length > 20 ? author.substring(0, 18) + "…" : author;
-
-  return (
-    <div
-      onClick={onClick}
-      title={`${title}${author ? " — " + author : ""}`}
-      style={{
-        width: `${width}px`,
-        minWidth: `${width}px`,
-        height: `${height}px`,
-        background: bg,
-        borderRadius: "2px 4px 4px 2px",
-        cursor: "pointer",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: "4px 2px",
-        boxShadow: "inset -2px 0 4px rgba(0,0,0,0.2), inset 2px 0 2px rgba(255,255,255,0.05), 2px 0 6px rgba(0,0,0,0.3)",
-        position: "relative",
-        overflow: "hidden",
-        transition: "transform 0.15s, box-shadow 0.15s",
-        flexShrink: 0,
-      }}
-      onMouseEnter={e => {
-        e.currentTarget.style.transform = "translateY(-4px) scaleX(1.05)";
-        e.currentTarget.style.boxShadow = "inset -2px 0 4px rgba(0,0,0,0.2), 4px 0 12px rgba(0,0,0,0.4)";
-        e.currentTarget.style.zIndex = "10";
-      }}
-      onMouseLeave={e => {
-        e.currentTarget.style.transform = "";
-        e.currentTarget.style.boxShadow = "inset -2px 0 4px rgba(0,0,0,0.2), inset 2px 0 2px rgba(255,255,255,0.05), 2px 0 6px rgba(0,0,0,0.3)";
-        e.currentTarget.style.zIndex = "";
-      }}
-    >
-      {/* Tranche gauche légèrement plus claire */}
-      <div style={{
-        position: "absolute", left: 0, top: 0, bottom: 0, width: "3px",
-        background: "rgba(255,255,255,0.12)",
-        borderRadius: "2px 0 0 2px",
-      }} />
-      {/* Texte vertical */}
-      <div style={{
-        writingMode: "vertical-rl",
-        textOrientation: "mixed",
-        transform: "rotate(180deg)",
-        color: text,
-        fontSize: "9px",
-        fontFamily: "Georgia, serif",
-        fontWeight: "600",
-        lineHeight: "1.2",
-        textAlign: "center",
-        overflow: "hidden",
-        maxHeight: `${height - 16}px`,
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: "4px",
-      }}>
-        <span style={{ fontSize: "9px", opacity: 0.9 }}>{shortTitle}</span>
-        {shortAuthor && (
-          <span style={{ fontSize: "7.5px", opacity: 0.65 }}>{shortAuthor}</span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// Livre avec couverture (si disponible)
-function BookCover({ book, height = 120, onClick }) {
-  const genre = book.genre?.[0] || "À classer";
-  const { bg, text } = getGenreColor(genre);
-
-  if (book.cover) {
-    const width = Math.round(height * 0.67);
-    return (
-      <div
-        onClick={onClick}
-        title={`${book.title || ""}${book.author ? " — " + book.author : ""}`}
-        style={{
-          width: `${width}px`,
-          minWidth: `${width}px`,
-          height: `${height}px`,
-          borderRadius: "2px 4px 4px 2px",
-          cursor: "pointer",
-          overflow: "hidden",
-          boxShadow: "inset -2px 0 4px rgba(0,0,0,0.2), 2px 0 6px rgba(0,0,0,0.3)",
-          flexShrink: 0,
-          transition: "transform 0.15s, box-shadow 0.15s",
-        }}
-        onMouseEnter={e => {
-          e.currentTarget.style.transform = "translateY(-4px)";
-          e.currentTarget.style.boxShadow = "inset -2px 0 4px rgba(0,0,0,0.2), 4px 0 12px rgba(0,0,0,0.4)";
-          e.currentTarget.style.zIndex = "10";
-        }}
-        onMouseLeave={e => {
-          e.currentTarget.style.transform = "";
-          e.currentTarget.style.boxShadow = "inset -2px 0 4px rgba(0,0,0,0.2), 2px 0 6px rgba(0,0,0,0.3)";
-          e.currentTarget.style.zIndex = "";
-        }}
-      >
-        <img
-          src={book.cover}
-          alt={book.title}
-          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
-          onError={e => { e.target.style.display = "none"; }}
-        />
-      </div>
-    );
+function getSerieKey(title) {
+  if (!title) return "";
+  const t = title.toLowerCase();
+  for (const s of KNOWN_SERIES) {
+    if (t.startsWith(s) || t.includes(s)) return s;
   }
-  // Pas de couverture → dos coloré
-  return <BookSpine book={book} width={28} height={height} onClick={onClick} />;
+  // Heuristique : si le titre contient un numéro (tome, n°, #, chiffre final)
+  // on garde les mots avant le numéro comme clé de série
+  const m = t.match(/^(.+?)\s+(?:tome|vol\.?|n°|#|\d)\s*\d/);
+  if (m) return m[1].trim();
+  return "";
 }
 
-// Une étagère avec ses livres
-function Shelf({ books, onSelectBook, showCovers }) {
-  const SHELF_HEIGHT = 110;
-
-  return (
-    <div style={{ position: "relative", marginBottom: "16px" }}>
-      {/* Planche du haut (ombre) */}
-      <div style={{
-        position: "absolute", top: 0, left: 0, right: 0, height: "6px",
-        background: "linear-gradient(180deg, rgba(0,0,0,0.15) 0%, transparent 100%)",
-        zIndex: 1,
-      }} />
-      {/* Zone des livres */}
-      <div style={{
-        display: "flex",
-        alignItems: "flex-end",
-        gap: "2px",
-        padding: "6px 12px 0 12px",
-        minHeight: `${SHELF_HEIGHT + 8}px`,
-        overflowX: "auto",
-        overflowY: "visible",
-        WebkitOverflowScrolling: "touch",
-        scrollbarWidth: "none",
-      }}>
-        {books.map(book => (
-          showCovers
-            ? <BookCover key={book.id} book={book} height={SHELF_HEIGHT} onClick={() => onSelectBook(book)} />
-            : <BookSpine key={book.id} book={book} width={28} height={SHELF_HEIGHT} onClick={() => onSelectBook(book)} />
-        ))}
-        {books.length === 0 && (
-          <div style={{ color: "var(--leather-light)", fontSize: "12px", fontStyle: "italic", padding: "8px 0" }}>
-            Aucun livre ici
-          </div>
-        )}
-      </div>
-      {/* Planche */}
-      <div style={{
-        height: "12px",
-        background: "linear-gradient(180deg, #8b6914 0%, #6b4a0a 40%, #5a3a08 100%)",
-        borderRadius: "0 0 2px 2px",
-        boxShadow: "0 4px 8px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.15)",
-        marginLeft: "4px",
-        marginRight: "4px",
-      }} />
-    </div>
-  );
+function sortBySeriesThenTitle(books) {
+  return [...books].sort((a, b) => {
+    const sa = getSerieKey(a.title);
+    const sb = getSerieKey(b.title);
+    // Si même série → tri par titre complet
+    if (sa && sb && sa === sb) return (a.title || "").localeCompare(b.title || "", "fr");
+    // Si l'un a une série et pas l'autre → série d'abord
+    if (sa && !sb) return -1;
+    if (!sa && sb) return 1;
+    // Deux séries différentes → tri alphabétique de la série
+    if (sa && sb) return sa.localeCompare(sb, "fr");
+    // Aucune série → tri alphabétique par titre
+    return (a.title || "").localeCompare(b.title || "", "fr");
+  });
 }
 
-// Compte les livres d'une catégorie principale
+// ── Helpers ───────────────────────────────────────────────────
 function countForCategory(books, cat) {
   return books.filter(b => {
     const genres = b.genre || [];
-    // Vérifie si un genre commence par la clé de catégorie
     return genres.some(g => g === cat.key || g.startsWith(cat.key + "/"));
   }).length;
 }
 
-// Filtre les livres pour une (sous-)catégorie donnée
 function booksForGenre(books, genre) {
   return books.filter(b => (b.genre || []).includes(genre));
 }
 
-// Tous les livres d'une catégorie principale (union de ses sous-genres)
 function booksForCategory(books, cat) {
   const seen = new Set();
   const result = [];
@@ -7998,36 +7937,115 @@ function booksForCategory(books, cat) {
   return result;
 }
 
-// Découpe un tableau en étagères de N livres
-function intoShelves(books, perShelf = 18) {
-  const shelves = [];
-  for (let i = 0; i < books.length; i += perShelf) {
-    shelves.push(books.slice(i, i + perShelf));
-  }
-  return shelves;
+// ── Carte livre style BookCard (même look que la vue Tous) ────
+function BiblioBookCard({ book, onClick, index }) {
+  const ITEM_TYPES_LOCAL = {
+    "livre":      { emoji: "📚", color: "#6b3410" },
+    "revue":      { emoji: "📰", color: "#2a5a6e" },
+    "jeu-societe":{ emoji: "🎲", color: "#d4670a" },
+    "jeu-switch": { emoji: "🎮", color: "#cc0000" },
+  };
+  const itemType = ITEM_TYPES_LOCAL[book.type || "livre"];
+  const genre    = (book.genre || [])[0] || "À classer";
+  const { bg, light } = getGenreColor(genre);
+  const mainInfo = book.type === "revue" ? (book.publisher || "")
+    : book.type === "jeu-switch" ? (book.platform || "")
+    : (book.author || "");
+
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        width: "100%", textAlign: "left", padding: "10px 12px",
+        borderRadius: "12px", display: "flex", gap: "10px",
+        background: "white", border: "1px solid var(--parchment)",
+        boxShadow: "0 1px 4px rgba(74,35,10,0.08)",
+        cursor: "pointer", position: "relative",
+        animationDelay: `${Math.min(index * 30, 300)}ms`,
+      }}
+    >
+      {/* Badge type */}
+      <div style={{
+        position: "absolute", top: "6px", right: "6px",
+        width: "22px", height: "22px", borderRadius: "50%",
+        background: itemType?.color || "#6b3410",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: "11px",
+      }}>
+        {itemType?.emoji}
+      </div>
+
+      {/* Couverture */}
+      <div style={{
+        width: "52px", minWidth: "52px", height: "72px",
+        borderRadius: "4px", overflow: "hidden",
+        background: light || "var(--parchment)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        flexShrink: 0,
+        boxShadow: "inset -1px 0 3px rgba(0,0,0,0.1)",
+      }}>
+        {book.cover
+          ? <img src={book.cover} alt={book.title} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+          : <span style={{ fontSize: "22px" }}>{itemType?.emoji || "📚"}</span>
+        }
+      </div>
+
+      {/* Texte */}
+      <div style={{ flex: 1, minWidth: 0, paddingRight: "22px" }}>
+        <div style={{
+          fontFamily: "var(--font-display)", color: "var(--ink)",
+          fontSize: "14px", fontWeight: "600", lineHeight: "1.3",
+          marginBottom: "3px",
+          display: "-webkit-box", WebkitLineClamp: 2,
+          WebkitBoxOrient: "vertical", overflow: "hidden",
+        }}>
+          {book.title || "Sans titre"}
+        </div>
+        {mainInfo && (
+          <div style={{ fontSize: "12px", color: "var(--ink-soft)", marginBottom: "3px",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {mainInfo}
+          </div>
+        )}
+        {/* Badges genre */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "3px", marginTop: "4px" }}>
+          {(book.genre || []).slice(0, 2).map((g, i) => {
+            const label = g.includes("/") ? g.split("/")[1] : g;
+            const { bg: gbg, text: gtxt } = getGenreColor(g);
+            return (
+              <span key={i} style={{
+                fontSize: "10px", padding: "1px 6px", borderRadius: "10px",
+                background: gbg, color: gtxt, fontWeight: "500",
+              }}>
+                {label}
+              </span>
+            );
+          })}
+        </div>
+      </div>
+    </button>
+  );
 }
 
-// ── Composant principal ──────────────────────────────────────
+// ── Composant principal ───────────────────────────────────────
 function BibliothequeView({ books, onSelectBook }) {
-  const [selectedCat, setSelectedCat] = useState(null);   // catégorie principale
-  const [selectedSub, setSelectedSub] = useState(null);   // sous-catégorie (null = toutes)
-  const [showCovers, setShowCovers]   = useState(true);
+  const [selectedCat, setSelectedCat] = useState(null);
+  const [selectedSub, setSelectedSub] = useState(null);
 
-  // Livres selon la sélection
+  // Livres triés par série puis titre
   const displayBooks = React.useMemo(() => {
     if (!selectedCat) return [];
-    if (selectedSub) return booksForGenre(books, selectedSub);
-    return booksForCategory(books, selectedCat);
+    const raw = selectedSub
+      ? booksForGenre(books, selectedSub)
+      : booksForCategory(books, selectedCat);
+    return sortBySeriesThenTitle(raw);
   }, [books, selectedCat, selectedSub]);
-
-  const shelves = intoShelves(displayBooks, 16);
 
   // ── Vue : grille des catégories ──────────────────────────
   if (!selectedCat) {
     const catsWithBooks = MAIN_CATEGORIES.filter(c => countForCategory(books, c) > 0);
     return (
       <div style={{ padding: "16px", paddingBottom: "100px" }}>
-        {/* Titre */}
         <div style={{ textAlign: "center", marginBottom: "20px" }}>
           <h2 style={{ fontFamily: "var(--font-display)", color: "var(--leather-dark)", fontSize: "20px", fontWeight: "600", margin: 0 }}>
             Ma Bibliothèque
@@ -8037,7 +8055,6 @@ function BibliothequeView({ books, onSelectBook }) {
           </p>
         </div>
 
-        {/* Grille */}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px" }}>
           {catsWithBooks.map(cat => {
             const count = countForCategory(books, cat);
@@ -8047,20 +8064,13 @@ function BibliothequeView({ books, onSelectBook }) {
                 key={cat.key}
                 onClick={() => { setSelectedCat(cat); setSelectedSub(null); }}
                 style={{
-                  background: bg,
-                  color: text,
-                  border: "none",
-                  borderRadius: "10px",
-                  padding: "14px 8px",
-                  cursor: "pointer",
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  gap: "6px",
+                  background: bg, color: text,
+                  border: "none", borderRadius: "10px",
+                  padding: "14px 8px", cursor: "pointer",
+                  display: "flex", flexDirection: "column",
+                  alignItems: "center", gap: "6px",
                   boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
-                  transition: "transform 0.15s, box-shadow 0.15s",
-                  minHeight: "90px",
-                  justifyContent: "center",
+                  minHeight: "90px", justifyContent: "center",
                   textAlign: "center",
                 }}
                 onTouchStart={e => e.currentTarget.style.transform = "scale(0.96)"}
@@ -8081,29 +8091,28 @@ function BibliothequeView({ books, onSelectBook }) {
     );
   }
 
-  // ── Vue : rayonnage d'une catégorie ─────────────────────
-  const hasSubs = selectedCat.subs && selectedCat.subs.length > 0;
-  const activeSubs = hasSubs
-    ? selectedCat.subs.filter(s => booksForGenre(books, s).length > 0)
-    : [];
+  // ── Vue : liste de livres d'une catégorie ────────────────
+  const hasSubs    = selectedCat.subs && selectedCat.subs.length > 0;
+  const activeSubs = hasSubs ? selectedCat.subs.filter(s => booksForGenre(books, s).length > 0) : [];
+  const { bg: headerBg, text: headerText } = getGenreColor(selectedSub || selectedCat.key);
 
   return (
     <div style={{ paddingBottom: "100px" }}>
-      {/* Header catégorie */}
+      {/* Header */}
       <div style={{
         padding: "14px 16px 10px",
-        background: `linear-gradient(135deg, ${getGenreColor(selectedCat.key).bg} 0%, ${getGenreColor(selectedCat.key).bg}cc 100%)`,
+        background: `linear-gradient(135deg, ${headerBg} 0%, ${headerBg}dd 100%)`,
         borderBottom: "1px solid rgba(0,0,0,0.1)",
+        position: "sticky", top: 0, zIndex: 10,
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
           <button
             onClick={() => { setSelectedCat(null); setSelectedSub(null); }}
             style={{
               background: "rgba(255,255,255,0.2)", border: "none", borderRadius: "50%",
-              width: "32px", height: "32px", cursor: "pointer", display: "flex",
-              alignItems: "center", justifyContent: "center",
-              color: getGenreColor(selectedCat.key).text,
-              fontSize: "18px", flexShrink: 0,
+              width: "34px", height: "34px", cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              color: headerText, fontSize: "18px", flexShrink: 0,
             }}
           >
             ←
@@ -8111,26 +8120,14 @@ function BibliothequeView({ books, onSelectBook }) {
           <div style={{ flex: 1 }}>
             <h2 style={{
               margin: 0, fontSize: "17px", fontWeight: "700",
-              fontFamily: "var(--font-display)",
-              color: getGenreColor(selectedCat.key).text,
+              fontFamily: "var(--font-display)", color: headerText,
             }}>
-              {selectedCat.emoji} {selectedCat.label}
+              {selectedCat.emoji} {selectedSub ? selectedSub.split("/")[1] : selectedCat.label}
             </h2>
-            <p style={{ margin: "2px 0 0", fontSize: "12px", color: getGenreColor(selectedCat.key).text, opacity: 0.75 }}>
+            <p style={{ margin: "2px 0 0", fontSize: "12px", color: headerText, opacity: 0.75 }}>
               {displayBooks.length} ouvrage{displayBooks.length > 1 ? "s" : ""}
             </p>
           </div>
-          {/* Toggle couvertures / dos */}
-          <button
-            onClick={() => setShowCovers(v => !v)}
-            style={{
-              background: "rgba(255,255,255,0.2)", border: "none", borderRadius: "20px",
-              padding: "5px 10px", cursor: "pointer", fontSize: "11px",
-              color: getGenreColor(selectedCat.key).text, fontWeight: "600",
-            }}
-          >
-            {showCovers ? "📚 Dos" : "🖼️ Couv."}
-          </button>
         </div>
 
         {/* Chips sous-catégories */}
@@ -8139,10 +8136,11 @@ function BibliothequeView({ books, onSelectBook }) {
             <button
               onClick={() => setSelectedSub(null)}
               style={{
-                background: !selectedSub ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.2)",
-                color: !selectedSub ? getGenreColor(selectedCat.key).bg : getGenreColor(selectedCat.key).text,
+                background: !selectedSub ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.2)",
+                color: !selectedSub ? headerBg : headerText,
                 border: "none", borderRadius: "20px", padding: "5px 12px",
-                fontSize: "11px", fontWeight: "600", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0,
+                fontSize: "11px", fontWeight: "600", cursor: "pointer",
+                whiteSpace: "nowrap", flexShrink: 0,
               }}
             >
               Tous ({booksForCategory(books, selectedCat).length})
@@ -8150,15 +8148,17 @@ function BibliothequeView({ books, onSelectBook }) {
             {activeSubs.map(sub => {
               const subLabel = sub.includes("/") ? sub.split("/")[1] : sub;
               const subCount = booksForGenre(books, sub).length;
+              const isActive = selectedSub === sub;
               return (
                 <button
                   key={sub}
                   onClick={() => setSelectedSub(sub)}
                   style={{
-                    background: selectedSub === sub ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.2)",
-                    color: selectedSub === sub ? getGenreColor(sub).bg : getGenreColor(selectedCat.key).text,
+                    background: isActive ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.2)",
+                    color: isActive ? getGenreColor(sub).bg : headerText,
                     border: "none", borderRadius: "20px", padding: "5px 12px",
-                    fontSize: "11px", fontWeight: "600", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0,
+                    fontSize: "11px", fontWeight: "600", cursor: "pointer",
+                    whiteSpace: "nowrap", flexShrink: 0,
                   }}
                 >
                   {subLabel} ({subCount})
@@ -8169,47 +8169,20 @@ function BibliothequeView({ books, onSelectBook }) {
         )}
       </div>
 
-      {/* Rayonnage */}
-      <div style={{
-        background: "linear-gradient(180deg, #f0e8d0 0%, #e8dcc0 100%)",
-        minHeight: "60vh",
-        padding: "16px 0 8px",
-      }}>
-        {/* Panneau bois latéral gauche */}
-        <div style={{ position: "relative" }}>
-          {/* Montant gauche */}
-          <div style={{
-            position: "absolute", left: 0, top: 0, bottom: 0, width: "8px",
-            background: "linear-gradient(90deg, #5a3a08 0%, #8b6914 100%)",
-            zIndex: 2,
-          }} />
-          {/* Montant droit */}
-          <div style={{
-            position: "absolute", right: 0, top: 0, bottom: 0, width: "8px",
-            background: "linear-gradient(270deg, #5a3a08 0%, #8b6914 100%)",
-            zIndex: 2,
-          }} />
-
-          {shelves.length > 0 ? shelves.map((shelf, i) => (
-            <Shelf
-              key={i}
-              books={shelf}
-              onSelectBook={(b) => {
-                onSelectBook(b);
-              }}
-              showCovers={showCovers}
-            />
-          )) : (
-            <div style={{ textAlign: "center", padding: "40px 20px", color: "var(--leather-light)", fontStyle: "italic" }}>
-              Aucun ouvrage dans cette catégorie
-            </div>
-          )}
-        </div>
-
-        {/* Compteur bas */}
-        <div style={{ textAlign: "center", padding: "8px", color: "var(--leather-light)", fontSize: "11px" }}>
-          {shelves.length} étagère{shelves.length > 1 ? "s" : ""} · {displayBooks.length} ouvrage{displayBooks.length > 1 ? "s" : ""}
-        </div>
+      {/* Liste de livres */}
+      <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "8px" }}>
+        {displayBooks.length > 0 ? displayBooks.map((book, i) => (
+          <BiblioBookCard
+            key={book.id}
+            book={book}
+            index={i}
+            onClick={() => onSelectBook(book)}
+          />
+        )) : (
+          <div style={{ textAlign: "center", padding: "60px 20px", color: "var(--leather-light)", fontStyle: "italic" }}>
+            Aucun ouvrage dans cette catégorie
+          </div>
+        )}
       </div>
     </div>
   );
