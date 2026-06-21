@@ -2255,10 +2255,10 @@ export default function App() {
         {view === "bibliotheque" && (
           <BibliothequeView
             books={books}
-            onSelectBook={(b) => {
+            onSelectBook={(b, orderedIds) => {
               setSelectedBook(b);
               setPreviousView("bibliotheque");
-              setNavigationIds(books.filter(x => (x.genre || []).some(g => (b.genre || []).some(bg => g === bg))).map(x => x.id));
+              setNavigationIds(orderedIds || books.map(x => x.id));
               setView("detail");
             }}
           />
@@ -3705,6 +3705,50 @@ const BookForm = forwardRef(function BookForm(
         </div>
       </div>
 
+      {/* Genres bibliothèque virtuelle — entre type et titre */}
+      <Field label="📚 Bibliothèque virtuelle">
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "8px" }}>
+          {genre.length > 0 ? genre.map((g, i) => {
+            const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
+            const label = g.includes("/") ? g.split("/")[1] : g;
+            return (
+              <span key={i} style={{
+                display: "inline-flex", alignItems: "center", gap: "4px",
+                padding: "4px 10px", borderRadius: "12px", fontSize: "12px",
+                fontWeight: "600", background: colors.bg, color: colors.text,
+              }}>
+                {label}
+                <button
+                  onClick={() => setGenre(genre.filter((_, j) => j !== i))}
+                  style={{ background: "none", border: "none", cursor: "pointer",
+                    color: colors.text, fontSize: "14px", padding: "0", lineHeight: 1 }}
+                >×</button>
+              </span>
+            );
+          }) : (
+            <span style={{ fontSize: "12px", color: "var(--ink-soft)", fontStyle: "italic" }}>Aucune catégorie assignée</span>
+          )}
+        </div>
+        <select
+          value=""
+          onChange={e => {
+            const val = e.target.value;
+            if (val && !genre.includes(val)) setGenre([...genre, val]);
+            e.target.value = "";
+          }}
+          style={{
+            width: "100%", padding: "10px", borderRadius: "8px",
+            border: "2px solid var(--parchment)", background: "white",
+            color: "var(--ink)", fontSize: "13px",
+          }}
+        >
+          <option value="">+ Ajouter une catégorie…</option>
+          {Object.keys(GENRE_COLORS).filter(g => !genre.includes(g) && g !== "À classer").map(g => (
+            <option key={g} value={g}>{g}</option>
+          ))}
+        </select>
+      </Field>
+
       <Field label={`${fields.titleLabel} *`}>
         <input
           value={title}
@@ -4108,50 +4152,6 @@ const BookForm = forwardRef(function BookForm(
           className="w-full p-3 rounded-lg border-2 outline-none resize-none"
           style={{ borderColor: "var(--parchment)" }}
         />
-      </Field>
-
-      {/* Genres bibliothèque virtuelle — toujours visible */}
-      <Field label="📚 Bibliothèque virtuelle">
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "8px" }}>
-          {genre.length > 0 ? genre.map((g, i) => {
-            const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
-            const label = g.includes("/") ? g.split("/")[1] : g;
-            return (
-              <span key={i} style={{
-                display: "inline-flex", alignItems: "center", gap: "4px",
-                padding: "4px 10px", borderRadius: "12px", fontSize: "12px",
-                fontWeight: "600", background: colors.bg, color: colors.text,
-              }}>
-                {label}
-                <button
-                  onClick={() => setGenre(genre.filter((_, j) => j !== i))}
-                  style={{ background: "none", border: "none", cursor: "pointer",
-                    color: colors.text, fontSize: "14px", padding: "0", lineHeight: 1 }}
-                >×</button>
-              </span>
-            );
-          }) : (
-            <span style={{ fontSize: "12px", color: "var(--ink-soft)", fontStyle: "italic" }}>Aucune catégorie assignée</span>
-          )}
-        </div>
-        <select
-          value=""
-          onChange={e => {
-            const val = e.target.value;
-            if (val && !genre.includes(val)) setGenre([...genre, val]);
-            e.target.value = "";
-          }}
-          style={{
-            width: "100%", padding: "10px", borderRadius: "8px",
-            border: "2px solid var(--parchment)", background: "white",
-            color: "var(--ink)", fontSize: "13px",
-          }}
-        >
-          <option value="">+ Ajouter une catégorie…</option>
-          {Object.keys(GENRE_COLORS).filter(g => !genre.includes(g) && g !== "À classer").map(g => (
-            <option key={g} value={g}>{g}</option>
-          ))}
-        </select>
       </Field>
 
       {!bareMode && (
@@ -8309,11 +8309,17 @@ function BibliothequeView({ books, onSelectBook }) {
 
       {/* Contenu selon le mode */}
       {viewMode === "shelves" ? (
-        <ShelfView books={displayBooks} onSelectBook={onSelectBook} />
+        <ShelfView
+          books={displayBooks}
+          onSelectBook={(book) => onSelectBook(book, displayBooks.map(x => x.id))}
+        />
       ) : (
         <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "8px" }}>
           {displayBooks.length > 0 ? displayBooks.map((book, i) => (
-            <BiblioBookCard key={book.id} book={book} index={i} onClick={() => onSelectBook(book)} />
+            <BiblioBookCard
+              key={book.id} book={book} index={i}
+              onClick={() => onSelectBook(book, displayBooks.map(x => x.id))}
+            />
           )) : (
             <div style={{ textAlign: "center", padding: "60px 20px",
               color: "var(--leather-light)", fontStyle: "italic" }}>
