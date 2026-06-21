@@ -317,6 +317,7 @@ function bookToDb(book) {
   if ("durationMin" in book) out.duration_min = book.durationMin ? parseInt(book.durationMin) : null;
   if ("ageMin" in book) out.age_min = book.ageMin ? parseInt(book.ageMin) : null;
   if ("platform" in book) out.platform = book.platform || null;
+  if ("genre" in book) out.genre = Array.isArray(book.genre) ? book.genre : [];
   // Si c'est une mise à jour partielle, on conserve l'id
   if (book.id && typeof book.id === "string" && book.id.includes("-")) {
     // UUID Supabase
