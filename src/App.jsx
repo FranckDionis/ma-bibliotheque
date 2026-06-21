@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, forwardRef, useImperativeHandle } from "react";
-import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload, LogOut, Cloud, CloudOff } from "lucide-react";
+import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload, LogOut, Cloud, CloudOff, Sparkles } from "lucide-react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
 import { BarcodeFormat, DecodeHintType } from "@zxing/library";
 import { supabase, isSupabaseConfigured } from "./supabase";
@@ -921,7 +921,7 @@ export default function App() {
   const [layout, setLayout] = useState(DEFAULT_LAYOUT);
   const [structure, setStructure] = useState(INITIAL_STRUCTURE);
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState("home"); // home, search, add, library, detail, edit
+  const [view, setView] = useState("home"); // home, search, add, library, detail, edit, bibliotheque
   const [searchQuery, setSearchQuery] = useState("");
   const [filterBib, setFilterBib] = useState("all");
   const [filterType, setFilterType] = useState("all");
@@ -2242,6 +2242,16 @@ export default function App() {
             }}
           />
         )}
+        {view === "bibliotheque" && (
+          <BibliothequeView
+            books={books}
+            onSelectBook={(b) => {
+              setSelectedBook(b);
+              setNavigationIds(books.filter(x => (x.genre || []).some(g => (b.genre || []).some(bg => g === bg))).map(x => x.id));
+              setView("detail");
+            }}
+          />
+        )}
         {view === "add" && (
           <AddView
             books={books}
@@ -2349,7 +2359,7 @@ export default function App() {
       )}
 
       {/* Bottom nav */}
-      {(view === "home" || view === "library") && (
+      {(view === "home" || view === "library" || view === "bibliotheque") && (
         <nav className="fixed bottom-0 left-0 right-0 z-20 border-t shadow-lg" style={{
           background: "var(--cream)",
           borderColor: "var(--parchment)",
@@ -2384,6 +2394,12 @@ export default function App() {
             >
               <Plus className="w-7 h-7" />
             </button>
+            <NavButton
+              icon={<Sparkles className="w-6 h-6" />}
+              label="Biblio"
+              active={view === "bibliotheque"}
+              onClick={() => setView("bibliotheque")}
+            />
             <NavButton
               icon={<Search className="w-6 h-6" />}
               label="Chercher"
@@ -7700,6 +7716,499 @@ function SettingsModal({
         {/* Astuce */}
         <div className="rounded-lg p-3 text-xs" style={{ background: "rgba(212, 167, 44, 0.15)", color: "var(--ink)" }}>
           💡 <strong>Astuce</strong> : exportez régulièrement, surtout après une grande session de scan. Le fichier reste petit (typiquement 100-500 Ko pour quelques centaines de livres).
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MA BIBLIOTHÈQUE VIRTUELLE
+// Navigation : grille de catégories → rayonnage visuel
+// ═══════════════════════════════════════════════════════════════
+
+// Palette de couleurs par catégorie (dos de livre)
+const GENRE_COLORS = {
+  "Arts & Culture":                          { bg: "#7c5c8a", text: "#f0e6f6" },
+  "Littérature classique":                   { bg: "#4a230a", text: "#f4ecd8" },
+  "Littérature classique/Romans classiques": { bg: "#5a2d0c", text: "#f4ecd8" },
+  "Littérature classique/Théâtre & Poésie":  { bg: "#6b3410", text: "#f4ecd8" },
+  "Romans adultes":                          { bg: "#8b4a1a", text: "#f4ecd8" },
+  "Romans adultes/Contemporain français":    { bg: "#9b5a1a", text: "#fdf6e8" },
+  "Romans adultes/Étranger":                 { bg: "#7a3d10", text: "#fdf6e8" },
+  "Romans adultes/Policier & Thriller":      { bg: "#2c2c3a", text: "#e8e8f0" },
+  "BD/BD adulte":                            { bg: "#d4870a", text: "#1a0a00" },
+  "BD/BD enfant":                            { bg: "#e8a020", text: "#1a0a00" },
+  "Albums petite enfance/0 – 3 ans":         { bg: "#e8c0d0", text: "#3a1020" },
+  "Albums petite enfance/3 – 6 ans":         { bg: "#d4a8c0", text: "#2a0818" },
+  "Romans jeunesse/6 – 10 ans":             { bg: "#2a7a3a", text: "#e8f8ec" },
+  "Romans jeunesse/10 – 14 ans":            { bg: "#1e5c2c", text: "#e8f8ec" },
+  "Lecture scolaire CP–CM2/Méthode de lecture": { bg: "#1a6080", text: "#e0f4ff" },
+  "Lecture scolaire CP–CM2/Romans faciles":     { bg: "#1e7890", text: "#e0f4ff" },
+  "Lecture scolaire CP–CM2/Maternelle & activités": { bg: "#2890a8", text: "#e0f4ff" },
+  "Scolaire collège & lycée/Manuels & cahiers":     { bg: "#1c3a6e", text: "#dce8ff" },
+  "Scolaire collège & lycée/Révisions & examens":   { bg: "#142e58", text: "#dce8ff" },
+  "Musique":                                 { bg: "#5c2d6e", text: "#f0e0ff" },
+  "Langues étrangères":                      { bg: "#2d5c6e", text: "#e0f4ff" },
+  "Langues étrangères/Anglais · Espagnol · Allemand…": { bg: "#1e4a5c", text: "#e0f4ff" },
+  "Langues étrangères/Russe · Hébreu · Japonais…":     { bg: "#2a3d5c", text: "#e0f4ff" },
+  "Cuisine & Nutrition/Recettes":            { bg: "#8b2020", text: "#ffe8e8" },
+  "Cuisine & Nutrition/Minceur & nutrition": { bg: "#6e4a20", text: "#fff0e0" },
+  "Sciences & Nature/Animaux & nature":      { bg: "#2a5a2a", text: "#e8ffe8" },
+  "Sciences & Nature/Corps humain & biologie": { bg: "#1e4a3a", text: "#e0fff4" },
+  "Sciences & Nature/Espace & univers":      { bg: "#1a1a3a", text: "#e0e8ff" },
+  "Histoire & Civilisations":                { bg: "#5a4a20", text: "#fff8e0" },
+  "Judaïsme & Shoah":                        { bg: "#1a1a2a", text: "#e8e8ff" },
+  "Religion & Spiritualité":                 { bg: "#4a3a6e", text: "#f0ecff" },
+  "Développement perso/Autisme · DYS · TDA": { bg: "#2a5a6e", text: "#e0f4ff" },
+  "Développement perso/Psychologie & mémoire": { bg: "#3a4a6e", text: "#e0e8ff" },
+  "Droit & Société":                         { bg: "#2a2a4a", text: "#e8e8ff" },
+  "Loisirs créatifs":                        { bg: "#c04a6e", text: "#fff0f4" },
+  "Revues & magazines":                      { bg: "#888888", text: "#f8f8f8" },
+  "Jeux de société":                         { bg: "#d4670a", text: "#fff4e0" },
+  "Jeux vidéo (Switch)":                     { bg: "#cc0000", text: "#ffffff" },
+  "À classer":                               { bg: "#aaaaaa", text: "#222222" },
+};
+
+function getGenreColor(genre) {
+  return GENRE_COLORS[genre] || { bg: "#6b3410", text: "#f4ecd8" };
+}
+
+// Catégories principales (pour la grille)
+const MAIN_CATEGORIES = [
+  { key: "Littérature classique", label: "Littérature classique", emoji: "📜", subs: ["Littérature classique/Romans classiques", "Littérature classique/Théâtre & Poésie"] },
+  { key: "Romans adultes",        label: "Romans adultes",        emoji: "📖", subs: ["Romans adultes/Contemporain français", "Romans adultes/Étranger", "Romans adultes/Policier & Thriller"] },
+  { key: "BD",                    label: "Bandes dessinées",      emoji: "💬", subs: ["BD/BD adulte", "BD/BD enfant"] },
+  { key: "Albums petite enfance", label: "Petite enfance",        emoji: "🧸", subs: ["Albums petite enfance/0 – 3 ans", "Albums petite enfance/3 – 6 ans"] },
+  { key: "Romans jeunesse",       label: "Romans jeunesse",       emoji: "🌱", subs: ["Romans jeunesse/6 – 10 ans", "Romans jeunesse/10 – 14 ans"] },
+  { key: "Lecture scolaire CP–CM2", label: "Lecture scolaire",   emoji: "✏️", subs: ["Lecture scolaire CP–CM2/Méthode de lecture", "Lecture scolaire CP–CM2/Romans faciles", "Lecture scolaire CP–CM2/Maternelle & activités"] },
+  { key: "Scolaire collège & lycée", label: "Collège & lycée",   emoji: "🎒", subs: ["Scolaire collège & lycée/Manuels & cahiers", "Scolaire collège & lycée/Révisions & examens"] },
+  { key: "Arts & Culture",        label: "Arts & Culture",        emoji: "🎨", subs: [] },
+  { key: "Musique",               label: "Musique",               emoji: "🎵", subs: [] },
+  { key: "Langues étrangères",    label: "Langues étrangères",    emoji: "🌍", subs: ["Langues étrangères/Anglais · Espagnol · Allemand…", "Langues étrangères/Russe · Hébreu · Japonais…"] },
+  { key: "Cuisine & Nutrition",   label: "Cuisine & Nutrition",   emoji: "🍳", subs: ["Cuisine & Nutrition/Recettes", "Cuisine & Nutrition/Minceur & nutrition"] },
+  { key: "Sciences & Nature",     label: "Sciences & Nature",     emoji: "🔬", subs: ["Sciences & Nature/Animaux & nature", "Sciences & Nature/Corps humain & biologie", "Sciences & Nature/Espace & univers"] },
+  { key: "Histoire & Civilisations", label: "Histoire",           emoji: "🏛️", subs: [] },
+  { key: "Judaïsme & Shoah",      label: "Judaïsme & Shoah",      emoji: "✡️", subs: [] },
+  { key: "Religion & Spiritualité", label: "Religion",            emoji: "🙏", subs: [] },
+  { key: "Développement perso",   label: "Développement perso",   emoji: "🧠", subs: ["Développement perso/Autisme · DYS · TDA", "Développement perso/Psychologie & mémoire"] },
+  { key: "Droit & Société",       label: "Droit & Société",       emoji: "⚖️", subs: [] },
+  { key: "Loisirs créatifs",      label: "Loisirs créatifs",      emoji: "✂️", subs: [] },
+  { key: "Revues & magazines",    label: "Revues",                emoji: "📰", subs: [] },
+  { key: "Jeux de société",       label: "Jeux de société",       emoji: "🎲", subs: [] },
+  { key: "Jeux vidéo (Switch)",   label: "Jeux Switch",           emoji: "🎮", subs: [] },
+  { key: "À classer",             label: "À classer",             emoji: "📦", subs: [] },
+];
+
+// Dos de livre SVG (style livre vu de dos sans couverture)
+function BookSpine({ book, width = 32, height = 120, onClick }) {
+  const genre = book.genre?.[0] || "À classer";
+  const { bg, text } = getGenreColor(genre);
+  const title = book.title || "?";
+  const author = book.author || "";
+
+  // Texte tronqué pour le dos
+  const shortTitle = title.length > 28 ? title.substring(0, 26) + "…" : title;
+  const shortAuthor = author.length > 20 ? author.substring(0, 18) + "…" : author;
+
+  return (
+    <div
+      onClick={onClick}
+      title={`${title}${author ? " — " + author : ""}`}
+      style={{
+        width: `${width}px`,
+        minWidth: `${width}px`,
+        height: `${height}px`,
+        background: bg,
+        borderRadius: "2px 4px 4px 2px",
+        cursor: "pointer",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "4px 2px",
+        boxShadow: "inset -2px 0 4px rgba(0,0,0,0.2), inset 2px 0 2px rgba(255,255,255,0.05), 2px 0 6px rgba(0,0,0,0.3)",
+        position: "relative",
+        overflow: "hidden",
+        transition: "transform 0.15s, box-shadow 0.15s",
+        flexShrink: 0,
+      }}
+      onMouseEnter={e => {
+        e.currentTarget.style.transform = "translateY(-4px) scaleX(1.05)";
+        e.currentTarget.style.boxShadow = "inset -2px 0 4px rgba(0,0,0,0.2), 4px 0 12px rgba(0,0,0,0.4)";
+        e.currentTarget.style.zIndex = "10";
+      }}
+      onMouseLeave={e => {
+        e.currentTarget.style.transform = "";
+        e.currentTarget.style.boxShadow = "inset -2px 0 4px rgba(0,0,0,0.2), inset 2px 0 2px rgba(255,255,255,0.05), 2px 0 6px rgba(0,0,0,0.3)";
+        e.currentTarget.style.zIndex = "";
+      }}
+    >
+      {/* Tranche gauche légèrement plus claire */}
+      <div style={{
+        position: "absolute", left: 0, top: 0, bottom: 0, width: "3px",
+        background: "rgba(255,255,255,0.12)",
+        borderRadius: "2px 0 0 2px",
+      }} />
+      {/* Texte vertical */}
+      <div style={{
+        writingMode: "vertical-rl",
+        textOrientation: "mixed",
+        transform: "rotate(180deg)",
+        color: text,
+        fontSize: "9px",
+        fontFamily: "Georgia, serif",
+        fontWeight: "600",
+        lineHeight: "1.2",
+        textAlign: "center",
+        overflow: "hidden",
+        maxHeight: `${height - 16}px`,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: "4px",
+      }}>
+        <span style={{ fontSize: "9px", opacity: 0.9 }}>{shortTitle}</span>
+        {shortAuthor && (
+          <span style={{ fontSize: "7.5px", opacity: 0.65 }}>{shortAuthor}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Livre avec couverture (si disponible)
+function BookCover({ book, height = 120, onClick }) {
+  const genre = book.genre?.[0] || "À classer";
+  const { bg, text } = getGenreColor(genre);
+
+  if (book.cover) {
+    const width = Math.round(height * 0.67);
+    return (
+      <div
+        onClick={onClick}
+        title={`${book.title || ""}${book.author ? " — " + book.author : ""}`}
+        style={{
+          width: `${width}px`,
+          minWidth: `${width}px`,
+          height: `${height}px`,
+          borderRadius: "2px 4px 4px 2px",
+          cursor: "pointer",
+          overflow: "hidden",
+          boxShadow: "inset -2px 0 4px rgba(0,0,0,0.2), 2px 0 6px rgba(0,0,0,0.3)",
+          flexShrink: 0,
+          transition: "transform 0.15s, box-shadow 0.15s",
+        }}
+        onMouseEnter={e => {
+          e.currentTarget.style.transform = "translateY(-4px)";
+          e.currentTarget.style.boxShadow = "inset -2px 0 4px rgba(0,0,0,0.2), 4px 0 12px rgba(0,0,0,0.4)";
+          e.currentTarget.style.zIndex = "10";
+        }}
+        onMouseLeave={e => {
+          e.currentTarget.style.transform = "";
+          e.currentTarget.style.boxShadow = "inset -2px 0 4px rgba(0,0,0,0.2), 2px 0 6px rgba(0,0,0,0.3)";
+          e.currentTarget.style.zIndex = "";
+        }}
+      >
+        <img
+          src={book.cover}
+          alt={book.title}
+          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+          onError={e => { e.target.style.display = "none"; }}
+        />
+      </div>
+    );
+  }
+  // Pas de couverture → dos coloré
+  return <BookSpine book={book} width={28} height={height} onClick={onClick} />;
+}
+
+// Une étagère avec ses livres
+function Shelf({ books, onSelectBook, showCovers }) {
+  const SHELF_HEIGHT = 110;
+
+  return (
+    <div style={{ position: "relative", marginBottom: "16px" }}>
+      {/* Planche du haut (ombre) */}
+      <div style={{
+        position: "absolute", top: 0, left: 0, right: 0, height: "6px",
+        background: "linear-gradient(180deg, rgba(0,0,0,0.15) 0%, transparent 100%)",
+        zIndex: 1,
+      }} />
+      {/* Zone des livres */}
+      <div style={{
+        display: "flex",
+        alignItems: "flex-end",
+        gap: "2px",
+        padding: "6px 12px 0 12px",
+        minHeight: `${SHELF_HEIGHT + 8}px`,
+        overflowX: "auto",
+        overflowY: "visible",
+        WebkitOverflowScrolling: "touch",
+        scrollbarWidth: "none",
+      }}>
+        {books.map(book => (
+          showCovers
+            ? <BookCover key={book.id} book={book} height={SHELF_HEIGHT} onClick={() => onSelectBook(book)} />
+            : <BookSpine key={book.id} book={book} width={28} height={SHELF_HEIGHT} onClick={() => onSelectBook(book)} />
+        ))}
+        {books.length === 0 && (
+          <div style={{ color: "var(--leather-light)", fontSize: "12px", fontStyle: "italic", padding: "8px 0" }}>
+            Aucun livre ici
+          </div>
+        )}
+      </div>
+      {/* Planche */}
+      <div style={{
+        height: "12px",
+        background: "linear-gradient(180deg, #8b6914 0%, #6b4a0a 40%, #5a3a08 100%)",
+        borderRadius: "0 0 2px 2px",
+        boxShadow: "0 4px 8px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.15)",
+        marginLeft: "4px",
+        marginRight: "4px",
+      }} />
+    </div>
+  );
+}
+
+// Compte les livres d'une catégorie principale
+function countForCategory(books, cat) {
+  return books.filter(b => {
+    const genres = b.genre || [];
+    // Vérifie si un genre commence par la clé de catégorie
+    return genres.some(g => g === cat.key || g.startsWith(cat.key + "/"));
+  }).length;
+}
+
+// Filtre les livres pour une (sous-)catégorie donnée
+function booksForGenre(books, genre) {
+  return books.filter(b => (b.genre || []).includes(genre));
+}
+
+// Tous les livres d'une catégorie principale (union de ses sous-genres)
+function booksForCategory(books, cat) {
+  const seen = new Set();
+  const result = [];
+  for (const b of books) {
+    const genres = b.genre || [];
+    if (genres.some(g => g === cat.key || g.startsWith(cat.key + "/"))) {
+      if (!seen.has(b.id)) { seen.add(b.id); result.push(b); }
+    }
+  }
+  return result;
+}
+
+// Découpe un tableau en étagères de N livres
+function intoShelves(books, perShelf = 18) {
+  const shelves = [];
+  for (let i = 0; i < books.length; i += perShelf) {
+    shelves.push(books.slice(i, i + perShelf));
+  }
+  return shelves;
+}
+
+// ── Composant principal ──────────────────────────────────────
+function BibliothequeView({ books, onSelectBook }) {
+  const [selectedCat, setSelectedCat] = useState(null);   // catégorie principale
+  const [selectedSub, setSelectedSub] = useState(null);   // sous-catégorie (null = toutes)
+  const [showCovers, setShowCovers]   = useState(true);
+
+  // Livres selon la sélection
+  const displayBooks = React.useMemo(() => {
+    if (!selectedCat) return [];
+    if (selectedSub) return booksForGenre(books, selectedSub);
+    return booksForCategory(books, selectedCat);
+  }, [books, selectedCat, selectedSub]);
+
+  const shelves = intoShelves(displayBooks, 16);
+
+  // ── Vue : grille des catégories ──────────────────────────
+  if (!selectedCat) {
+    const catsWithBooks = MAIN_CATEGORIES.filter(c => countForCategory(books, c) > 0);
+    return (
+      <div style={{ padding: "16px", paddingBottom: "100px" }}>
+        {/* Titre */}
+        <div style={{ textAlign: "center", marginBottom: "20px" }}>
+          <h2 style={{ fontFamily: "var(--font-display)", color: "var(--leather-dark)", fontSize: "20px", fontWeight: "600", margin: 0 }}>
+            Ma Bibliothèque
+          </h2>
+          <p style={{ color: "var(--leather-light)", fontSize: "13px", margin: "4px 0 0" }}>
+            {books.filter(b => b.genre && b.genre.length).length} ouvrages classifiés
+          </p>
+        </div>
+
+        {/* Grille */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px" }}>
+          {catsWithBooks.map(cat => {
+            const count = countForCategory(books, cat);
+            const { bg, text } = getGenreColor(cat.key);
+            return (
+              <button
+                key={cat.key}
+                onClick={() => { setSelectedCat(cat); setSelectedSub(null); }}
+                style={{
+                  background: bg,
+                  color: text,
+                  border: "none",
+                  borderRadius: "10px",
+                  padding: "14px 8px",
+                  cursor: "pointer",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: "6px",
+                  boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
+                  transition: "transform 0.15s, box-shadow 0.15s",
+                  minHeight: "90px",
+                  justifyContent: "center",
+                  textAlign: "center",
+                }}
+                onTouchStart={e => e.currentTarget.style.transform = "scale(0.96)"}
+                onTouchEnd={e => e.currentTarget.style.transform = ""}
+              >
+                <span style={{ fontSize: "24px" }}>{cat.emoji}</span>
+                <span style={{ fontSize: "11px", fontWeight: "600", lineHeight: "1.3", fontFamily: "var(--font-display)" }}>
+                  {cat.label}
+                </span>
+                <span style={{ fontSize: "10px", opacity: 0.75 }}>
+                  {count} {count > 1 ? "ouvrages" : "ouvrage"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Vue : rayonnage d'une catégorie ─────────────────────
+  const hasSubs = selectedCat.subs && selectedCat.subs.length > 0;
+  const activeSubs = hasSubs
+    ? selectedCat.subs.filter(s => booksForGenre(books, s).length > 0)
+    : [];
+
+  return (
+    <div style={{ paddingBottom: "100px" }}>
+      {/* Header catégorie */}
+      <div style={{
+        padding: "14px 16px 10px",
+        background: `linear-gradient(135deg, ${getGenreColor(selectedCat.key).bg} 0%, ${getGenreColor(selectedCat.key).bg}cc 100%)`,
+        borderBottom: "1px solid rgba(0,0,0,0.1)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          <button
+            onClick={() => { setSelectedCat(null); setSelectedSub(null); }}
+            style={{
+              background: "rgba(255,255,255,0.2)", border: "none", borderRadius: "50%",
+              width: "32px", height: "32px", cursor: "pointer", display: "flex",
+              alignItems: "center", justifyContent: "center",
+              color: getGenreColor(selectedCat.key).text,
+              fontSize: "18px", flexShrink: 0,
+            }}
+          >
+            ←
+          </button>
+          <div style={{ flex: 1 }}>
+            <h2 style={{
+              margin: 0, fontSize: "17px", fontWeight: "700",
+              fontFamily: "var(--font-display)",
+              color: getGenreColor(selectedCat.key).text,
+            }}>
+              {selectedCat.emoji} {selectedCat.label}
+            </h2>
+            <p style={{ margin: "2px 0 0", fontSize: "12px", color: getGenreColor(selectedCat.key).text, opacity: 0.75 }}>
+              {displayBooks.length} ouvrage{displayBooks.length > 1 ? "s" : ""}
+            </p>
+          </div>
+          {/* Toggle couvertures / dos */}
+          <button
+            onClick={() => setShowCovers(v => !v)}
+            style={{
+              background: "rgba(255,255,255,0.2)", border: "none", borderRadius: "20px",
+              padding: "5px 10px", cursor: "pointer", fontSize: "11px",
+              color: getGenreColor(selectedCat.key).text, fontWeight: "600",
+            }}
+          >
+            {showCovers ? "📚 Dos" : "🖼️ Couv."}
+          </button>
+        </div>
+
+        {/* Chips sous-catégories */}
+        {activeSubs.length > 0 && (
+          <div style={{ display: "flex", gap: "6px", marginTop: "10px", overflowX: "auto", paddingBottom: "2px" }}>
+            <button
+              onClick={() => setSelectedSub(null)}
+              style={{
+                background: !selectedSub ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.2)",
+                color: !selectedSub ? getGenreColor(selectedCat.key).bg : getGenreColor(selectedCat.key).text,
+                border: "none", borderRadius: "20px", padding: "5px 12px",
+                fontSize: "11px", fontWeight: "600", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0,
+              }}
+            >
+              Tous ({booksForCategory(books, selectedCat).length})
+            </button>
+            {activeSubs.map(sub => {
+              const subLabel = sub.includes("/") ? sub.split("/")[1] : sub;
+              const subCount = booksForGenre(books, sub).length;
+              return (
+                <button
+                  key={sub}
+                  onClick={() => setSelectedSub(sub)}
+                  style={{
+                    background: selectedSub === sub ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.2)",
+                    color: selectedSub === sub ? getGenreColor(sub).bg : getGenreColor(selectedCat.key).text,
+                    border: "none", borderRadius: "20px", padding: "5px 12px",
+                    fontSize: "11px", fontWeight: "600", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0,
+                  }}
+                >
+                  {subLabel} ({subCount})
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Rayonnage */}
+      <div style={{
+        background: "linear-gradient(180deg, #f0e8d0 0%, #e8dcc0 100%)",
+        minHeight: "60vh",
+        padding: "16px 0 8px",
+      }}>
+        {/* Panneau bois latéral gauche */}
+        <div style={{ position: "relative" }}>
+          {/* Montant gauche */}
+          <div style={{
+            position: "absolute", left: 0, top: 0, bottom: 0, width: "8px",
+            background: "linear-gradient(90deg, #5a3a08 0%, #8b6914 100%)",
+            zIndex: 2,
+          }} />
+          {/* Montant droit */}
+          <div style={{
+            position: "absolute", right: 0, top: 0, bottom: 0, width: "8px",
+            background: "linear-gradient(270deg, #5a3a08 0%, #8b6914 100%)",
+            zIndex: 2,
+          }} />
+
+          {shelves.length > 0 ? shelves.map((shelf, i) => (
+            <Shelf
+              key={i}
+              books={shelf}
+              onSelectBook={(b) => {
+                onSelectBook(b);
+              }}
+              showCovers={showCovers}
+            />
+          )) : (
+            <div style={{ textAlign: "center", padding: "40px 20px", color: "var(--leather-light)", fontStyle: "italic" }}>
+              Aucun ouvrage dans cette catégorie
+            </div>
+          )}
+        </div>
+
+        {/* Compteur bas */}
+        <div style={{ textAlign: "center", padding: "8px", color: "var(--leather-light)", fontSize: "11px" }}>
+          {shelves.length} étagère{shelves.length > 1 ? "s" : ""} · {displayBooks.length} ouvrage{displayBooks.length > 1 ? "s" : ""}
         </div>
       </div>
     </div>
