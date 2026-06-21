@@ -2784,6 +2784,24 @@ function BookCard({ book, structure, onClick, index }) {
             </div>
           )}
         </div>
+        {/* Badges genre bibliothèque virtuelle */}
+        {book.genre && book.genre.length > 0 && (
+          <div className="flex flex-wrap gap-1 mt-1.5">
+            {book.genre.slice(0, 3).map((g, i) => {
+              const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
+              const label = g.includes("/") ? g.split("/")[1] : g;
+              return (
+                <span key={i} style={{
+                  fontSize: "9px", padding: "1px 6px", borderRadius: "8px",
+                  background: colors.bg, color: colors.text, fontWeight: "600",
+                  whiteSpace: "nowrap",
+                }}>
+                  {label}
+                </span>
+              );
+            })}
+          </div>
+        )}
       </div>
       <ChevronRight className="w-5 h-5 self-center flex-shrink-0" style={{ color: "var(--leather)" }} />
     </button>
