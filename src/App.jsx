@@ -3611,8 +3611,8 @@ const BookForm = forwardRef(function BookForm(
           <BookOpen className="w-12 h-12" style={{ color: "var(--leather)" }} />
         )}
       </div>
-      {/* Boutons Changer / Supprimer sous la photo */}
-      <div style={{ display: "grid", gridTemplateColumns: cover ? "1fr 1fr" : "1fr", gap: "6px", marginTop: "8px" }}>
+      {/* Boutons Changer / Supprimer sous la photo — en colonne pour éviter la superposition */}
+      <div style={{ display: "flex", flexDirection: "column", gap: "5px", marginTop: "8px" }}>
         <label
           className="py-2 px-2 rounded-lg border-2 text-xs text-center cursor-pointer flex items-center justify-center gap-1"
           style={{ borderColor: "var(--parchment)", color: "var(--leather)" }}
@@ -3980,7 +3980,7 @@ const BookForm = forwardRef(function BookForm(
     return (
       <div>
         {/* Ligne supérieure : photo à gauche, champs essentiels à droite */}
-        <div style={{ display: "grid", gridTemplateColumns: "140px 1fr", gap: "14px", alignItems: "start" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "170px 1fr", gap: "14px", alignItems: "start" }}>
           {/* Colonne gauche : couverture + boutons */}
           <div>
             {coverBlock}
