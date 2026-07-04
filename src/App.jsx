@@ -2562,14 +2562,35 @@ function HomeView({ books, structure, filteredBooks, searchQuery, setSearchQuery
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           placeholder="Titre, auteur, ISBN…"
-          className="w-full pl-10 pr-4 py-3 rounded-xl border-2 outline-none"
+          className="w-full pl-10 pr-4 py-3 rounded-xl border-2 outline-none [&::-webkit-search-cancel-button]:hidden"
           style={{
             background: "var(--cream)",
             borderColor: "var(--parchment)",
             color: "var(--ink)",
             fontSize: "1rem",
+            // Laisse la place au compteur + bouton effacer quand une recherche est active
+            paddingRight: searchQuery ? "8rem" : undefined,
           }}
         />
+        {/* Compteur de résultats + effacement, affichés seulement pendant une recherche */}
+        {searchQuery && (
+          <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+            <span
+              className="text-xs font-semibold px-2 py-1 rounded-full whitespace-nowrap"
+              style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+            >
+              {filteredBooks.length} résultat{filteredBooks.length > 1 ? "s" : ""}
+            </span>
+            <button
+              onClick={() => setSearchQuery("")}
+              aria-label="Effacer la recherche"
+              className="p-1.5 rounded-full"
+              style={{ color: "var(--leather)" }}
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
       </div>
 
       {/* === LIGNE 1 : FILTRE PAR TYPE D'OBJET (+ "Sans titre") === */}
