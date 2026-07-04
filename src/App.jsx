@@ -1484,11 +1484,42 @@ export default function App() {
     }
   };
 
+  // === RECHERCHE SOUPLE ===
+  // Normalisation : minuscules, accents supprimés (é/è/ê → e, ç → c, ï → i…),
+  // ligatures œ/æ → oe/ae, apostrophes/tirets/ponctuation → espaces.
+  // Ainsi "elephant" trouve "Éléphant" et "j aime lire" trouve "J'aime Lire".
+  const normalizeSearchText = (str) => {
+    if (!str) return "";
+    return String(str)
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/œ/g, "oe")
+      .replace(/æ/g, "ae")
+      .replace(/[’'`"«»–—\-_.,;:!?()[\]/\\]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  };
+
+  // La requête est découpée en mots : chaque mot doit être présent quelque part
+  // dans le livre (titre, auteur, notes ou résumé), quel que soit l'ordre.
+  // Calculé une seule fois par frappe, pas pour chaque livre.
+  const searchWords = normalizeSearchText(searchQuery).split(" ").filter(Boolean);
+  // Recherche ISBN : on compare les chiffres seuls, pour tolérer les tirets/espaces.
+  const searchDigits = searchQuery.replace(/\D/g, "");
+
   const filteredBooks = books.filter((b) => {
-    const matchSearch = !searchQuery ||
-      b.title?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      b.author?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      b.isbn?.includes(searchQuery);
+    let matchSearch = true;
+    if (searchWords.length > 0) {
+      const haystack = normalizeSearchText(
+        [b.title, b.author, b.notes, b.description].filter(Boolean).join(" ")
+      );
+      const matchWords = searchWords.every((w) => haystack.includes(w));
+      const matchIsbn =
+        searchDigits.length >= 4 &&
+        (b.isbn || "").replace(/\D/g, "").includes(searchDigits);
+      matchSearch = matchWords || matchIsbn;
+    }
 
     // Filtre PIÈCE : trouve la pièce de la bibliothèque du livre
     let matchPiece = filterPiece === "all";
