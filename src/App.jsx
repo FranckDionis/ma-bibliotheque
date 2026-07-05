@@ -2764,12 +2764,12 @@ function BookCard({ book, structure, onClick, index }) {
       >
         {itemType?.emoji}
       </div>
-      <div className="w-16 h-24 flex-shrink-0 rounded overflow-hidden flex items-center justify-center"
+      <div className="w-24 h-36 flex-shrink-0 rounded overflow-hidden flex items-center justify-center"
         style={{ background: "var(--parchment)" }}>
         {book.cover ? (
           <img src={book.cover} alt={book.title} className="w-full h-full object-cover" />
         ) : (
-          <span style={{ fontSize: "2rem" }}>{itemType?.emoji || "📖"}</span>
+          <span style={{ fontSize: "3rem" }}>{itemType?.emoji || "📖"}</span>
         )}
       </div>
       <div className="flex-1 min-w-0 pr-6">
@@ -4032,7 +4032,7 @@ const BookForm = forwardRef(function BookForm(
     return (
       <div>
         {/* Ligne supérieure : photo à gauche, champs essentiels à droite */}
-        <div style={{ display: "grid", gridTemplateColumns: "170px 1fr", gap: "14px", alignItems: "start" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "255px 1fr", gap: "14px", alignItems: "start" }}>
           {/* Colonne gauche : couverture + boutons */}
           <div>
             {coverBlock}
@@ -4100,12 +4100,12 @@ const BookForm = forwardRef(function BookForm(
 
       {/* Couverture — version compacte pour le mode ajout */}
       <div className="flex gap-3 items-start">
-        <div className="w-32 h-44 rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0 shadow-md"
-          style={{ background: "var(--parchment)" }}>
+        <div className="rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0 shadow-md"
+          style={{ background: "var(--parchment)", width: "192px", height: "264px" }}>
           {cover ? (
             <img src={cover} alt="" className="w-full h-full object-cover" />
           ) : (
-            <BookOpen className="w-10 h-10" style={{ color: "var(--leather)" }} />
+            <BookOpen className="w-14 h-14" style={{ color: "var(--leather)" }} />
           )}
         </div>
         <div className="flex-1 space-y-1.5">
@@ -4443,13 +4443,13 @@ function DetailView({ book, structure, navigationIds, allBooks, onBack, onEdit, 
       </div>
 
       <div className="text-center mb-6">
-        <div className="inline-block w-40 h-56 rounded-lg overflow-hidden shadow-lg mb-4"
-          style={{ background: "var(--parchment)" }}>
+        <div className="inline-block rounded-lg overflow-hidden shadow-lg mb-4"
+          style={{ background: "var(--parchment)", width: "240px", height: "336px", maxWidth: "80vw" }}>
           {book.cover ? (
             <img src={book.cover} alt={book.title} className="w-full h-full object-cover" />
           ) : (
             <div className="w-full h-full flex items-center justify-center">
-              <span style={{ fontSize: "3rem" }}>{itemType?.emoji || "📖"}</span>
+              <span style={{ fontSize: "4.5rem" }}>{itemType?.emoji || "📖"}</span>
             </div>
           )}
         </div>
@@ -5871,8 +5871,8 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
             type="button"
             onClick={() => setEditingCoverFor(lastBook)}
             aria-label="Modifier la couverture (reprendre la photo)"
-            className="w-20 h-28 rounded overflow-hidden flex-shrink-0 flex items-center justify-center relative group"
-            style={{ background: "var(--parchment)", border: "1px solid var(--gold-light)" }}
+            className="rounded overflow-hidden flex-shrink-0 flex items-center justify-center relative group"
+            style={{ background: "var(--parchment)", border: "1px solid var(--gold-light)", width: "120px", height: "168px" }}
           >
             {lastBook.cover ? (
               <img src={lastBook.cover} alt="" className="w-full h-full object-cover" />
@@ -6259,13 +6259,13 @@ function DuplicateModal({ duplicateOf, structure, newLocation, onIgnore, onAddAn
             <img
               src={duplicateOf.cover}
               alt=""
-              className="w-12 h-16 object-cover rounded"
-              style={{ background: "var(--cream)" }}
+              className="object-cover rounded"
+              style={{ background: "var(--cream)", width: "72px", height: "96px" }}
             />
           ) : (
             <div
-              className="w-12 h-16 rounded flex items-center justify-center"
-              style={{ background: "var(--cream)" }}
+              className="rounded flex items-center justify-center"
+              style={{ background: "var(--cream)", width: "72px", height: "96px" }}
             >
               <BookOpen className="w-5 h-5" style={{ color: "var(--ink-soft)" }} />
             </div>
@@ -7550,15 +7550,15 @@ function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit, onQuickSca
             Étagère vide
           </div>
         ) : (
-          <div className="flex gap-1.5 items-end" style={{ minHeight: "120px" }}>
+          <div className="flex gap-1.5 items-end" style={{ minHeight: "180px" }}>
             {books.map((book) => (
               <button
                 key={book.id}
                 onClick={() => onSelectBook(book)}
                 className="flex-shrink-0 rounded overflow-hidden shadow-sm relative group"
                 style={{
-                  width: "44px",
-                  height: "110px",
+                  width: "66px",
+                  height: "165px",
                   background: book.cover ? "transparent" : `hsl(${(parseInt(book.id, 36) % 60) + 10}, 40%, 30%)`,
                 }}
                 title={`${book.title}${book.author ? ` — ${book.author}` : ""} (pos. ${book.position})`}
@@ -7576,7 +7576,7 @@ function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit, onQuickSca
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
-                      maxHeight: "100px",
+                      maxHeight: "150px",
                     }}>
                       {book.title}
                     </span>
@@ -8179,7 +8179,7 @@ function BiblioBookCard({ book, onClick, index }) {
 
       {/* Couverture */}
       <div style={{
-        width: "52px", minWidth: "52px", height: "72px",
+        width: "78px", minWidth: "78px", height: "108px",
         borderRadius: "4px", overflow: "hidden",
         background: light || "var(--parchment)",
         display: "flex", alignItems: "center", justifyContent: "center",
@@ -8188,7 +8188,7 @@ function BiblioBookCard({ book, onClick, index }) {
       }}>
         {book.cover
           ? <img src={book.cover} alt={book.title} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
-          : <span style={{ fontSize: "22px" }}>{itemType?.emoji || "📚"}</span>
+          : <span style={{ fontSize: "33px" }}>{itemType?.emoji || "📚"}</span>
         }
       </div>
 
@@ -8231,7 +8231,7 @@ function BiblioBookCard({ book, onClick, index }) {
 
 // ── Composant principal ───────────────────────────────────────
 // ── Vue étagère bois ─────────────────────────────────────────
-function BookOnShelf({ book, height = 110, onClick }) {
+function BookOnShelf({ book, height = 165, onClick }) {
   const genre = (book.genre || [])[0] || "À classer";
   const { bg, text } = getGenreColor(genre);
 
@@ -8267,7 +8267,7 @@ function BookOnShelf({ book, height = 110, onClick }) {
       onClick={onClick}
       title={`${book.title || ""}${book.author ? " — " + book.author : ""}`}
       style={{
-        width: "28px", minWidth: "28px", height: `${height}px`,
+        width: "42px", minWidth: "42px", height: `${height}px`,
         background: bg, borderRadius: "2px 4px 4px 2px",
         cursor: "pointer", display: "flex", flexDirection: "column",
         alignItems: "center", justifyContent: "center", padding: "4px 2px",
@@ -8294,7 +8294,7 @@ function BookOnShelf({ book, height = 110, onClick }) {
 }
 
 function WoodShelf({ books, onSelectBook }) {
-  const SHELF_H = 110;
+  const SHELF_H = 165;
   return (
     <div style={{ position: "relative", marginBottom: "14px" }}>
       {/* Ombre du dessus */}
