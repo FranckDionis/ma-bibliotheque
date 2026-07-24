@@ -3661,51 +3661,64 @@ function ImageCropper({ src, onCancel, onCrop }) {
 
   const endDrag = () => { dragRef.current = null; };
 
+  // Recadrage robuste : on GARANTIT que onCrop() est toujours appelé une fois
+  // (donc que la fiche est marquée modifiée et que « Enregistrer » s'active),
+  // même si le chargement de l'image échoue ou traîne. Pas de seconde étape de
+  // compression asynchrone (source des blocages « ça marche 2 fois puis plus »):
+  // le canvas produit directement un JPEG déjà redimensionné.
   const doCrop = async () => {
+    if (busy) return;
     setBusy(true);
+    // finish() est le SEUL chemin de sortie : setBusy(false) + onCrop() garantis.
+    let done = false;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      setBusy(false);
+      onCrop(val);
+    };
     try {
-      // Si le cadre n'a pas encore été initialisé (image très vite en cache),
-      // on se rabat sur l'image entière plutôt que de ne rien faire.
+      // Cadre courant (repli sur l'image entière s'il n'est pas encore prêt).
       const el = imgRef.current;
-      let curDisp = disp.w && disp.h ? disp : null;
-      if (!curDisp && el) curDisp = { w: el.clientWidth, h: el.clientHeight };
-      let curRect = rect;
-      if ((!curRect || !curDisp) && el) {
-        curDisp = curDisp || { w: el.clientWidth, h: el.clientHeight };
-        curRect = { x: 0, y: 0, w: curDisp.w, h: curDisp.h };
-      }
-      if (!curRect || !curDisp) { setBusy(false); return; }
+      let curDisp = disp.w && disp.h ? disp : (el ? { w: el.clientWidth, h: el.clientHeight } : null);
+      let curRect = rect || (curDisp ? { x: 0, y: 0, w: curDisp.w, h: curDisp.h } : null);
+      if (!curRect || !curDisp) { finish(src); return; }
 
+      // Chargement de l'image avec timeout (8 s) pour ne JAMAIS rester bloqué.
       const image = await new Promise((res, rej) => {
         const im = new Image();
-        // crossOrigin pour pouvoir lire les pixels d'une couverture distante
-        // servie avec CORS (openlibrary, Google, Wikimedia…). Sans effet sur
-        // les data URLs (photos prises dans l'appli).
         if (/^https?:\/\//i.test(src)) im.crossOrigin = "anonymous";
-        im.onload = () => res(im);
-        im.onerror = rej;
+        const t = setTimeout(() => rej(new Error("timeout")), 8000);
+        im.onload = () => { clearTimeout(t); res(im); };
+        im.onerror = () => { clearTimeout(t); rej(new Error("load")); };
         im.src = src;
       });
+
       const scaleX = image.naturalWidth / (curDisp.w || 1);
       const scaleY = image.naturalHeight / (curDisp.h || 1);
       const sx = Math.max(0, Math.round(curRect.x * scaleX));
       const sy = Math.max(0, Math.round(curRect.y * scaleY));
-      const sw = Math.round(curRect.w * scaleX);
-      const sh = Math.round(curRect.h * scaleY);
+      const sw = Math.max(1, Math.round(curRect.w * scaleX));
+      const sh = Math.max(1, Math.round(curRect.h * scaleY));
+
+      // Redimensionnement direct dans le canvas (cap 1000 px de large) → un seul
+      // encodage, pas de rechargement d'image supplémentaire.
+      const MAXW = 1000;
+      let outW = sw, outH = sh;
+      if (outW > MAXW) { outH = Math.max(1, Math.round(outH * (MAXW / outW))); outW = MAXW; }
+
       const canvas = document.createElement("canvas");
-      canvas.width = sw;
-      canvas.height = sh;
+      canvas.width = outW;
+      canvas.height = outH;
       const ctx = canvas.getContext("2d");
-      ctx.drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh);
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-      const compressed = await compressImageDataUrl(dataUrl);
-      onCrop(compressed);
+      ctx.drawImage(image, sx, sy, sw, sh, 0, 0, outW, outH);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+      finish(dataUrl);
     } catch (err) {
-      // Repli : on renvoie l'image d'origine compressée
-      const compressed = await compressImageDataUrl(src);
-      onCrop(compressed);
-    } finally {
-      setBusy(false);
+      // CORS non autorisé, timeout, etc. : on renvoie l'image d'origine pour ne
+      // pas bloquer le flux (le recadrage n'est alors pas appliqué, mais la
+      // fiche reste enregistrable).
+      finish(src);
     }
   };
 
