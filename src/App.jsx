@@ -3838,6 +3838,11 @@ const BookForm = forwardRef(function BookForm(
   // Image en cours de recadrage (import d'un fichier OU « Recadrer » sur la
   // couverture existante). Null = pas de recadrage en cours.
   const [cropSrc, setCropSrc] = useState(null);
+  // Marqueur explicite : toute action sur la couverture (recadrage, import,
+  // suppression) doit compter comme une modification, même si la comparaison
+  // de chaînes ne « voit » pas la différence. Évite de perdre un recadrage
+  // seul faute d'avoir déclenché l'état « modifié ».
+  const [coverTouched, setCoverTouched] = useState(false);
   const initialBib = initial.bibliotheque || structure.bibliotheques[0]?.id || "";
   const initialEtagere = initial.etagere || "1";
   const [bibliotheque, setBibliotheque] = useState(initialBib);
@@ -3973,6 +3978,7 @@ const BookForm = forwardRef(function BookForm(
   // chose a changé. Permet à EditView de demander une confirmation avant
   // de quitter (bouton retour, précédent, suivant) sans avoir enregistré.
   const isDirty = (
+    coverTouched ||
     type !== (initial.type || "livre") ||
     title !== (initial.title || "") ||
     author !== (initial.author || "") ||
@@ -4018,7 +4024,7 @@ const BookForm = forwardRef(function BookForm(
         <ImageCropper
           src={cropSrc}
           onCancel={() => setCropSrc(null)}
-          onCrop={(dataUrl) => { setCover(dataUrl); setCropSrc(null); }}
+          onCrop={(dataUrl) => { setCover(dataUrl); setCoverTouched(true); setCropSrc(null); }}
         />
       )}
       <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)" }}>
@@ -4055,7 +4061,7 @@ const BookForm = forwardRef(function BookForm(
           {cover && (
             <button
               type="button"
-              onClick={() => setCover("")}
+              onClick={() => { setCover(""); setCoverTouched(true); }}
               className="w-full py-2 px-3 rounded-lg border-2 text-xs text-center"
               style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
             >
