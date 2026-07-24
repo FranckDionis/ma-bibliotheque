@@ -3608,6 +3608,19 @@ function ImageCropper({ src, onCancel, onCrop }) {
     setRect({ x: 0, y: Math.round((h - ch) / 2), w, h: ch });
   };
 
+  // ⚠️ Correctif « couverture déjà présente » : une image en cache est souvent
+  // déjà `complete` au montage, donc l'événement onLoad ne se déclenche jamais
+  // et le cadre de recadrage n'était jamais initialisé (→ « Valider » sans
+  // effet, on ne pouvait qu'annuler). On initialise donc aussi au montage si
+  // l'image est déjà chargée. Un petit rAF laisse le layout se stabiliser.
+  useEffect(() => {
+    const el = imgRef.current;
+    if (el && el.complete && el.naturalWidth) {
+      requestAnimationFrame(() => initRect());
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [src]);
+
   useEffect(() => {
     const onResize = () => initRect();
     window.addEventListener("resize", onResize);
@@ -3649,21 +3662,36 @@ function ImageCropper({ src, onCancel, onCrop }) {
   const endDrag = () => { dragRef.current = null; };
 
   const doCrop = async () => {
-    if (!rect) return;
     setBusy(true);
     try {
+      // Si le cadre n'a pas encore été initialisé (image très vite en cache),
+      // on se rabat sur l'image entière plutôt que de ne rien faire.
+      const el = imgRef.current;
+      let curDisp = disp.w && disp.h ? disp : null;
+      if (!curDisp && el) curDisp = { w: el.clientWidth, h: el.clientHeight };
+      let curRect = rect;
+      if ((!curRect || !curDisp) && el) {
+        curDisp = curDisp || { w: el.clientWidth, h: el.clientHeight };
+        curRect = { x: 0, y: 0, w: curDisp.w, h: curDisp.h };
+      }
+      if (!curRect || !curDisp) { setBusy(false); return; }
+
       const image = await new Promise((res, rej) => {
         const im = new Image();
+        // crossOrigin pour pouvoir lire les pixels d'une couverture distante
+        // servie avec CORS (openlibrary, Google, Wikimedia…). Sans effet sur
+        // les data URLs (photos prises dans l'appli).
+        if (/^https?:\/\//i.test(src)) im.crossOrigin = "anonymous";
         im.onload = () => res(im);
         im.onerror = rej;
         im.src = src;
       });
-      const scaleX = image.naturalWidth / (disp.w || 1);
-      const scaleY = image.naturalHeight / (disp.h || 1);
-      const sx = Math.max(0, Math.round(rect.x * scaleX));
-      const sy = Math.max(0, Math.round(rect.y * scaleY));
-      const sw = Math.round(rect.w * scaleX);
-      const sh = Math.round(rect.h * scaleY);
+      const scaleX = image.naturalWidth / (curDisp.w || 1);
+      const scaleY = image.naturalHeight / (curDisp.h || 1);
+      const sx = Math.max(0, Math.round(curRect.x * scaleX));
+      const sy = Math.max(0, Math.round(curRect.y * scaleY));
+      const sw = Math.round(curRect.w * scaleX);
+      const sh = Math.round(curRect.h * scaleY);
       const canvas = document.createElement("canvas");
       canvas.width = sw;
       canvas.height = sh;
