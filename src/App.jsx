@@ -1556,11 +1556,34 @@ export default function App() {
     }
   };
 
+  // Garde le cache IndexedDB des couvertures aligné avec ce qu'on enregistre,
+  // pour tout `updates` contenant la clé `cover`. Non bloquant.
+  const syncCoverCache = (id, updates) => {
+    if (!id || !updates || !Object.prototype.hasOwnProperty.call(updates, "cover")) return;
+    if (updates.cover) {
+      setCachedCovers({ [id]: updates.cover }).catch(() => {});
+    } else {
+      deleteCachedCover(id).catch(() => {});
+    }
+  };
+
   const updateBook = async (id, updates) => {
     if (isCloudMode) {
       try {
         const updated = await updateBookRemote(id, updates);
-        setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, ...updated } : b)));
+        // On force la nouvelle couverture dans le state local même si le retour
+        // serveur ne renvoie pas la colonne `cover` (allégée au chargement).
+        const localPatch = { ...updated };
+        if (Object.prototype.hasOwnProperty.call(updates, "cover")) {
+          localPatch.cover = updates.cover;
+        }
+        setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, ...localPatch } : b)));
+        // ⚠️ Synchronise le CACHE LOCAL de couvertures. Au démarrage, les
+        // couvertures sont lues depuis ce cache IndexedDB et le serveur n'est
+        // PAS re-sollicité pour un id déjà en cache. Sans cette synchro, une
+        // couverture recadrée/enregistrée réapparaît à l'ancienne après un
+        // redémarrage (le cache masque la version en base).
+        syncCoverCache(id, updates);
         showToast("Livre mis à jour");
       } catch (e) {
         showToast(`Erreur : ${e.message}`, "error");
@@ -1571,6 +1594,7 @@ export default function App() {
         window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
         return next;
       });
+      syncCoverCache(id, updates);
       showToast("Livre mis à jour");
     }
   };
@@ -1635,6 +1659,7 @@ export default function App() {
       try {
         await updateBookRemote(id, updates);
         setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, ...updates } : b)));
+        syncCoverCache(id, updates);
       } catch (e) { /* ignore */ }
     } else {
       setBooks((prev) => {
@@ -1642,6 +1667,7 @@ export default function App() {
         window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
         return next;
       });
+      syncCoverCache(id, updates);
     }
   };
 
