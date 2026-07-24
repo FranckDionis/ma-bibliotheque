@@ -4009,7 +4009,10 @@ const BookForm = forwardRef(function BookForm(
   };
 
   const submit = () => {
-    if (!title.trim()) return;
+    // Un titre reste requis à la CRÉATION, mais pas pour ré-enregistrer une
+    // fiche EXISTANTE (ex. jeu scanné sans titre reconnu dont on veut juste
+    // sauver la couverture recadrée). Sinon l'enregistrement resterait bloqué.
+    if (!title.trim() && isCreation) return;
     onSubmit({
       type,
       title: title.trim(),
@@ -4087,7 +4090,9 @@ const BookForm = forwardRef(function BookForm(
   useImperativeHandle(externalRef, () => ({
     submit,
     isDirty: () => isDirty,
-    canSubmit: () => !!title.trim(),
+    // Enregistrable si un titre est saisi, OU s'il s'agit d'une fiche déjà
+    // existante (édition) — on n'exige un titre qu'à la création.
+    canSubmit: () => !!title.trim() || !isCreation,
   }), [submit, isDirty, title]);
 
   return (
