@@ -29,6 +29,73 @@ import {
   getCachedCoverIds,
 } from "./coverCache";
 
+// ============================================================
+// COUVERTURE ADAPTATIVE (portrait livre / paysage jeu)
+// ============================================================
+// Les livres ont des jaquettes portrait ; les boîtes de jeux sont en paysage.
+// Ce composant mesure le ratio réel de l'image une fois chargée et choisit :
+//   • portrait / carré → object-cover  (remplit le cadre — comportement livre)
+//   • paysage          → object-contain (affiche TOUTE la boîte, sans rogner)
+// Si `adaptFrame` est vrai, le cadre lui-même bascule en paysage
+// (classe `landscapeFrameClass`) pour donner toute sa place au visuel du jeu.
+// Variante « image seule » : à utiliser dans les cadres/boutons existants qui
+// ont déjà leur propre wrapper (ou une surimpression). Choisit object-contain
+// pour un visuel paysage (pas de rognage) et object-cover sinon.
+function SmartImg({ src, alt = "", className = "", style }) {
+  const [fit, setFit] = useState("object-cover");
+  const onLoad = (e) => {
+    const w = e.currentTarget.naturalWidth;
+    const h = e.currentTarget.naturalHeight;
+    if (w && h) setFit(w > h * 1.1 ? "object-contain" : "object-cover");
+  };
+  return (
+    <img src={src} alt={alt} onLoad={onLoad} className={`${className} ${fit}`} style={style} />
+  );
+}
+
+function SmartCover({
+  src,
+  alt = "",
+  frameClass = "",
+  landscapeFrameClass = "",
+  frameStyle,
+  fallback = null,
+  adaptFrame = false,
+}) {
+  const [orientation, setOrientation] = useState("unknown");
+  const isLandscape = orientation === "landscape";
+  const handleLoad = (e) => {
+    const img = e.currentTarget;
+    const w = img.naturalWidth;
+    const h = img.naturalHeight;
+    if (w && h) setOrientation(w > h * 1.1 ? "landscape" : "portrait");
+  };
+  // Cadre : on bascule en paysage seulement si demandé ET image paysage.
+  const frame =
+    adaptFrame && isLandscape && landscapeFrameClass
+      ? landscapeFrameClass
+      : frameClass;
+  // object-contain en paysage pour ne rien rogner ; object-cover sinon.
+  const fit = isLandscape ? "object-contain" : "object-cover";
+  return (
+    <div
+      className={`overflow-hidden flex items-center justify-center ${frame}`}
+      style={frameStyle}
+    >
+      {src ? (
+        <img
+          src={src}
+          alt={alt}
+          onLoad={handleLoad}
+          className={`w-full h-full ${fit}`}
+        />
+      ) : (
+        fallback
+      )}
+    </div>
+  );
+}
+
 // === ADAPTATEUR DE STOCKAGE ===
 // Utilise localStorage du navigateur (les données restent sur l'iPhone, dans le navigateur).
 if (typeof window !== "undefined" && !window.storage) {
@@ -587,10 +654,17 @@ async function lookupUPCitemdb(code) {
     let title = String(item.title || "").trim();
     title = title.replace(/\s*\((?:ASIN[:\s]*)?B0[A-Z0-9]{8,9}\)\s*$/i, "").trim();
     if (!title) return null;
-    // Première image http(s) valide comme couverture (on force https).
+    // Première VRAIE image http(s) comme couverture (on force https et on
+    // écarte les placeholders — « no_image.gif » d'Alibris, .tif de Macy's, etc.
+    // qui salissaient les jaquettes récupérées).
     const cover = (item.images || [])
       .map((u) => (u || "").replace(/^http:\/\//i, "https://"))
-      .find((u) => /^https:\/\//i.test(u)) || "";
+      .find(
+        (u) =>
+          /^https:\/\//i.test(u) &&
+          !/no[_-]?image|placeholder|spacer|blank|default/i.test(u) &&
+          !/\.(tif|tiff|gif)(\?|$)/i.test(u)
+      ) || "";
     return {
       title,
       author: "",
@@ -606,11 +680,55 @@ async function lookupUPCitemdb(code) {
   }
 }
 
-// BoardGameGeek — référence absolue pour les jeux de société.
-// L'API BGG ne supporte pas la recherche par EAN directement, mais elle a une
-// API de recherche par nom. Pour l'instant on l'expose pour usage futur (la
-// recherche par EAN passe par Open Food Facts qui renvoie le nom, ensuite on
-// peut enrichir avec BGG si l'on veut). À ce stade on s'en tient à OFF.
+// BoardGameGeek — référence absolue pour les jeux de société, et surtout LA
+// meilleure source d'art de boîte (visuels paysage, haute qualité).
+// L'API BGG (XML) ne fait pas de recherche par EAN : on cherche par NOM (le
+// titre déjà obtenu via KNOWN_GAMES / Open Food Facts / UPCitemdb), on prend le
+// 1er résultat « boardgame », puis on lit sa <image>.
+//
+// ⚠️ CORS : l'API BGG n'envoie pas d'en-tête Access-Control-Allow-Origin, donc
+// un fetch direct depuis le navigateur est bloqué. On passe par un proxy CORS.
+// Par défaut on utilise allorigins (public, gratuit) pour que ça marche tout de
+// suite, mais en production il vaut MIEUX router via ton propre backend (celui
+// qui sert déjà les livres) pour la fiabilité. Mets "" pour désactiver BGG.
+const BGG_COVER_PROXY = "https://api.allorigins.win/raw?url=";
+
+// Récupère une jaquette (art de boîte) sur BoardGameGeek à partir d'un titre.
+// Ne s'applique qu'aux jeux. Renvoie une URL d'image ou "" en cas d'échec.
+async function lookupBGGCover(title, type) {
+  const name = (title || "").trim();
+  if (!name) return "";
+  if (type !== "jeu-societe" && type !== "jeu-switch") return "";
+  if (!BGG_COVER_PROXY && typeof BGG_COVER_PROXY !== "string") return "";
+  const wrap = (u) => (BGG_COVER_PROXY ? BGG_COVER_PROXY + encodeURIComponent(u) : u);
+  try {
+    // 1) Recherche par nom (type boardgame)
+    const sRes = await fetchWithTimeout(
+      wrap(`https://boardgamegeek.com/xmlapi2/search?type=boardgame&query=${encodeURIComponent(name)}`),
+      7000
+    );
+    if (!sRes.ok) return "";
+    const sXml = await sRes.text();
+    const idMatch = sXml.match(/<item\b[^>]*\bid="(\d+)"/i);
+    if (!idMatch) return "";
+    const id = idMatch[1];
+    // 2) Fiche détaillée → <image> (grande) ou <thumbnail> à défaut
+    const tRes = await fetchWithTimeout(
+      wrap(`https://boardgamegeek.com/xmlapi2/thing?id=${id}`),
+      7000
+    );
+    if (!tRes.ok) return "";
+    const tXml = await tRes.text();
+    const imgMatch =
+      tXml.match(/<image>([^<]+)<\/image>/i) ||
+      tXml.match(/<thumbnail>([^<]+)<\/thumbnail>/i);
+    let img = imgMatch ? imgMatch[1].trim() : "";
+    if (img.startsWith("//")) img = "https:" + img;
+    return /^https?:\/\//i.test(img) ? img : "";
+  } catch (e) {
+    return "";
+  }
+}
 
 // Stratégie pour les jeux Switch en UPC-A (12 chiffres) :
 // On préfixe d'un 0 pour obtenir un EAN-13 valide, ce qui maximise les chances
@@ -752,7 +870,7 @@ async function lookupAnyBarcode(code, type) {
     pick(off?.publisher, upc?.publisher, wikidata?.publisher, google?.publisher);
 
   // Couverture : OFF > UPCitemdb > Wikidata > Google
-  const cover = pick(off?.cover, upc?.cover, wikidata?.cover, google?.cover);
+  let cover = pick(off?.cover, upc?.cover, wikidata?.cover, google?.cover);
 
   // Source affichée
   let source = null;
@@ -763,6 +881,19 @@ async function lookupAnyBarcode(code, type) {
   else if (wikidata) source = "Wikidata";
   else if (google) source = "Google Books";
   else if (pressPub) source = "Préfixe éditeur";
+
+  // Dernier recours JAQUETTE pour les jeux : si aucune source n'a fourni de
+  // visuel mais qu'on a un titre, on tente l'art de boîte (paysage) de BGG.
+  if (!cover && title && (type === "jeu-societe" || type === "jeu-switch")) {
+    const bggCover = await lookupBGGCover(title, type).catch(() => "");
+    if (bggCover) {
+      cover = bggCover;
+      debug.bgg = "OK (art de boîte)";
+      if (!source || source === "Préfixe éditeur") source = "BoardGameGeek";
+    } else {
+      debug.bgg = "rien";
+    }
+  }
 
   if (!title && !cover) {
     return { title: "", author: "", cover: "", source: null, debug };
@@ -2763,14 +2894,13 @@ function BookCard({ book, structure, onClick, index }) {
       >
         {itemType?.emoji}
       </div>
-      <div className="w-16 h-24 flex-shrink-0 rounded overflow-hidden flex items-center justify-center"
-        style={{ background: "var(--parchment)" }}>
-        {book.cover ? (
-          <img src={book.cover} alt={book.title} className="w-full h-full object-cover" />
-        ) : (
-          <span style={{ fontSize: "2rem" }}>{itemType?.emoji || "📖"}</span>
-        )}
-      </div>
+      <SmartCover
+        src={book.cover}
+        alt={book.title}
+        frameClass="w-16 h-24 flex-shrink-0 rounded"
+        frameStyle={{ background: "var(--parchment)" }}
+        fallback={<span style={{ fontSize: "2rem" }}>{itemType?.emoji || "📖"}</span>}
+      />
       <div className="flex-1 min-w-0 pr-6">
         <h3 className="font-semibold leading-tight mb-1 line-clamp-2"
           style={{ fontFamily: "var(--font-display)", color: "var(--ink)", fontSize: "1rem" }}>
@@ -3639,14 +3769,15 @@ const BookForm = forwardRef(function BookForm(
 
       {/* Couverture — agrandie en mode édition pour faciliter la vérification visuelle */}
       <div className="flex gap-3 items-start">
-        <div className="w-32 h-44 rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0 shadow-md"
-          style={{ background: "var(--parchment)" }}>
-          {cover ? (
-            <img src={cover} alt="" className="w-full h-full object-cover" />
-          ) : (
-            <BookOpen className="w-10 h-10" style={{ color: "var(--leather)" }} />
-          )}
-        </div>
+        <SmartCover
+          src={cover}
+          alt=""
+          adaptFrame
+          frameClass="w-32 h-44 rounded-lg flex-shrink-0 shadow-md"
+          landscapeFrameClass="w-52 h-36 rounded-lg flex-shrink-0 shadow-md"
+          frameStyle={{ background: "var(--parchment)" }}
+          fallback={<BookOpen className="w-10 h-10" style={{ color: "var(--leather)" }} />}
+        />
         <div className="flex-1 space-y-1.5">
           <label className="block py-2 px-3 rounded-lg border-2 text-sm text-center cursor-pointer"
             style={{ borderColor: "var(--parchment)", color: "var(--leather)" }}>
@@ -4301,16 +4432,15 @@ function DetailView({ book, structure, navigationIds, allBooks, onBack, onEdit, 
       </div>
 
       <div className="text-center mb-6">
-        <div className="inline-block w-40 h-56 rounded-lg overflow-hidden shadow-lg mb-4"
-          style={{ background: "var(--parchment)" }}>
-          {book.cover ? (
-            <img src={book.cover} alt={book.title} className="w-full h-full object-cover" />
-          ) : (
-            <div className="w-full h-full flex items-center justify-center">
-              <span style={{ fontSize: "3rem" }}>{itemType?.emoji || "📖"}</span>
-            </div>
-          )}
-        </div>
+        <SmartCover
+          src={book.cover}
+          alt={book.title}
+          adaptFrame
+          frameClass="inline-flex w-40 h-56 rounded-lg shadow-lg mb-4"
+          landscapeFrameClass="inline-flex w-64 h-44 rounded-lg shadow-lg mb-4"
+          frameStyle={{ background: "var(--parchment)" }}
+          fallback={<span style={{ fontSize: "3rem" }}>{itemType?.emoji || "📖"}</span>}
+        />
 
         {/* Badge type pour les non-livres */}
         {book.type && book.type !== "livre" && (
@@ -5733,7 +5863,7 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
             style={{ background: "var(--parchment)", border: "1px solid var(--gold-light)" }}
           >
             {lastBook.cover ? (
-              <img src={lastBook.cover} alt="" className="w-full h-full object-cover" />
+              <SmartImg src={lastBook.cover} alt="" className="w-full h-full" />
             ) : (
               <BookOpen className="w-6 h-6" style={{ color: "var(--leather)" }} />
             )}
@@ -6114,10 +6244,10 @@ function DuplicateModal({ duplicateOf, structure, newLocation, onIgnore, onAddAn
         {/* Aperçu du livre déjà existant */}
         <div className="flex gap-3 mb-4 p-2 rounded-lg" style={{ background: "var(--parchment)" }}>
           {duplicateOf.cover ? (
-            <img
+            <SmartImg
               src={duplicateOf.cover}
               alt=""
-              className="w-12 h-16 object-cover rounded"
+              className="w-12 h-16 rounded"
               style={{ background: "var(--cream)" }}
             />
           ) : (
@@ -7421,7 +7551,7 @@ function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit, onQuickSca
                 title={`${book.title}${book.author ? ` — ${book.author}` : ""} (pos. ${book.position})`}
               >
                 {book.cover ? (
-                  <img src={book.cover} alt={book.title} className="w-full h-full object-cover" />
+                  <SmartImg src={book.cover} alt={book.title} className="w-full h-full" />
                 ) : (
                   <div className="w-full h-full flex flex-col items-center justify-end p-1 text-center"
                     style={{ color: "var(--cream)" }}>
