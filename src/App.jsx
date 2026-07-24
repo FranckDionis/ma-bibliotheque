@@ -561,6 +561,51 @@ async function lookupOpenFoodFacts(code) {
   }
 }
 
+// UPCitemdb — base communautaire couvrant des dizaines de millions d'UPC/EAN,
+// avec une très bonne couverture des jeux de société (Ravensburger, Asmodee,
+// Cocktail Games, Hasbro…) et des visuels marchands de bonne qualité, là où
+// Open Food Facts ne remonte souvent rien pour une boîte de jeu.
+// Endpoint « trial » : gratuit, sans clé, CORS ouvert. Limité à ~100 requêtes/
+// jour par IP — suffisant pour un usage de scan ponctuel. En cas de dépassement
+// l'API renvoie { code: "TOO_MANY_REQUESTS" | "TOO_FAST" } et on retombe sur null.
+async function lookupUPCitemdb(code) {
+  const clean = (code || "").replace(/\D/g, "");
+  if (!clean) return null;
+  try {
+    const res = await fetchWithTimeout(
+      `https://api.upcitemdb.com/prod/trial/lookup?upc=${clean}`,
+      6000
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.code !== "OK" || !Array.isArray(data.items) || !data.items.length) {
+      return null;
+    }
+    const item = data.items[0];
+    // Nettoyage du titre : les fiches UPCitemdb reprennent souvent le libellé
+    // Amazon, verbeux et suffixé d'un ASIN entre parenthèses « (B07GVVCRFV) ».
+    let title = String(item.title || "").trim();
+    title = title.replace(/\s*\((?:ASIN[:\s]*)?B0[A-Z0-9]{8,9}\)\s*$/i, "").trim();
+    if (!title) return null;
+    // Première image http(s) valide comme couverture (on force https).
+    const cover = (item.images || [])
+      .map((u) => (u || "").replace(/^http:\/\//i, "https://"))
+      .find((u) => /^https:\/\//i.test(u)) || "";
+    return {
+      title,
+      author: "",
+      cover,
+      publisher: item.brand || "",
+      year: "",
+      description: item.description || "",
+      category: item.category || "",
+      source: "UPCitemdb",
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 // BoardGameGeek — référence absolue pour les jeux de société.
 // L'API BGG ne supporte pas la recherche par EAN directement, mais elle a une
 // API de recherche par nom. Pour l'instant on l'expose pour usage futur (la
@@ -635,8 +680,8 @@ async function lookupWikidata(code) {
 // Recherche unifiée selon le type d'objet détecté.
 // - livre / inconnu  → Google Books + Open Library + BnF (cascade existante)
 // - revue            → reconnaissance par préfixe (déjà fait côté UI) + Open Food Facts en complément
-// - jeu-switch       → KNOWN_GAMES → Open Food Facts → Wikidata (UPC normalisé)
-// - jeu-societe      → KNOWN_GAMES → Open Food Facts → Wikidata
+// - jeu-switch       → KNOWN_GAMES → Open Food Facts → UPCitemdb → Wikidata (UPC normalisé)
+// - jeu-societe      → KNOWN_GAMES → Open Food Facts → UPCitemdb → Wikidata
 // Renvoie { title, author, cover, publisher, year, description, source, debug, _type? }
 async function lookupAnyBarcode(code, type) {
   // ⚠️ On retire d'abord un éventuel suffixe `#N` (utilisé pour distinguer
@@ -662,13 +707,16 @@ async function lookupAnyBarcode(code, type) {
 
   // === LOOKUP RÉSEAU EN PARALLÈLE ===
   const eanForOFF = upcToEan(clean);
-  const [off, google, wikidata] = await Promise.all([
+  const [off, google, wikidata, upc] = await Promise.all([
     lookupOpenFoodFacts(eanForOFF).catch(() => null),
     // Google Books peut parfois remonter une fiche pour un produit non-livre
     // (rare mais utile en secours pour le titre). On le met en parallèle.
     lookupGoogleBooks(clean).catch(() => null),
     // Wikidata couvre bien les jeux Switch et certains jeux de société
     lookupWikidata(clean).catch(() => null),
+    // UPCitemdb : forte couverture des boîtes de jeux + visuels marchands.
+    // On lui passe le code brut ; l'API accepte aussi bien l'UPC-A que l'EAN-13.
+    lookupUPCitemdb(clean).catch(() => null),
   ]);
 
   const debug = {
@@ -676,6 +724,7 @@ async function lookupAnyBarcode(code, type) {
     knownMag: knownMag ? `OK (${knownMag.title})` : "rien",
     pressPub: pressPub ? `OK (${pressPub.publisher})` : "rien",
     openFoodFacts: off ? `OK (${off.title?.slice(0, 40)})` : "rien",
+    upcitemdb: upc ? `OK (${upc.title?.slice(0, 40)})` : "rien",
     google: google ? `OK (${google.title?.slice(0, 40)})` : "rien",
     wikidata: wikidata ? `OK (${wikidata.title?.slice(0, 40)})` : "rien",
   };
@@ -684,31 +733,33 @@ async function lookupAnyBarcode(code, type) {
   // Priorité titre :
   //   1. KNOWN_GAMES / KNOWN_MAGAZINES — déterministe et fiable
   //   2. Open Food Facts — bon pour produits indexés
-  //   3. Wikidata — bon pour jeux/œuvres notables
-  //   4. Google Books — secours
-  //   5. À défaut : "Revue Bayard…" si on a reconnu l'éditeur de presse
+  //   3. UPCitemdb — forte couverture des boîtes de jeux
+  //   4. Wikidata — bon pour jeux/œuvres notables
+  //   5. Google Books — secours
+  //   6. À défaut : "Revue Bayard…" si on a reconnu l'éditeur de presse
   const pick = (...vals) => vals.find((v) => v !== undefined && v !== null && v !== "") ?? "";
 
   const title =
     knownGame?.title ||
     knownMag?.title ||
-    pick(off?.title, wikidata?.title, google?.title) ||
+    pick(off?.title, upc?.title, wikidata?.title, google?.title) ||
     (pressPub ? `Revue ${pressPub.publisher}` : "");
 
   const publisher =
     knownGame?.publisher ||
     knownMag?.publisher ||
     pressPub?.publisher ||
-    pick(off?.publisher, wikidata?.publisher, google?.publisher);
+    pick(off?.publisher, upc?.publisher, wikidata?.publisher, google?.publisher);
 
-  // Couverture : OFF > Wikidata > Google
-  const cover = pick(off?.cover, wikidata?.cover, google?.cover);
+  // Couverture : OFF > UPCitemdb > Wikidata > Google
+  const cover = pick(off?.cover, upc?.cover, wikidata?.cover, google?.cover);
 
   // Source affichée
   let source = null;
   if (knownGame) source = "Base interne (jeux)";
   else if (knownMag) source = "Base interne (revues)";
   else if (off) source = "Open Food Facts";
+  else if (upc) source = "UPCitemdb";
   else if (wikidata) source = "Wikidata";
   else if (google) source = "Google Books";
   else if (pressPub) source = "Préfixe éditeur";
@@ -724,7 +775,7 @@ async function lookupAnyBarcode(code, type) {
     subtitle: "",
     publisher,
     year: pick(google?.year, wikidata?.year, ""),
-    description: pick(off?.description, google?.description, ""),
+    description: pick(off?.description, upc?.description, google?.description, ""),
     categories: "",
     pages: 0,
     language: "",
@@ -1484,42 +1535,11 @@ export default function App() {
     }
   };
 
-  // === RECHERCHE SOUPLE ===
-  // Normalisation : minuscules, accents supprimés (é/è/ê → e, ç → c, ï → i…),
-  // ligatures œ/æ → oe/ae, apostrophes/tirets/ponctuation → espaces.
-  // Ainsi "elephant" trouve "Éléphant" et "j aime lire" trouve "J'aime Lire".
-  const normalizeSearchText = (str) => {
-    if (!str) return "";
-    return String(str)
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/œ/g, "oe")
-      .replace(/æ/g, "ae")
-      .replace(/[’'`"«»–—\-_.,;:!?()[\]/\\]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  };
-
-  // La requête est découpée en mots : chaque mot doit être présent quelque part
-  // dans le livre (titre, auteur, notes ou résumé), quel que soit l'ordre.
-  // Calculé une seule fois par frappe, pas pour chaque livre.
-  const searchWords = normalizeSearchText(searchQuery).split(" ").filter(Boolean);
-  // Recherche ISBN : on compare les chiffres seuls, pour tolérer les tirets/espaces.
-  const searchDigits = searchQuery.replace(/\D/g, "");
-
   const filteredBooks = books.filter((b) => {
-    let matchSearch = true;
-    if (searchWords.length > 0) {
-      const haystack = normalizeSearchText(
-        [b.title, b.author, b.notes, b.description].filter(Boolean).join(" ")
-      );
-      const matchWords = searchWords.every((w) => haystack.includes(w));
-      const matchIsbn =
-        searchDigits.length >= 4 &&
-        (b.isbn || "").replace(/\D/g, "").includes(searchDigits);
-      matchSearch = matchWords || matchIsbn;
-    }
+    const matchSearch = !searchQuery ||
+      b.title?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      b.author?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      b.isbn?.includes(searchQuery);
 
     // Filtre PIÈCE : trouve la pièce de la bibliothèque du livre
     let matchPiece = filterPiece === "all";
@@ -2286,10 +2306,10 @@ export default function App() {
         {view === "bibliotheque" && (
           <BibliothequeView
             books={books}
-            onSelectBook={(b, orderedIds) => {
+            onSelectBook={(b) => {
               setSelectedBook(b);
               setPreviousView("bibliotheque");
-              setNavigationIds(orderedIds || books.map(x => x.id));
+              setNavigationIds(books.filter(x => (x.genre || []).some(g => (b.genre || []).some(bg => g === bg))).map(x => x.id));
               setView("detail");
             }}
           />
@@ -2562,35 +2582,14 @@ function HomeView({ books, structure, filteredBooks, searchQuery, setSearchQuery
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           placeholder="Titre, auteur, ISBN…"
-          className="w-full pl-10 pr-4 py-3 rounded-xl border-2 outline-none [&::-webkit-search-cancel-button]:hidden"
+          className="w-full pl-10 pr-4 py-3 rounded-xl border-2 outline-none"
           style={{
             background: "var(--cream)",
             borderColor: "var(--parchment)",
             color: "var(--ink)",
             fontSize: "1rem",
-            // Laisse la place au compteur + bouton effacer quand une recherche est active
-            paddingRight: searchQuery ? "8rem" : undefined,
           }}
         />
-        {/* Compteur de résultats + effacement, affichés seulement pendant une recherche */}
-        {searchQuery && (
-          <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
-            <span
-              className="text-xs font-semibold px-2 py-1 rounded-full whitespace-nowrap"
-              style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
-            >
-              {filteredBooks.length} résultat{filteredBooks.length > 1 ? "s" : ""}
-            </span>
-            <button
-              onClick={() => setSearchQuery("")}
-              aria-label="Effacer la recherche"
-              className="p-1.5 rounded-full"
-              style={{ color: "var(--leather)" }}
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        )}
       </div>
 
       {/* === LIGNE 1 : FILTRE PAR TYPE D'OBJET (+ "Sans titre") === */}
@@ -2764,12 +2763,12 @@ function BookCard({ book, structure, onClick, index }) {
       >
         {itemType?.emoji}
       </div>
-      <div className="w-24 h-36 flex-shrink-0 rounded overflow-hidden flex items-center justify-center"
+      <div className="w-16 h-24 flex-shrink-0 rounded overflow-hidden flex items-center justify-center"
         style={{ background: "var(--parchment)" }}>
         {book.cover ? (
           <img src={book.cover} alt={book.title} className="w-full h-full object-cover" />
         ) : (
-          <span style={{ fontSize: "3rem" }}>{itemType?.emoji || "📖"}</span>
+          <span style={{ fontSize: "2rem" }}>{itemType?.emoji || "📖"}</span>
         )}
       </div>
       <div className="flex-1 min-w-0 pr-6">
@@ -2836,24 +2835,6 @@ function BookCard({ book, structure, onClick, index }) {
             </div>
           )}
         </div>
-        {/* Badges genre bibliothèque virtuelle */}
-        {book.genre && book.genre.length > 0 && (
-          <div className="flex flex-wrap gap-1 mt-1.5">
-            {book.genre.slice(0, 3).map((g, i) => {
-              const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
-              const label = g.includes("/") ? g.split("/")[1] : g;
-              return (
-                <span key={i} style={{
-                  fontSize: "9px", padding: "1px 6px", borderRadius: "8px",
-                  background: colors.bg, color: colors.text, fontWeight: "600",
-                  whiteSpace: "nowrap",
-                }}>
-                  {label}
-                </span>
-              );
-            })}
-          </div>
-        )}
       </div>
       <ChevronRight className="w-5 h-5 self-center flex-shrink-0" style={{ color: "var(--leather)" }} />
     </button>
@@ -3461,7 +3442,7 @@ function CoverScanner({ onCancel, onCapture }) {
 
 // === FORMULAIRE ===
 const BookForm = forwardRef(function BookForm(
-  { books, structure, initial, onCancel, onSubmit, submitLabel, bareMode = false, onDirtyChange, editLayout = false },
+  { books, structure, initial, onCancel, onSubmit, submitLabel, bareMode = false, onDirtyChange },
   externalRef
 ) {
   // Type d'objet (livre/revue/jeu-societe/jeu-switch)
@@ -3650,87 +3631,132 @@ const BookForm = forwardRef(function BookForm(
     canSubmit: () => !!title.trim(),
   }), [submit, isDirty, title]);
 
-  // === BLOC COUVERTURE (réutilisé dans les deux layouts) ===
-  const coverBlock = (
-    <div>
-      <div
-        className="rounded-lg overflow-hidden flex items-center justify-center shadow-md"
-        style={{ background: "var(--parchment)", aspectRatio: "2/3", width: "100%" }}
-      >
-        {cover ? (
-          <img src={cover} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-        ) : (
-          <BookOpen className="w-12 h-12" style={{ color: "var(--leather)" }} />
-        )}
-      </div>
-      {/* Boutons Changer / Supprimer sous la photo — en colonne pour éviter la superposition */}
-      <div style={{ display: "flex", flexDirection: "column", gap: "5px", marginTop: "8px" }}>
-        <label
-          className="py-2 px-2 rounded-lg border-2 text-xs text-center cursor-pointer flex items-center justify-center gap-1"
-          style={{ borderColor: "var(--parchment)", color: "var(--leather)" }}
-        >
-          <Camera className="w-3.5 h-3.5" /> {cover ? "Changer" : "Ajouter une photo"}
-          <input type="file" accept="image/*" onChange={handleCoverUpload} className="hidden" />
-        </label>
-        {cover && (
-          <button
-            type="button"
-            onClick={() => setCover("")}
-            className="py-2 px-2 rounded-lg border-2 text-xs flex items-center justify-center gap-1"
-            style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
-          >
-            <Trash2 className="w-3.5 h-3.5" /> Supprimer
-          </button>
-        )}
-      </div>
-      {(title || isbn) && (
-        <a
-          href={`https://www.google.com/search?tbm=isch&q=${encodeURIComponent(
-            title ? `${title} ${author || ""} couverture livre` : `ISBN ${isbn} couverture`
-          )}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="block py-2 px-2 rounded-lg text-xs text-center mt-1"
-          style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
-        >
-          <Search className="w-3.5 h-3.5 inline mr-1" /> Chercher sur Google Images
-        </a>
-      )}
-    </div>
-  );
+  return (
+    <div className="space-y-4">
+      <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)" }}>
+        Informations du livre
+      </h2>
 
-  // === CHAMPS PRINCIPAUX (titre, auteur, type, genre) ===
-  const mainFieldsBlock = (
-    <div className="space-y-3">
-      {/* Sélecteur de type */}
-      <div className="space-y-1">
-        <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>Type d'objet</label>
-        <div className="grid grid-cols-2 gap-1.5">
+      {/* Couverture — agrandie en mode édition pour faciliter la vérification visuelle */}
+      <div className="flex gap-3 items-start">
+        <div className="w-32 h-44 rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0 shadow-md"
+          style={{ background: "var(--parchment)" }}>
+          {cover ? (
+            <img src={cover} alt="" className="w-full h-full object-cover" />
+          ) : (
+            <BookOpen className="w-10 h-10" style={{ color: "var(--leather)" }} />
+          )}
+        </div>
+        <div className="flex-1 space-y-1.5">
+          <label className="block py-2 px-3 rounded-lg border-2 text-sm text-center cursor-pointer"
+            style={{ borderColor: "var(--parchment)", color: "var(--leather)" }}>
+            <Camera className="w-4 h-4 inline mr-1" /> {cover ? "Changer la couverture" : "Ajouter une photo"}
+            <input type="file" accept="image/*" onChange={handleCoverUpload} className="hidden" />
+          </label>
+          {cover && (
+            <button
+              type="button"
+              onClick={() => setCover("")}
+              className="w-full py-2 px-3 rounded-lg border-2 text-xs text-center"
+              style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
+            >
+              <Trash2 className="w-3.5 h-3.5 inline mr-1" /> Supprimer la couverture
+            </button>
+          )}
+          {(title || isbn) && (
+            <a
+              href={`https://www.google.com/search?tbm=isch&q=${encodeURIComponent(
+                title ? `${title} ${author || ""} couverture livre` : `ISBN ${isbn} couverture`
+              )}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block py-2 px-3 rounded-lg text-xs text-center"
+              style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+            >
+              <Search className="w-3.5 h-3.5 inline mr-1" /> Chercher l'image sur Google
+            </a>
+          )}
+        </div>
+      </div>
+
+      {/* Aide quand le titre n'a pas été trouvé automatiquement */}
+      {isbn && !title && (
+        <div className="rounded-lg p-3 space-y-2" style={{ background: "var(--parchment)" }}>
+          <p className="text-sm" style={{ color: "var(--ink)" }}>
+            Livre non trouvé automatiquement pour l'ISBN <strong>{isbn}</strong>.
+          </p>
+          <div className="flex gap-2 flex-wrap">
+            <a
+              href={`https://www.google.com/search?q=${encodeURIComponent(isbn)}+livre`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-3 py-2 rounded-lg text-sm font-medium inline-flex items-center gap-1.5"
+              style={{ background: "var(--leather-dark)", color: "var(--cream)" }}
+            >
+              <Search className="w-4 h-4" /> Chercher sur Google
+            </a>
+            <button
+              onClick={handleRetryLookup}
+              disabled={retrying}
+              className="px-3 py-2 rounded-lg text-sm font-medium inline-flex items-center gap-1.5 disabled:opacity-50"
+              style={{ background: "var(--leather)", color: "var(--cream)" }}
+            >
+              {retrying ? <><Loader2 className="w-4 h-4 animate-spin" /> Recherche…</> : <><RotateCcw className="w-4 h-4" /> Réessayer</>}
+            </button>
+            {debugInfo && (
+              <button
+                onClick={() => setShowDebug((v) => !v)}
+                className="px-3 py-2 rounded-lg text-sm font-medium border"
+                style={{ borderColor: "var(--leather)", color: "var(--leather-dark)" }}
+              >
+                {showDebug ? "Masquer détails" : "Détails sources"}
+              </button>
+            )}
+          </div>
+          <p className="text-xs" style={{ color: "var(--ink-soft)" }}>
+            Conseil : copiez le titre/auteur de la fiche Google et collez-les dans les champs ci-dessous.
+          </p>
+          {showDebug && debugInfo && (
+            <div className="text-xs font-mono p-2 rounded" style={{ background: "#1a1a1a", color: "#9fdc9f" }}>
+              <div>Google Books: {debugInfo.google}</div>
+              <div>Open Library: {debugInfo.openLibrary}</div>
+              <div>BnF: {debugInfo.bnf}</div>
+              <div>Couverture (toutes sources): {debugInfo.coverFallback}</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Sélecteur de type — modifiable à tout moment */}
+      <div className="space-y-1.5">
+        <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>
+          Type d'objet
+        </label>
+        <div className="grid grid-cols-2 gap-2">
           {ITEM_TYPES_LIST.map((t) => (
             <button
               key={t.id}
               type="button"
               onClick={() => {
                 setType(t.id);
+                // Pré-remplit la plateforme pour les jeux Switch
                 if (t.id === "jeu-switch" && !platform) setPlatform("Nintendo Switch");
               }}
-              className="p-1.5 rounded-lg border-2 flex items-center gap-1.5 text-left transition-all"
+              className="p-2 rounded-lg border-2 flex items-center gap-2 text-left transition-all"
               style={{
                 background: type === t.id ? t.color : "white",
                 borderColor: type === t.id ? t.color : "var(--parchment)",
                 color: type === t.id ? "var(--cream)" : "var(--ink)",
               }}
             >
-              <span style={{ fontSize: "1rem" }}>{t.emoji}</span>
+              <span style={{ fontSize: "1.1rem" }}>{t.emoji}</span>
               <span className="text-xs font-medium leading-tight">{t.label}</span>
             </button>
           ))}
         </div>
       </div>
 
-      {/* Titre */}
-      <div className="space-y-1">
-        <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>{fields.titleLabel} *</label>
+      <Field label={`${fields.titleLabel} *`}>
         <input
           value={title}
           onChange={(e) => setTitle(e.target.value)}
@@ -3740,93 +3766,155 @@ const BookForm = forwardRef(function BookForm(
             type === "jeu-switch" ? "Mario Kart 8, Zelda…" :
             "Le titre du livre"
           }
-          className="w-full p-2.5 rounded-lg border-2 outline-none text-sm"
+          className="w-full p-3 rounded-lg border-2 outline-none"
           style={{ borderColor: "var(--parchment)" }}
         />
-      </div>
+      </Field>
 
-      {/* Numéro + Date pour revues */}
+      {/* Sous-titre — uniquement pour livres */}
+      {fields.showSubtitle && type === "livre" && subtitle && (
+        <Field label="Sous-titre">
+          <input
+            value={subtitle}
+            onChange={(e) => setSubtitle(e.target.value)}
+            className="w-full p-3 rounded-lg border-2 outline-none"
+            style={{ borderColor: "var(--parchment)" }}
+          />
+        </Field>
+      )}
+
+      {/* Numéro et date — uniquement pour les revues */}
       {fields.showIssue && (
-        <div className="grid grid-cols-2 gap-2">
-          <div className="space-y-1">
-            <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>N° du numéro</label>
-            <input value={issueNumber} onChange={(e) => setIssueNumber(e.target.value)} placeholder="ex: 920"
-              className="w-full p-2.5 rounded-lg border-2 outline-none text-sm" style={{ borderColor: "var(--parchment)" }} />
-          </div>
-          <div className="space-y-1">
-            <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>Date</label>
-            <input value={issueDate} onChange={(e) => setIssueDate(e.target.value)} placeholder="Janv. 2024"
-              className="w-full p-2.5 rounded-lg border-2 outline-none text-sm" style={{ borderColor: "var(--parchment)" }} />
-          </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="N° du numéro">
+            <input
+              value={issueNumber}
+              onChange={(e) => setIssueNumber(e.target.value)}
+              placeholder="ex: 920"
+              className="w-full p-3 rounded-lg border-2 outline-none"
+              style={{ borderColor: "var(--parchment)" }}
+            />
+          </Field>
+          <Field label="Date">
+            <input
+              value={issueDate}
+              onChange={(e) => setIssueDate(e.target.value)}
+              placeholder="Janvier 2024"
+              className="w-full p-3 rounded-lg border-2 outline-none"
+              style={{ borderColor: "var(--parchment)" }}
+            />
+          </Field>
         </div>
       )}
 
-      {/* Auteur */}
+      {/* Auteur — uniquement pour livres */}
       {fields.showAuthor && (
-        <div className="space-y-1">
-          <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>Auteur</label>
-          <input value={author} onChange={(e) => setAuthor(e.target.value)} placeholder="Prénom Nom"
-            className="w-full p-2.5 rounded-lg border-2 outline-none text-sm" style={{ borderColor: "var(--parchment)" }} />
-        </div>
+        <Field label="Auteur">
+          <input
+            value={author}
+            onChange={(e) => setAuthor(e.target.value)}
+            placeholder="Prénom Nom"
+            className="w-full p-3 rounded-lg border-2 outline-none"
+            style={{ borderColor: "var(--parchment)" }}
+          />
+        </Field>
       )}
 
-      {/* Plateforme */}
+      {/* Plateforme — uniquement pour jeux Switch */}
       {fields.showPlatform && (
-        <div className="space-y-1">
-          <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>Plateforme</label>
-          <input value={platform} onChange={(e) => setPlatform(e.target.value)} placeholder="Nintendo Switch"
-            className="w-full p-2.5 rounded-lg border-2 outline-none text-sm" style={{ borderColor: "var(--parchment)" }} />
-        </div>
+        <Field label="Plateforme">
+          <input
+            value={platform}
+            onChange={(e) => setPlatform(e.target.value)}
+            placeholder="Nintendo Switch"
+            className="w-full p-3 rounded-lg border-2 outline-none"
+            style={{ borderColor: "var(--parchment)" }}
+          />
+        </Field>
       )}
 
-      {/* Catégorie bibliothèque virtuelle */}
-      <div className="space-y-1">
-        <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>📚 Catégorie bibliothèque</label>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "5px", marginBottom: genre.length > 0 ? "6px" : 0 }}>
-          {genre.map((g, i) => {
-            const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
-            const label = g.includes("/") ? g.split("/")[1] : g;
-            return (
-              <span key={i} style={{
-                display: "inline-flex", alignItems: "center", gap: "3px",
-                padding: "3px 8px", borderRadius: "10px", fontSize: "11px",
-                fontWeight: "600", background: colors.bg, color: colors.text,
-              }}>
-                {label}
-                <button onClick={() => setGenre(genre.filter((_, j) => j !== i))}
-                  style={{ background: "none", border: "none", cursor: "pointer", color: colors.text, fontSize: "13px", padding: "0", lineHeight: 1 }}>×</button>
-              </span>
-            );
-          })}
-        </div>
-        <select
-          value=""
-          onChange={e => {
-            const val = e.target.value;
-            if (val && !genre.includes(val)) setGenre([...genre, val]);
-            e.target.value = "";
-          }}
-          style={{
-            width: "100%", padding: "8px", borderRadius: "8px",
-            border: "2px solid var(--parchment)", background: "white",
-            color: genre.length === 0 ? "var(--ink-soft)" : "var(--ink)", fontSize: "12px",
-          }}
-        >
-          <option value="">+ Ajouter une catégorie…</option>
-          {Object.keys(GENRE_COLORS).filter(g => !genre.includes(g) && g !== "À classer").map(g => (
-            <option key={g} value={g}>{g}</option>
-          ))}
-        </select>
-      </div>
-    </div>
-  );
+      {/* Infos jeu — joueurs / durée / âge */}
+      {fields.showGameInfo && (
+        <>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Joueurs min">
+              <input
+                type="number"
+                value={playersMin}
+                onChange={(e) => setPlayersMin(e.target.value)}
+                placeholder="2"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+            <Field label="Joueurs max">
+              <input
+                type="number"
+                value={playersMax}
+                onChange={(e) => setPlayersMax(e.target.value)}
+                placeholder="6"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Durée (min)">
+              <input
+                type="number"
+                value={durationMin}
+                onChange={(e) => setDurationMin(e.target.value)}
+                placeholder="45"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+            <Field label="Âge minimum">
+              <input
+                type="number"
+                value={ageMin}
+                onChange={(e) => setAgeMin(e.target.value)}
+                placeholder="8"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+          </div>
+        </>
+      )}
 
-  // === SECTION EMPLACEMENT ===
-  const locationBlock = (
-    <div className="space-y-3">
-      <h3 className="font-semibold flex items-center gap-2 text-sm" style={{ fontFamily: "var(--font-display)", color: "var(--leather-dark)" }}>
-        <MapPin className="w-4 h-4" /> Emplacement
-      </h3>
+      {/* ISBN — uniquement pour les livres */}
+      {fields.showIsbn && (
+        <Field label="ISBN">
+          <input
+            value={isbn}
+            onChange={(e) => setIsbn(e.target.value)}
+            placeholder="978…"
+            className="w-full p-3 rounded-lg border-2 outline-none"
+            style={{ borderColor: "var(--parchment)" }}
+          />
+        </Field>
+      )}
+
+      {/* Code-barres — pour les autres types, on garde quand même un champ ISBN/EAN */}
+      {!fields.showIsbn && isbn && (
+        <Field label="Code-barres">
+          <input
+            value={isbn}
+            onChange={(e) => setIsbn(e.target.value)}
+            placeholder="EAN-13"
+            className="w-full p-3 rounded-lg border-2 outline-none"
+            style={{ borderColor: "var(--parchment)" }}
+          />
+        </Field>
+      )}
+
+      <div className="pt-2 pb-1">
+        <h3 className="font-semibold flex items-center gap-2" style={{ fontFamily: "var(--font-display)", color: "var(--leather-dark)" }}>
+          <MapPin className="w-4 h-4" /> Emplacement
+        </h3>
+      </div>
+
       <Field label="Bibliothèque">
         <select
           value={bibliotheque}
@@ -3847,429 +3935,41 @@ const BookForm = forwardRef(function BookForm(
           })}
         </select>
       </Field>
-      <div className="grid grid-cols-2 gap-3">
-        <Field label="Étagère (haut → bas)">
-          <input type="number" min="1" value={etagere} onChange={(e) => setEtagere(e.target.value)}
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-        <Field label="Position (gauche → droite)">
-          <input type="number" min="1" value={position}
-            onChange={(e) => { positionTouchedRef.current = true; setPosition(e.target.value); }}
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      </div>
-    </div>
-  );
-
-  // === SECTION DÉTAILS (éditeur, année, pages, etc.) ===
-  const detailsBlock = (expanded) => expanded && (
-    <div className="space-y-3">
-      {fields.showSubtitle && (
-        <Field label="Sous-titre">
-          <input value={subtitle} onChange={(e) => setSubtitle(e.target.value)} placeholder="Le sous-titre"
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      )}
-      {(fields.showPages || fields.showLanguage) && (
-        <div className="grid grid-cols-2 gap-3">
-          {fields.showPages && (
-            <Field label="Pages">
-              <input type="number" value={pages} onChange={(e) => setPages(e.target.value)} placeholder="320"
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-            </Field>
-          )}
-          {fields.showLanguage && (
-            <Field label="Langue">
-              <input value={language} onChange={(e) => setLanguage(e.target.value)} placeholder="Français"
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-            </Field>
-          )}
-        </div>
-      )}
-      {(fields.showPublisher || fields.showYear) && (
-        <div className="grid grid-cols-2 gap-3">
-          {fields.showPublisher && (
-            <Field label="Éditeur">
-              <input value={publisher} onChange={(e) => setPublisher(e.target.value)}
-                placeholder={type === "revue" ? "Bayard, Milan…" : type === "jeu-societe" ? "Asmodée…" : "Gallimard…"}
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-            </Field>
-          )}
-          {fields.showYear && (
-            <Field label="Année">
-              <input value={year} onChange={(e) => setYear(e.target.value)} placeholder="2020"
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-            </Field>
-          )}
-        </div>
-      )}
-      {fields.showFormat && (
-        <Field label="Format">
-          <input value={format} onChange={(e) => setFormat(e.target.value)} placeholder="Broché, Poche, Relié…"
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      )}
-      {fields.showDimensions && (
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Dimensions">
-            <input value={dimensions} onChange={(e) => setDimensions(e.target.value)} placeholder="20 x 13 cm"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-          </Field>
-          <Field label="Poids">
-            <input value={weight} onChange={(e) => setWeight(e.target.value)} placeholder="350 g"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-          </Field>
-        </div>
-      )}
-      {fields.showCategories && (
-        <Field label={type === "jeu-societe" || type === "jeu-switch" ? "Genre" : "Catégorie / Genre"}>
-          <input value={categories} onChange={(e) => setCategories(e.target.value)}
-            placeholder={type === "jeu-societe" ? "Stratégie, Famille…" : type === "jeu-switch" ? "Aventure, Course…" : "Roman, Science-fiction…"}
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      )}
-      {fields.showDescription && (
-        <Field label={type === "revue" ? "Dossier / Sujet du n°" : type === "jeu-societe" || type === "jeu-switch" ? "Description" : "Résumé"}>
-          <textarea value={description} onChange={(e) => setDescription(e.target.value)}
-            placeholder={type === "revue" ? "Le sujet du dossier principal…" : "Quelques mots sur le contenu…"}
-            rows={4} className="w-full p-3 rounded-lg border-2 outline-none resize-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      )}
-      {fields.showGameInfo && (
-        <>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Joueurs min"><input type="number" value={playersMin} onChange={(e) => setPlayersMin(e.target.value)} placeholder="2"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-            <Field label="Joueurs max"><input type="number" value={playersMax} onChange={(e) => setPlayersMax(e.target.value)} placeholder="6"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Durée (min)"><input type="number" value={durationMin} onChange={(e) => setDurationMin(e.target.value)} placeholder="45"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-            <Field label="Âge minimum"><input type="number" value={ageMin} onChange={(e) => setAgeMin(e.target.value)} placeholder="8"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-          </div>
-        </>
-      )}
-      {fields.showRating && (rating > 0 || ratingsCount > 0) && (
-        <div className="rounded-lg p-3" style={{ background: "var(--parchment)" }}>
-          <div className="text-sm flex items-center justify-between" style={{ color: "var(--ink)" }}>
-            <span>Note</span>
-            <span style={{ fontFamily: "var(--font-display)", fontWeight: 600 }}>
-              ⭐ {rating?.toFixed(1)} / 5 {ratingsCount > 0 && `(${ratingsCount} avis)`}
-            </span>
-          </div>
-        </div>
-      )}
-      {infoLink && (
-        <a href={infoLink} target="_blank" rel="noopener noreferrer"
-          className="block py-2 px-3 rounded-lg text-sm text-center"
-          style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}>
-          📖 Voir la fiche complète en ligne
-        </a>
-      )}
-    </div>
-  );
-
-  // === AIDE ISBN NON TROUVÉ ===
-  const isbnHelpBlock = isbn && !title && (
-    <div className="rounded-lg p-3 space-y-2" style={{ background: "var(--parchment)" }}>
-      <p className="text-sm" style={{ color: "var(--ink)" }}>
-        Livre non trouvé automatiquement pour l'ISBN <strong>{isbn}</strong>.
-      </p>
-      <div className="flex gap-2 flex-wrap">
-        <a href={`https://www.google.com/search?q=${encodeURIComponent(isbn)}+livre`} target="_blank" rel="noopener noreferrer"
-          className="px-3 py-2 rounded-lg text-sm font-medium inline-flex items-center gap-1.5"
-          style={{ background: "var(--leather-dark)", color: "var(--cream)" }}>
-          <Search className="w-4 h-4" /> Chercher sur Google
-        </a>
-        <button onClick={handleRetryLookup} disabled={retrying}
-          className="px-3 py-2 rounded-lg text-sm font-medium inline-flex items-center gap-1.5 disabled:opacity-50"
-          style={{ background: "var(--leather)", color: "var(--cream)" }}>
-          {retrying ? <><Loader2 className="w-4 h-4 animate-spin" /> Recherche…</> : <><RotateCcw className="w-4 h-4" /> Réessayer</>}
-        </button>
-        {debugInfo && (
-          <button onClick={() => setShowDebug((v) => !v)}
-            className="px-3 py-2 rounded-lg text-sm font-medium border"
-            style={{ borderColor: "var(--leather)", color: "var(--leather-dark)" }}>
-            {showDebug ? "Masquer détails" : "Détails sources"}
-          </button>
-        )}
-      </div>
-      {showDebug && debugInfo && (
-        <div className="text-xs font-mono p-2 rounded" style={{ background: "#1a1a1a", color: "#9fdc9f" }}>
-          <div>Google Books: {debugInfo.google}</div>
-          <div>Open Library: {debugInfo.openLibrary}</div>
-          <div>BnF: {debugInfo.bnf}</div>
-          <div>Couverture (toutes sources): {debugInfo.coverFallback}</div>
-        </div>
-      )}
-    </div>
-  );
-
-  // === CHAMP ISBN ===
-  const isbnBlock = (
-    <>
-      {fields.showIsbn && (
-        <Field label="ISBN">
-          <input value={isbn} onChange={(e) => setIsbn(e.target.value)} placeholder="978…"
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      )}
-      {!fields.showIsbn && isbn && (
-        <Field label="Code-barres">
-          <input value={isbn} onChange={(e) => setIsbn(e.target.value)} placeholder="EAN-13"
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      )}
-    </>
-  );
-
-  // =========================================================
-  // LAYOUT ÉDITION — deux colonnes (photo | champs essentiels)
-  // =========================================================
-  if (editLayout) {
-    return (
-      <div>
-        {/* Ligne supérieure : photo à gauche, champs essentiels à droite */}
-        <div style={{ display: "grid", gridTemplateColumns: "255px 1fr", gap: "14px", alignItems: "start" }}>
-          {/* Colonne gauche : couverture + boutons */}
-          <div>
-            {coverBlock}
-          </div>
-          {/* Colonne droite : type, titre, auteur, catégorie */}
-          <div>
-            {mainFieldsBlock}
-          </div>
-        </div>
-
-        {/* Séparateur */}
-        <div style={{ borderTop: "1px solid var(--parchment)", margin: "16px 0" }} />
-
-        {/* Aide ISBN */}
-        {isbnHelpBlock}
-
-        {/* Emplacement */}
-        {locationBlock}
-
-        {/* ISBN */}
-        <div style={{ marginTop: "12px" }}>
-          {isbnBlock}
-        </div>
-
-        {/* Notes */}
-        <div style={{ marginTop: "12px" }}>
-          <Field label="Notes (optionnel)">
-            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Édition, état, prêté à…"
-              rows={3} className="w-full p-3 rounded-lg border-2 outline-none resize-none" style={{ borderColor: "var(--parchment)" }} />
-          </Field>
-        </div>
-
-        {/* Section Détails dépliable */}
-        <div className="border-t pt-3 mt-3" style={{ borderColor: "var(--parchment)" }}>
-          <button type="button" onClick={() => setShowMore(!showMore)}
-            className="flex items-center justify-between w-full text-left"
-            style={{ color: "var(--leather-dark)" }}>
-            <span className="font-semibold flex items-center gap-2" style={{ fontFamily: "var(--font-display)" }}>
-              <BookOpen className="w-4 h-4" /> Détails supplémentaires
-            </span>
-            <ChevronRight className={`w-5 h-5 transition-transform ${showMore ? "rotate-90" : ""}`} />
-          </button>
-        </div>
-        {detailsBlock(showMore)}
-
-        {!bareMode && (
-          <button onClick={submit} disabled={!title.trim()}
-            className="w-full py-3 rounded-xl font-medium disabled:opacity-50 mt-4"
-            style={{ background: "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)", color: "var(--cream)" }}>
-            {submitLabel}
-          </button>
-        )}
-      </div>
-    );
-  }
-
-  // =========================================================
-  // LAYOUT STANDARD (ajout d'un livre)
-  // =========================================================
-  return (
-    <div className="space-y-4">
-      <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)" }}>
-        Informations du livre
-      </h2>
-
-      {/* Couverture — version compacte pour le mode ajout */}
-      <div className="flex gap-3 items-start">
-        <div className="rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0 shadow-md"
-          style={{ background: "var(--parchment)", width: "192px", height: "264px" }}>
-          {cover ? (
-            <img src={cover} alt="" className="w-full h-full object-cover" />
-          ) : (
-            <BookOpen className="w-14 h-14" style={{ color: "var(--leather)" }} />
-          )}
-        </div>
-        <div className="flex-1 space-y-1.5">
-          <label className="block py-2 px-3 rounded-lg border-2 text-sm text-center cursor-pointer"
-            style={{ borderColor: "var(--parchment)", color: "var(--leather)" }}>
-            <Camera className="w-4 h-4 inline mr-1" /> {cover ? "Changer la couverture" : "Ajouter une photo"}
-            <input type="file" accept="image/*" onChange={handleCoverUpload} className="hidden" />
-          </label>
-          {cover && (
-            <button type="button" onClick={() => setCover("")}
-              className="w-full py-2 px-3 rounded-lg border-2 text-xs text-center"
-              style={{ borderColor: "var(--accent)", color: "var(--accent)" }}>
-              <Trash2 className="w-3.5 h-3.5 inline mr-1" /> Supprimer la couverture
-            </button>
-          )}
-          {(title || isbn) && (
-            <a href={`https://www.google.com/search?tbm=isch&q=${encodeURIComponent(
-                title ? `${title} ${author || ""} couverture livre` : `ISBN ${isbn} couverture`
-              )}`} target="_blank" rel="noopener noreferrer"
-              className="block py-2 px-3 rounded-lg text-xs text-center"
-              style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}>
-              <Search className="w-3.5 h-3.5 inline mr-1" /> Chercher l'image sur Google
-            </a>
-          )}
-        </div>
-      </div>
-
-      {/* Aide ISBN non trouvé */}
-      {isbnHelpBlock}
-
-      {/* Sélecteur de type */}
-      <div className="space-y-1.5">
-        <label className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>Type d'objet</label>
-        <div className="grid grid-cols-2 gap-2">
-          {ITEM_TYPES_LIST.map((t) => (
-            <button key={t.id} type="button"
-              onClick={() => { setType(t.id); if (t.id === "jeu-switch" && !platform) setPlatform("Nintendo Switch"); }}
-              className="p-2 rounded-lg border-2 flex items-center gap-2 text-left transition-all"
-              style={{ background: type === t.id ? t.color : "white", borderColor: type === t.id ? t.color : "var(--parchment)", color: type === t.id ? "var(--cream)" : "var(--ink)" }}>
-              <span style={{ fontSize: "1.1rem" }}>{t.emoji}</span>
-              <span className="text-xs font-medium leading-tight">{t.label}</span>
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Genres bibliothèque virtuelle */}
-      <Field label="📚 Bibliothèque virtuelle">
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "8px" }}>
-          {genre.length > 0 ? genre.map((g, i) => {
-            const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
-            const label = g.includes("/") ? g.split("/")[1] : g;
-            return (
-              <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "4px 10px", borderRadius: "12px", fontSize: "12px", fontWeight: "600", background: colors.bg, color: colors.text }}>
-                {label}
-                <button onClick={() => setGenre(genre.filter((_, j) => j !== i))}
-                  style={{ background: "none", border: "none", cursor: "pointer", color: colors.text, fontSize: "14px", padding: "0", lineHeight: 1 }}>×</button>
-              </span>
-            );
-          }) : (<span style={{ fontSize: "12px", color: "var(--ink-soft)", fontStyle: "italic" }}>Aucune catégorie assignée</span>)}
-        </div>
-        <select value="" onChange={e => { const val = e.target.value; if (val && !genre.includes(val)) setGenre([...genre, val]); e.target.value = ""; }}
-          style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid var(--parchment)", background: "white", color: "var(--ink)", fontSize: "13px" }}>
-          <option value="">+ Ajouter une catégorie…</option>
-          {Object.keys(GENRE_COLORS).filter(g => !genre.includes(g) && g !== "À classer").map(g => (<option key={g} value={g}>{g}</option>))}
-        </select>
-      </Field>
-
-      <Field label={`${fields.titleLabel} *`}>
-        <input value={title} onChange={(e) => setTitle(e.target.value)}
-          placeholder={type === "revue" ? "Pomme d'Api, Historia…" : type === "jeu-societe" ? "Cluedo, Catan…" : type === "jeu-switch" ? "Mario Kart 8, Zelda…" : "Le titre du livre"}
-          className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-      </Field>
-
-      {fields.showSubtitle && type === "livre" && subtitle && (
-        <Field label="Sous-titre">
-          <input value={subtitle} onChange={(e) => setSubtitle(e.target.value)}
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      )}
-
-      {fields.showIssue && (
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="N° du numéro"><input value={issueNumber} onChange={(e) => setIssueNumber(e.target.value)} placeholder="ex: 920"
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-          <Field label="Date"><input value={issueDate} onChange={(e) => setIssueDate(e.target.value)} placeholder="Janvier 2024"
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-        </div>
-      )}
-
-      {fields.showAuthor && (
-        <Field label="Auteur">
-          <input value={author} onChange={(e) => setAuthor(e.target.value)} placeholder="Prénom Nom"
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      )}
-
-      {fields.showPlatform && (
-        <Field label="Plateforme">
-          <input value={platform} onChange={(e) => setPlatform(e.target.value)} placeholder="Nintendo Switch"
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
-        </Field>
-      )}
-
-      {fields.showGameInfo && (
-        <>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Joueurs min"><input type="number" value={playersMin} onChange={(e) => setPlayersMin(e.target.value)} placeholder="2"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-            <Field label="Joueurs max"><input type="number" value={playersMax} onChange={(e) => setPlayersMax(e.target.value)} placeholder="6"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Durée (min)"><input type="number" value={durationMin} onChange={(e) => setDurationMin(e.target.value)} placeholder="45"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-            <Field label="Âge minimum"><input type="number" value={ageMin} onChange={(e) => setAgeMin(e.target.value)} placeholder="8"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-          </div>
-        </>
-      )}
-
-      {fields.showIsbn && (
-        <Field label="ISBN"><input value={isbn} onChange={(e) => setIsbn(e.target.value)} placeholder="978…"
-          className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-      )}
-      {!fields.showIsbn && isbn && (
-        <Field label="Code-barres"><input value={isbn} onChange={(e) => setIsbn(e.target.value)} placeholder="EAN-13"
-          className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-      )}
-
-      <div className="pt-2 pb-1">
-        <h3 className="font-semibold flex items-center gap-2" style={{ fontFamily: "var(--font-display)", color: "var(--leather-dark)" }}>
-          <MapPin className="w-4 h-4" /> Emplacement
-        </h3>
-      </div>
-
-      <Field label="Bibliothèque">
-        <select value={bibliotheque} onChange={(e) => setBibliotheque(e.target.value)}
-          className="w-full p-3 rounded-lg border-2 outline-none bg-white" style={{ borderColor: "var(--parchment)" }}>
-          {structure.pieces.map((piece) => {
-            const bibs = structure.bibliotheques.filter((b) => b.pieceId === piece.id);
-            if (bibs.length === 0) return null;
-            return (<optgroup key={piece.id} label={piece.nom}>
-              {bibs.map((b) => (<option key={b.id} value={b.id}>{b.nom}</option>))}
-            </optgroup>);
-          })}
-        </select>
-      </Field>
 
       <div className="grid grid-cols-2 gap-3">
         <Field label="Étagère (haut → bas)">
-          <input type="number" min="1" value={etagere} onChange={(e) => setEtagere(e.target.value)}
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
+          <input
+            type="number"
+            min="1"
+            value={etagere}
+            onChange={(e) => setEtagere(e.target.value)}
+            className="w-full p-3 rounded-lg border-2 outline-none"
+            style={{ borderColor: "var(--parchment)" }}
+          />
         </Field>
         <Field label="Position (gauche → droite)">
-          <input type="number" min="1" value={position}
-            onChange={(e) => { positionTouchedRef.current = true; setPosition(e.target.value); }}
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
+          <input
+            type="number"
+            min="1"
+            value={position}
+            onChange={(e) => {
+              positionTouchedRef.current = true;
+              setPosition(e.target.value);
+            }}
+            className="w-full p-3 rounded-lg border-2 outline-none"
+            style={{ borderColor: "var(--parchment)" }}
+          />
         </Field>
       </div>
 
+      {/* === SECTION DÉTAILS DÉPLIABLE === */}
       <div className="border-t pt-3" style={{ borderColor: "var(--parchment)" }}>
-        <button type="button" onClick={() => setShowMore(!showMore)}
-          className="flex items-center justify-between w-full text-left" style={{ color: "var(--leather-dark)" }}>
+        <button
+          type="button"
+          onClick={() => setShowMore(!showMore)}
+          className="flex items-center justify-between w-full text-left"
+          style={{ color: "var(--leather-dark)" }}
+        >
           <span className="font-semibold flex items-center gap-2" style={{ fontFamily: "var(--font-display)" }}>
             <BookOpen className="w-4 h-4" /> Détails
           </span>
@@ -4279,55 +3979,196 @@ const BookForm = forwardRef(function BookForm(
 
       {showMore && (
         <div className="space-y-3 pl-1">
+          {/* Sous-titre — uniquement livres */}
           {fields.showSubtitle && (
-            <Field label="Sous-titre"><input value={subtitle} onChange={(e) => setSubtitle(e.target.value)} placeholder="Le sous-titre"
-              className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
+            <Field label="Sous-titre">
+              <input
+                value={subtitle}
+                onChange={(e) => setSubtitle(e.target.value)}
+                placeholder="Le sous-titre"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
           )}
+
+          {/* Pages + Langue (livres) */}
           {(fields.showPages || fields.showLanguage) && (
             <div className="grid grid-cols-2 gap-3">
-              {fields.showPages && (<Field label="Pages"><input type="number" value={pages} onChange={(e) => setPages(e.target.value)} placeholder="320"
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>)}
-              {fields.showLanguage && (<Field label="Langue"><input value={language} onChange={(e) => setLanguage(e.target.value)} placeholder="Français"
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>)}
+              {fields.showPages && (
+                <Field label="Pages">
+                  <input
+                    type="number"
+                    value={pages}
+                    onChange={(e) => setPages(e.target.value)}
+                    placeholder="320"
+                    className="w-full p-3 rounded-lg border-2 outline-none"
+                    style={{ borderColor: "var(--parchment)" }}
+                  />
+                </Field>
+              )}
+              {fields.showLanguage && (
+                <Field label="Langue">
+                  <input
+                    value={language}
+                    onChange={(e) => setLanguage(e.target.value)}
+                    placeholder="Français"
+                    className="w-full p-3 rounded-lg border-2 outline-none"
+                    style={{ borderColor: "var(--parchment)" }}
+                  />
+                </Field>
+              )}
             </div>
           )}
+
+          {/* Éditeur + Année */}
           {(fields.showPublisher || fields.showYear) && (
             <div className="grid grid-cols-2 gap-3">
               {fields.showPublisher && (
                 <Field label={type === "revue" ? "Éditeur" : type === "jeu-societe" || type === "jeu-switch" ? "Éditeur du jeu" : "Éditeur"}>
-                  <input value={publisher} onChange={(e) => setPublisher(e.target.value)}
-                    placeholder={type === "revue" ? "Bayard, Milan…" : type === "jeu-societe" ? "Asmodée, Hasbro…" : type === "jeu-switch" ? "Nintendo, EA…" : "Gallimard…"}
-                    className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
+                  <input
+                    value={publisher}
+                    onChange={(e) => setPublisher(e.target.value)}
+                    placeholder={
+                      type === "revue" ? "Bayard, Milan…" :
+                      type === "jeu-societe" ? "Asmodée, Hasbro…" :
+                      type === "jeu-switch" ? "Nintendo, EA…" :
+                      "Gallimard…"
+                    }
+                    className="w-full p-3 rounded-lg border-2 outline-none"
+                    style={{ borderColor: "var(--parchment)" }}
+                  />
                 </Field>
               )}
-              {fields.showYear && (<Field label="Année"><input value={year} onChange={(e) => setYear(e.target.value)} placeholder="2020"
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>)}
+              {fields.showYear && (
+                <Field label="Année">
+                  <input
+                    value={year}
+                    onChange={(e) => setYear(e.target.value)}
+                    placeholder="2020"
+                    className="w-full p-3 rounded-lg border-2 outline-none"
+                    style={{ borderColor: "var(--parchment)" }}
+                  />
+                </Field>
+              )}
             </div>
           )}
-          {fields.showFormat && (<Field label="Format"><input value={format} onChange={(e) => setFormat(e.target.value)} placeholder="Broché, Poche, Relié…"
-            className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>)}
+
+          {/* Format / Dimensions / Poids — livres uniquement */}
+          {fields.showFormat && (
+            <Field label="Format">
+              <input
+                value={format}
+                onChange={(e) => setFormat(e.target.value)}
+                placeholder="Broché, Poche, Relié…"
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
+            </Field>
+          )}
+
           {fields.showDimensions && (
             <div className="grid grid-cols-2 gap-3">
-              <Field label="Dimensions"><input value={dimensions} onChange={(e) => setDimensions(e.target.value)} placeholder="20 x 13 cm"
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
-              <Field label="Poids"><input value={weight} onChange={(e) => setWeight(e.target.value)} placeholder="350 g"
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} /></Field>
+              <Field label="Dimensions">
+                <input
+                  value={dimensions}
+                  onChange={(e) => setDimensions(e.target.value)}
+                  placeholder="20 x 13 cm"
+                  className="w-full p-3 rounded-lg border-2 outline-none"
+                  style={{ borderColor: "var(--parchment)" }}
+                />
+              </Field>
+              <Field label="Poids">
+                <input
+                  value={weight}
+                  onChange={(e) => setWeight(e.target.value)}
+                  placeholder="350 g"
+                  className="w-full p-3 rounded-lg border-2 outline-none"
+                  style={{ borderColor: "var(--parchment)" }}
+                />
+              </Field>
             </div>
           )}
+
+          {/* Catégorie / Genre */}
           {fields.showCategories && (
             <Field label={type === "jeu-societe" || type === "jeu-switch" ? "Genre" : "Catégorie / Genre"}>
-              <input value={categories} onChange={(e) => setCategories(e.target.value)}
-                placeholder={type === "jeu-societe" ? "Stratégie, Famille, Réflexion…" : type === "jeu-switch" ? "Aventure, Course, Sport…" : "Roman, Science-fiction…"}
-                className="w-full p-3 rounded-lg border-2 outline-none" style={{ borderColor: "var(--parchment)" }} />
+              <input
+                value={categories}
+                onChange={(e) => setCategories(e.target.value)}
+                placeholder={
+                  type === "jeu-societe" ? "Stratégie, Famille, Réflexion…" :
+                  type === "jeu-switch" ? "Aventure, Course, Sport…" :
+                  "Roman, Science-fiction…"
+                }
+                className="w-full p-3 rounded-lg border-2 outline-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
             </Field>
           )}
+
+          {/* Genres bibliothèque virtuelle */}
+          <Field label="📚 Bibliothèque virtuelle">
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "6px" }}>
+              {genre.length > 0 ? genre.map((g, i) => {
+                const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
+                const label = g.includes("/") ? g.split("/")[1] : g;
+                return (
+                  <span key={i} style={{
+                    display: "inline-flex", alignItems: "center", gap: "4px",
+                    padding: "3px 8px", borderRadius: "12px", fontSize: "11px",
+                    fontWeight: "600", background: colors.bg, color: colors.text,
+                  }}>
+                    {label}
+                    <button
+                      onClick={() => setGenre(genre.filter((_, j) => j !== i))}
+                      style={{ background: "none", border: "none", cursor: "pointer",
+                        color: colors.text, fontSize: "13px", padding: "0", lineHeight: 1 }}
+                    >×</button>
+                  </span>
+                );
+              }) : (
+                <span style={{ fontSize: "12px", color: "var(--ink-soft)", fontStyle: "italic" }}>Aucune catégorie</span>
+              )}
+            </div>
+            <select
+              value=""
+              onChange={e => {
+                const val = e.target.value;
+                if (val && !genre.includes(val)) setGenre([...genre, val]);
+                e.target.value = "";
+              }}
+              style={{
+                width: "100%", padding: "10px", borderRadius: "8px",
+                border: "2px solid var(--parchment)", background: "white",
+                color: "var(--ink)", fontSize: "13px",
+              }}
+            >
+              <option value="">+ Ajouter une catégorie…</option>
+              {Object.keys(GENRE_COLORS).filter(g => !genre.includes(g) && g !== "À classer").map(g => (
+                <option key={g} value={g}>{g}</option>
+              ))}
+            </select>
+          </Field>
+
+          {/* Résumé */}
           {fields.showDescription && (
             <Field label={type === "revue" ? "Dossier / Sujet du n°" : type === "jeu-societe" || type === "jeu-switch" ? "Description" : "Résumé"}>
-              <textarea value={description} onChange={(e) => setDescription(e.target.value)}
-                placeholder={type === "revue" ? "Le sujet du dossier principal de ce numéro…" : type === "jeu-societe" || type === "jeu-switch" ? "Le pitch du jeu…" : "Quelques mots sur le contenu…"}
-                rows={4} className="w-full p-3 rounded-lg border-2 outline-none resize-none" style={{ borderColor: "var(--parchment)" }} />
+              <textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder={
+                  type === "revue" ? "Le sujet du dossier principal de ce numéro…" :
+                  type === "jeu-societe" || type === "jeu-switch" ? "Le pitch du jeu…" :
+                  "Quelques mots sur le contenu…"
+                }
+                rows={4}
+                className="w-full p-3 rounded-lg border-2 outline-none resize-none"
+                style={{ borderColor: "var(--parchment)" }}
+              />
             </Field>
           )}
+
           {fields.showRating && (rating > 0 || ratingsCount > 0) && (
             <div className="rounded-lg p-3" style={{ background: "var(--parchment)" }}>
               <div className="text-sm flex items-center justify-between" style={{ color: "var(--ink)" }}>
@@ -4338,10 +4179,15 @@ const BookForm = forwardRef(function BookForm(
               </div>
             </div>
           )}
+
           {infoLink && (
-            <a href={infoLink} target="_blank" rel="noopener noreferrer"
+            <a
+              href={infoLink}
+              target="_blank"
+              rel="noopener noreferrer"
               className="block py-2 px-3 rounded-lg text-sm text-center"
-              style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}>
+              style={{ background: "var(--parchment)", color: "var(--leather-dark)" }}
+            >
               📖 Voir la fiche complète en ligne
             </a>
           )}
@@ -4349,14 +4195,26 @@ const BookForm = forwardRef(function BookForm(
       )}
 
       <Field label="Notes (optionnel)">
-        <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Édition, état, prêté à…"
-          rows={3} className="w-full p-3 rounded-lg border-2 outline-none resize-none" style={{ borderColor: "var(--parchment)" }} />
+        <textarea
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+          placeholder="Édition, état, prêté à…"
+          rows={3}
+          className="w-full p-3 rounded-lg border-2 outline-none resize-none"
+          style={{ borderColor: "var(--parchment)" }}
+        />
       </Field>
 
       {!bareMode && (
-        <button onClick={submit} disabled={!title.trim()}
+        <button
+          onClick={submit}
+          disabled={!title.trim()}
           className="w-full py-3 rounded-xl font-medium disabled:opacity-50 mt-4"
-          style={{ background: "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)", color: "var(--cream)" }}>
+          style={{
+            background: "linear-gradient(135deg, var(--leather) 0%, var(--leather-dark) 100%)",
+            color: "var(--cream)",
+          }}
+        >
           {submitLabel}
         </button>
       )}
@@ -4443,13 +4301,13 @@ function DetailView({ book, structure, navigationIds, allBooks, onBack, onEdit, 
       </div>
 
       <div className="text-center mb-6">
-        <div className="inline-block rounded-lg overflow-hidden shadow-lg mb-4"
-          style={{ background: "var(--parchment)", width: "240px", height: "336px", maxWidth: "80vw" }}>
+        <div className="inline-block w-40 h-56 rounded-lg overflow-hidden shadow-lg mb-4"
+          style={{ background: "var(--parchment)" }}>
           {book.cover ? (
             <img src={book.cover} alt={book.title} className="w-full h-full object-cover" />
           ) : (
             <div className="w-full h-full flex items-center justify-center">
-              <span style={{ fontSize: "4.5rem" }}>{itemType?.emoji || "📖"}</span>
+              <span style={{ fontSize: "3rem" }}>{itemType?.emoji || "📖"}</span>
             </div>
           )}
         </div>
@@ -5871,8 +5729,8 @@ function BatchScanner({ books, structure, setup, onAddBook, onEnrichBook, onEnri
             type="button"
             onClick={() => setEditingCoverFor(lastBook)}
             aria-label="Modifier la couverture (reprendre la photo)"
-            className="rounded overflow-hidden flex-shrink-0 flex items-center justify-center relative group"
-            style={{ background: "var(--parchment)", border: "1px solid var(--gold-light)", width: "120px", height: "168px" }}
+            className="w-20 h-28 rounded overflow-hidden flex-shrink-0 flex items-center justify-center relative group"
+            style={{ background: "var(--parchment)", border: "1px solid var(--gold-light)" }}
           >
             {lastBook.cover ? (
               <img src={lastBook.cover} alt="" className="w-full h-full object-cover" />
@@ -6259,13 +6117,13 @@ function DuplicateModal({ duplicateOf, structure, newLocation, onIgnore, onAddAn
             <img
               src={duplicateOf.cover}
               alt=""
-              className="object-cover rounded"
-              style={{ background: "var(--cream)", width: "72px", height: "96px" }}
+              className="w-12 h-16 object-cover rounded"
+              style={{ background: "var(--cream)" }}
             />
           ) : (
             <div
-              className="rounded flex items-center justify-center"
-              style={{ background: "var(--cream)", width: "72px", height: "96px" }}
+              className="w-12 h-16 rounded flex items-center justify-center"
+              style={{ background: "var(--cream)" }}
             >
               <BookOpen className="w-5 h-5" style={{ color: "var(--ink-soft)" }} />
             </div>
@@ -6433,7 +6291,6 @@ function EditView({ books, book, structure, navigationIds, allBooks, onCancel, o
         onSubmit={onSave}
         submitLabel="Enregistrer"
         bareMode={true}
-        editLayout={true}
         onDirtyChange={setIsDirty}
       />
 
@@ -7550,15 +7407,15 @@ function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit, onQuickSca
             Étagère vide
           </div>
         ) : (
-          <div className="flex gap-1.5 items-end" style={{ minHeight: "180px" }}>
+          <div className="flex gap-1.5 items-end" style={{ minHeight: "120px" }}>
             {books.map((book) => (
               <button
                 key={book.id}
                 onClick={() => onSelectBook(book)}
                 className="flex-shrink-0 rounded overflow-hidden shadow-sm relative group"
                 style={{
-                  width: "66px",
-                  height: "165px",
+                  width: "44px",
+                  height: "110px",
                   background: book.cover ? "transparent" : `hsl(${(parseInt(book.id, 36) % 60) + 10}, 40%, 30%)`,
                 }}
                 title={`${book.title}${book.author ? ` — ${book.author}` : ""} (pos. ${book.position})`}
@@ -7576,7 +7433,7 @@ function ShelfRow({ shelfNum, shelfName, books, onSelectBook, onEdit, onQuickSca
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
-                      maxHeight: "150px",
+                      maxHeight: "100px",
                     }}>
                       {book.title}
                     </span>
@@ -8179,7 +8036,7 @@ function BiblioBookCard({ book, onClick, index }) {
 
       {/* Couverture */}
       <div style={{
-        width: "78px", minWidth: "78px", height: "108px",
+        width: "52px", minWidth: "52px", height: "72px",
         borderRadius: "4px", overflow: "hidden",
         background: light || "var(--parchment)",
         display: "flex", alignItems: "center", justifyContent: "center",
@@ -8188,7 +8045,7 @@ function BiblioBookCard({ book, onClick, index }) {
       }}>
         {book.cover
           ? <img src={book.cover} alt={book.title} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
-          : <span style={{ fontSize: "33px" }}>{itemType?.emoji || "📚"}</span>
+          : <span style={{ fontSize: "22px" }}>{itemType?.emoji || "📚"}</span>
         }
       </div>
 
@@ -8231,7 +8088,7 @@ function BiblioBookCard({ book, onClick, index }) {
 
 // ── Composant principal ───────────────────────────────────────
 // ── Vue étagère bois ─────────────────────────────────────────
-function BookOnShelf({ book, height = 165, onClick }) {
+function BookOnShelf({ book, height = 110, onClick }) {
   const genre = (book.genre || [])[0] || "À classer";
   const { bg, text } = getGenreColor(genre);
 
@@ -8267,7 +8124,7 @@ function BookOnShelf({ book, height = 165, onClick }) {
       onClick={onClick}
       title={`${book.title || ""}${book.author ? " — " + book.author : ""}`}
       style={{
-        width: "42px", minWidth: "42px", height: `${height}px`,
+        width: "28px", minWidth: "28px", height: `${height}px`,
         background: bg, borderRadius: "2px 4px 4px 2px",
         cursor: "pointer", display: "flex", flexDirection: "column",
         alignItems: "center", justifyContent: "center", padding: "4px 2px",
@@ -8294,7 +8151,7 @@ function BookOnShelf({ book, height = 165, onClick }) {
 }
 
 function WoodShelf({ books, onSelectBook }) {
-  const SHELF_H = 165;
+  const SHELF_H = 110;
   return (
     <div style={{ position: "relative", marginBottom: "14px" }}>
       {/* Ombre du dessus */}
@@ -8503,17 +8360,11 @@ function BibliothequeView({ books, onSelectBook }) {
 
       {/* Contenu selon le mode */}
       {viewMode === "shelves" ? (
-        <ShelfView
-          books={displayBooks}
-          onSelectBook={(book) => onSelectBook(book, displayBooks.map(x => x.id))}
-        />
+        <ShelfView books={displayBooks} onSelectBook={onSelectBook} />
       ) : (
         <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "8px" }}>
           {displayBooks.length > 0 ? displayBooks.map((book, i) => (
-            <BiblioBookCard
-              key={book.id} book={book} index={i}
-              onClick={() => onSelectBook(book, displayBooks.map(x => x.id))}
-            />
+            <BiblioBookCard key={book.id} book={book} index={i} onClick={() => onSelectBook(book)} />
           )) : (
             <div style={{ textAlign: "center", padding: "60px 20px",
               color: "var(--leather-light)", fontStyle: "italic" }}>
