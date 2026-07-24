@@ -265,6 +265,10 @@ function dbToBook(row) {
     publisher: row.publisher || "",
     year: row.year || "",
     addedAt: row.created_at,
+    // Date de dernière modification (sert à invalider le cache local de
+    // couvertures : si un livre a été modifié plus récemment que la dernière
+    // synchro, on retélécharge sa couverture même si elle est déjà en cache).
+    updatedAt: row.updated_at || null,
     // Champs spécifiques aux nouveaux types
     issueNumber: row.issue_number || "",     // n° de revue
     issueDate: row.issue_date || "",          // date de parution revue

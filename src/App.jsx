@@ -1236,15 +1236,39 @@ export default function App() {
               ));
             }
 
-            // 2. Téléchargement des couvertures manquantes uniquement
-            const missingIds = ids.filter((id) => !cached.has(id));
-            if (missingIds.length === 0) return; // tout est en cache, rien à faire
+            // 2. Détermine les couvertures à (re)télécharger :
+            //    - celles ABSENTES du cache
+            //    - ET celles dont le livre a été MODIFIÉ depuis la dernière
+            //      synchro. Sans ce second point, une couverture changée sur un
+            //      AUTRE appareil restait masquée à jamais par le cache local
+            //      périmé (bug « recadré sur le PC → ancien sur le téléphone »).
+            let sinceStr = null;
+            try {
+              sinceStr = (await window.storage.get("coverSyncSince"))?.value || null;
+            } catch (e) { /* ignore */ }
+            // Marge de sécurité (10 min) contre les petits décalages d'horloge
+            // entre appareils (updated_at est posé côté client à l'écriture).
+            const boundary = (sinceStr ? Date.parse(sinceStr) : 0) - 10 * 60 * 1000;
 
-            console.log(`Téléchargement de ${missingIds.length} couvertures manquantes (sur ${ids.length} livres)`);
+            const missingIds = ids.filter((id) => !cached.has(id));
+            const staleIds = remoteBooks
+              .filter((b) => b.id && cached.has(b.id) && b.updatedAt && Date.parse(b.updatedAt) > boundary)
+              .map((b) => b.id);
+            const refetch = Array.from(new Set([...missingIds, ...staleIds]));
+
+            // Nouvelle borne de synchro (maintenant), mémorisée en fin de passe.
+            const syncStamp = new Date().toISOString();
+
+            if (refetch.length === 0) {
+              window.storage.set("coverSyncSince", syncStamp).catch(() => {});
+              return; // tout est déjà à jour
+            }
+
+            console.log(`Couvertures à synchroniser : ${refetch.length} (${missingIds.length} manquantes, ${staleIds.length} modifiées) sur ${ids.length} livres`);
             const COVER_BATCH = 30;
-            for (let i = 0; i < missingIds.length; i += COVER_BATCH) {
+            for (let i = 0; i < refetch.length; i += COVER_BATCH) {
               if (cancelled) return;
-              const slice = missingIds.slice(i, i + COVER_BATCH);
+              const slice = refetch.slice(i, i + COVER_BATCH);
               try {
                 const covers = await fetchBookCoversRemote(slice);
                 if (cancelled) return;
@@ -1253,14 +1277,24 @@ export default function App() {
                   setBooks((prev) => prev.map((b) =>
                     covers.has(b.id) ? { ...b, cover: covers.get(b.id) } : b
                   ));
-                  // Persiste en arrière-plan (non bloquant pour l'UI)
                   setCachedCovers(covers).catch(() => {});
+                }
+                // Ids demandés mais SANS couverture renvoyée = couverture
+                // supprimée sur un autre appareil → on purge cache + état local.
+                const removed = slice.filter((id) => !covers.has(id) && cached.has(id));
+                if (removed.length > 0) {
+                  setBooks((prev) => prev.map((b) =>
+                    removed.includes(b.id) && b.cover ? { ...b, cover: "" } : b
+                  ));
+                  removed.forEach((id) => deleteCachedCover(id).catch(() => {}));
                 }
               } catch (e) {
                 console.warn("Lot de couvertures non chargé:", e?.message);
               }
               await new Promise((r) => setTimeout(r, 50));
             }
+            // Passe terminée : on avance la borne de synchro.
+            window.storage.set("coverSyncSince", syncStamp).catch(() => {});
           })();
           if (remoteStructure && (remoteStructure.pieces?.length || 0) > 0) {
             setStructure({
