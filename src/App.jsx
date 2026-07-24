@@ -3524,20 +3524,29 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
 // === SCANNER COUVERTURE ===
 function CoverScanner({ onCancel, onCapture }) {
   const fileRef = useRef(null);
+  // Image brute juste prise/importée, en attente de recadrage.
+  const [rawImg, setRawImg] = useState(null);
 
   const handleFile = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = async (ev) => {
-      // Compression avant transmission au parent — réduit drastiquement la
-      // taille (typiquement 5 Mo → 80 Ko) sans perte visuelle pour une
-      // couverture de livre.
-      const compressed = await compressImageDataUrl(ev.target.result);
-      onCapture(compressed);
-    };
+    // On garde l'image pleine résolution pour la passer au recadreur ;
+    // la compression a lieu APRÈS le recadrage.
+    reader.onload = (ev) => setRawImg(ev.target.result);
     reader.readAsDataURL(file);
   };
+
+  // Étape de recadrage dès qu'une photo est disponible.
+  if (rawImg) {
+    return (
+      <ImageCropper
+        src={rawImg}
+        onCancel={() => setRawImg(null)}
+        onCrop={(dataUrl) => { setRawImg(null); onCapture(dataUrl); }}
+      />
+    );
+  }
 
   return (
     <div className="text-center pt-4">
@@ -3570,6 +3579,216 @@ function CoverScanner({ onCancel, onCapture }) {
   );
 }
 
+// === RECADRAGE D'IMAGE (rectangle libre) ===
+// Modale plein écran : l'image est affichée à l'échelle, avec un rectangle de
+// sélection déplaçable (glisser le centre) et redimensionnable par 8 poignées
+// (4 coins + 4 bords). Les poignées de bord haut/bas servent précisément à
+// rogner le haut et le bas d'une photo portrait pour en faire une jaquette.
+// Tout est piloté en pointer events → fonctionne au doigt sur iPhone.
+// À la validation, on découpe à la résolution native de l'image puis on
+// recompresse via compressImageDataUrl (même pipeline que le reste de l'appli).
+function ImageCropper({ src, onCancel, onCrop }) {
+  const wrapRef = useRef(null);
+  const imgRef = useRef(null);
+  const dragRef = useRef(null);
+  const [disp, setDisp] = useState({ w: 0, h: 0 });
+  const [rect, setRect] = useState(null); // en px de l'image AFFICHÉE
+  const [busy, setBusy] = useState(false);
+  const MIN = 30;
+
+  const initRect = () => {
+    const el = imgRef.current;
+    if (!el) return;
+    const w = el.clientWidth;
+    const h = el.clientHeight;
+    setDisp({ w, h });
+    // Sélection de départ : pleine largeur, 70 % de hauteur centrée
+    // (invite naturellement à rogner le haut et le bas).
+    const ch = Math.round(h * 0.7);
+    setRect({ x: 0, y: Math.round((h - ch) / 2), w, h: ch });
+  };
+
+  useEffect(() => {
+    const onResize = () => initRect();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const clampRect = (r) => {
+    let { x, y, w, h } = r;
+    w = Math.max(MIN, Math.min(w, disp.w));
+    h = Math.max(MIN, Math.min(h, disp.h));
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + w > disp.w) x = disp.w - w;
+    if (y + h > disp.h) y = disp.h - h;
+    return { x, y, w, h };
+  };
+
+  const startDrag = (mode) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragRef.current = { mode, sx: e.clientX, sy: e.clientY, orig: rect };
+    try { wrapRef.current?.setPointerCapture?.(e.pointerId); } catch (err) {}
+  };
+
+  const onMove = (e) => {
+    if (!dragRef.current) return;
+    const { mode, sx, sy, orig } = dragRef.current;
+    const dx = e.clientX - sx;
+    const dy = e.clientY - sy;
+    let r = { ...orig };
+    if (mode === "move") { r.x = orig.x + dx; r.y = orig.y + dy; }
+    if (mode.includes("e")) r.w = orig.w + dx;
+    if (mode.includes("s")) r.h = orig.h + dy;
+    if (mode.includes("w")) { r.x = orig.x + dx; r.w = orig.w - dx; }
+    if (mode.includes("n")) { r.y = orig.y + dy; r.h = orig.h - dy; }
+    setRect(clampRect(r));
+  };
+
+  const endDrag = () => { dragRef.current = null; };
+
+  const doCrop = async () => {
+    if (!rect) return;
+    setBusy(true);
+    try {
+      const image = await new Promise((res, rej) => {
+        const im = new Image();
+        im.onload = () => res(im);
+        im.onerror = rej;
+        im.src = src;
+      });
+      const scaleX = image.naturalWidth / (disp.w || 1);
+      const scaleY = image.naturalHeight / (disp.h || 1);
+      const sx = Math.max(0, Math.round(rect.x * scaleX));
+      const sy = Math.max(0, Math.round(rect.y * scaleY));
+      const sw = Math.round(rect.w * scaleX);
+      const sh = Math.round(rect.h * scaleY);
+      const canvas = document.createElement("canvas");
+      canvas.width = sw;
+      canvas.height = sh;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+      const compressed = await compressImageDataUrl(dataUrl);
+      onCrop(compressed);
+    } catch (err) {
+      // Repli : on renvoie l'image d'origine compressée
+      const compressed = await compressImageDataUrl(src);
+      onCrop(compressed);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDot = (mode, pos) => (
+    <div
+      onPointerDown={startDrag(mode)}
+      style={{
+        position: "absolute",
+        width: 20,
+        height: 20,
+        marginLeft: -10,
+        marginTop: -10,
+        background: "var(--cream, #fff)",
+        border: "2px solid var(--leather-dark, #5a3d2b)",
+        borderRadius: 5,
+        touchAction: "none",
+        ...pos,
+      }}
+    />
+  );
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 70,
+        background: "rgba(0,0,0,0.85)",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 16,
+      }}
+    >
+      <p style={{ color: "#fff", marginBottom: 12, fontSize: "0.9rem", textAlign: "center", maxWidth: 340 }}>
+        Ajuste le cadre pour rogner. Glisse les poignées du haut et du bas pour
+        couper, ou le centre pour déplacer.
+      </p>
+      <div
+        ref={wrapRef}
+        onPointerMove={onMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        style={{ position: "relative", touchAction: "none", lineHeight: 0, maxWidth: "100%", maxHeight: "68vh" }}
+      >
+        <img
+          ref={imgRef}
+          src={src}
+          alt=""
+          onLoad={initRect}
+          draggable={false}
+          style={{ maxWidth: "100%", maxHeight: "68vh", display: "block", userSelect: "none" }}
+        />
+        {rect && (
+          <>
+            <div
+              onPointerDown={startDrag("move")}
+              style={{
+                position: "absolute",
+                left: rect.x,
+                top: rect.y,
+                width: rect.w,
+                height: rect.h,
+                boxShadow: "0 0 0 9999px rgba(0,0,0,0.55)",
+                border: "1px solid rgba(255,255,255,0.9)",
+                cursor: "move",
+                touchAction: "none",
+              }}
+            />
+            {handleDot("nw", { left: rect.x, top: rect.y })}
+            {handleDot("ne", { left: rect.x + rect.w, top: rect.y })}
+            {handleDot("sw", { left: rect.x, top: rect.y + rect.h })}
+            {handleDot("se", { left: rect.x + rect.w, top: rect.y + rect.h })}
+            {handleDot("n", { left: rect.x + rect.w / 2, top: rect.y })}
+            {handleDot("s", { left: rect.x + rect.w / 2, top: rect.y + rect.h })}
+            {handleDot("w", { left: rect.x, top: rect.y + rect.h / 2 })}
+            {handleDot("e", { left: rect.x + rect.w, top: rect.y + rect.h / 2 })}
+          </>
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 10, marginTop: 18, flexWrap: "wrap", justifyContent: "center" }}>
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={busy}
+          style={{ padding: "10px 16px", borderRadius: 10, background: "rgba(255,255,255,0.15)", color: "#fff", border: "1px solid rgba(255,255,255,0.4)" }}
+        >
+          Annuler
+        </button>
+        <button
+          type="button"
+          onClick={() => { const el = imgRef.current; if (el) setRect({ x: 0, y: 0, w: el.clientWidth, h: el.clientHeight }); }}
+          disabled={busy}
+          style={{ padding: "10px 16px", borderRadius: 10, background: "rgba(255,255,255,0.15)", color: "#fff", border: "1px solid rgba(255,255,255,0.4)" }}
+        >
+          Tout sélectionner
+        </button>
+        <button
+          type="button"
+          onClick={doCrop}
+          disabled={busy}
+          style={{ padding: "10px 18px", borderRadius: 10, background: "var(--leather-dark, #5a3d2b)", color: "var(--cream, #fff)", border: "1px solid var(--gold, #c9a24b)", fontWeight: 600 }}
+        >
+          {busy ? "…" : "Valider le recadrage"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // === FORMULAIRE ===
 const BookForm = forwardRef(function BookForm(
   { books, structure, initial, onCancel, onSubmit, submitLabel, bareMode = false, onDirtyChange },
@@ -3588,6 +3807,9 @@ const BookForm = forwardRef(function BookForm(
   const [author, setAuthor] = useState(initial.author || "");
   const [isbn, setIsbn] = useState(initial.isbn || "");
   const [cover, setCover] = useState(initial.cover || "");
+  // Image en cours de recadrage (import d'un fichier OU « Recadrer » sur la
+  // couverture existante). Null = pas de recadrage en cours.
+  const [cropSrc, setCropSrc] = useState(null);
   const initialBib = initial.bibliotheque || structure.bibliotheques[0]?.id || "";
   const initialEtagere = initial.etagere || "1";
   const [bibliotheque, setBibliotheque] = useState(initialBib);
@@ -3645,12 +3867,12 @@ const BookForm = forwardRef(function BookForm(
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = async (ev) => {
-      // Compression avant stockage — voir compressImageDataUrl pour les détails.
-      const compressed = await compressImageDataUrl(ev.target.result);
-      setCover(compressed);
-    };
+    // On ouvre le recadreur avec l'image pleine résolution ; la compression
+    // se fait à la validation du recadrage.
+    reader.onload = (ev) => setCropSrc(ev.target.result);
     reader.readAsDataURL(file);
+    // Permet de re-sélectionner le même fichier plus tard.
+    e.target.value = "";
   };
 
   const handleRetryLookup = async () => {
@@ -3763,6 +3985,14 @@ const BookForm = forwardRef(function BookForm(
 
   return (
     <div className="space-y-4">
+      {/* Recadrage (import d'un fichier ou « Recadrer » sur la couverture). */}
+      {cropSrc && (
+        <ImageCropper
+          src={cropSrc}
+          onCancel={() => setCropSrc(null)}
+          onCrop={(dataUrl) => { setCover(dataUrl); setCropSrc(null); }}
+        />
+      )}
       <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", color: "var(--ink)" }}>
         Informations du livre
       </h2>
@@ -3784,6 +4014,16 @@ const BookForm = forwardRef(function BookForm(
             <Camera className="w-4 h-4 inline mr-1" /> {cover ? "Changer la couverture" : "Ajouter une photo"}
             <input type="file" accept="image/*" onChange={handleCoverUpload} className="hidden" />
           </label>
+          {cover && (
+            <button
+              type="button"
+              onClick={() => setCropSrc(cover)}
+              className="w-full py-2 px-3 rounded-lg border-2 text-xs text-center"
+              style={{ borderColor: "var(--gold)", color: "var(--leather-dark)" }}
+            >
+              <Edit2 className="w-3.5 h-3.5 inline mr-1" /> Recadrer la couverture
+            </button>
+          )}
           {cover && (
             <button
               type="button"
