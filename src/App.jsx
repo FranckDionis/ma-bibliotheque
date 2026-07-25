@@ -4239,6 +4239,51 @@ const BookForm = forwardRef(function BookForm(
         </div>
       </div>
 
+      {/* Bibliothèque virtuelle (classification) — placée juste sous le type
+          d'objet, visible sans avoir à déplier « Plus de détails ». */}
+      <Field label="📚 Bibliothèque virtuelle">
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "6px" }}>
+          {genre.length > 0 ? genre.map((g, i) => {
+            const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
+            const label = g.includes("/") ? g.split("/")[1] : g;
+            return (
+              <span key={i} style={{
+                display: "inline-flex", alignItems: "center", gap: "4px",
+                padding: "3px 8px", borderRadius: "12px", fontSize: "11px",
+                fontWeight: "600", background: colors.bg, color: colors.text,
+              }}>
+                {label}
+                <button
+                  onClick={() => setGenre(genre.filter((_, j) => j !== i))}
+                  style={{ background: "none", border: "none", cursor: "pointer",
+                    color: colors.text, fontSize: "13px", padding: "0", lineHeight: 1 }}
+                >×</button>
+              </span>
+            );
+          }) : (
+            <span style={{ fontSize: "12px", color: "var(--ink-soft)", fontStyle: "italic" }}>Aucune catégorie</span>
+          )}
+        </div>
+        <select
+          value=""
+          onChange={e => {
+            const val = e.target.value;
+            if (val && !genre.includes(val)) setGenre([...genre, val]);
+            e.target.value = "";
+          }}
+          style={{
+            width: "100%", padding: "10px", borderRadius: "8px",
+            border: "2px solid var(--parchment)", background: "white",
+            color: "var(--ink)", fontSize: "13px",
+          }}
+        >
+          <option value="">+ Ajouter une catégorie…</option>
+          {Object.keys(GENRE_COLORS).filter(g => !genre.includes(g) && g !== "À classer").map(g => (
+            <option key={g} value={g}>{g}</option>
+          ))}
+        </select>
+      </Field>
+
       <Field label={`${fields.titleLabel} *`}>
         <input
           value={title}
@@ -4589,50 +4634,6 @@ const BookForm = forwardRef(function BookForm(
               />
             </Field>
           )}
-
-          {/* Genres bibliothèque virtuelle */}
-          <Field label="📚 Bibliothèque virtuelle">
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "6px" }}>
-              {genre.length > 0 ? genre.map((g, i) => {
-                const colors = GENRE_COLORS[g] || { bg: "#6b3410", text: "#f4ecd8" };
-                const label = g.includes("/") ? g.split("/")[1] : g;
-                return (
-                  <span key={i} style={{
-                    display: "inline-flex", alignItems: "center", gap: "4px",
-                    padding: "3px 8px", borderRadius: "12px", fontSize: "11px",
-                    fontWeight: "600", background: colors.bg, color: colors.text,
-                  }}>
-                    {label}
-                    <button
-                      onClick={() => setGenre(genre.filter((_, j) => j !== i))}
-                      style={{ background: "none", border: "none", cursor: "pointer",
-                        color: colors.text, fontSize: "13px", padding: "0", lineHeight: 1 }}
-                    >×</button>
-                  </span>
-                );
-              }) : (
-                <span style={{ fontSize: "12px", color: "var(--ink-soft)", fontStyle: "italic" }}>Aucune catégorie</span>
-              )}
-            </div>
-            <select
-              value=""
-              onChange={e => {
-                const val = e.target.value;
-                if (val && !genre.includes(val)) setGenre([...genre, val]);
-                e.target.value = "";
-              }}
-              style={{
-                width: "100%", padding: "10px", borderRadius: "8px",
-                border: "2px solid var(--parchment)", background: "white",
-                color: "var(--ink)", fontSize: "13px",
-              }}
-            >
-              <option value="">+ Ajouter une catégorie…</option>
-              {Object.keys(GENRE_COLORS).filter(g => !genre.includes(g) && g !== "À classer").map(g => (
-                <option key={g} value={g}>{g}</option>
-              ))}
-            </select>
-          </Field>
 
           {/* Résumé */}
           {fields.showDescription && (
