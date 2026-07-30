@@ -1,118 +1,114 @@
 # Ma Bibliothèque
 
-Application web pour cataloguer vos livres à la maison, avec scan de code-barres ISBN, gestion des emplacements (pièces / bibliothèques / étagères) et plan visuel personnalisable.
+Application web (PWA) pour cataloguer une bibliothèque familiale : livres,
+revues, jeux de société et jeux Nintendo Switch. Scan de code-barres, recherche
+de métadonnées multi-sources, gestion des emplacements physiques
+(pièce → bibliothèque → étagère) et plan visuel personnalisable.
 
-Conçue pour fonctionner comme une vraie app sur iPhone (ajout à l'écran d'accueil).
-
----
-
-## 🚀 Déploiement sur Vercel — pas-à-pas
-
-Vous n'avez **rien à installer** sur votre ordinateur. Tout se fait dans le navigateur.
-
-### Étape 1 — Créer un compte GitHub (si vous n'en avez pas)
-
-1. Allez sur **https://github.com/signup**
-2. Choisissez un nom d'utilisateur, un email, un mot de passe
-3. Validez votre email
-
-### Étape 2 — Créer un dépôt et y mettre les fichiers
-
-1. Connecté à GitHub, cliquez sur le **« + »** en haut à droite → **« New repository »**
-2. Nom : `ma-bibliotheque` (ou ce que vous voulez)
-3. Laissez en **Public** (Vercel gratuit nécessite un dépôt public, sauf comptes payants)
-4. Cochez **« Add a README file »**
-5. Cliquez **« Create repository »**
-
-6. Sur la page du dépôt fraîchement créé, cliquez **« Add file » → « Upload files »**
-7. Glissez-déposez **TOUS** les fichiers et dossiers de ce projet :
-   - `package.json`
-   - `vite.config.js`
-   - `tailwind.config.js`
-   - `postcss.config.js`
-   - `index.html`
-   - `.gitignore`
-   - `README.md` (ce fichier)
-   - le dossier `src/` entier
-   - le dossier `public/` entier
-   - **Ne pas uploader** `node_modules/` ni `dist/` (s'ils existent)
-8. En bas, cliquez **« Commit changes »**
-
-### Étape 3 — Créer un compte Vercel
-
-1. Allez sur **https://vercel.com/signup**
-2. Cliquez **« Continue with GitHub »** (le plus simple)
-3. Autorisez Vercel à accéder à GitHub
-
-### Étape 4 — Déployer
-
-1. Sur le tableau de bord Vercel, cliquez **« Add New… » → « Project »**
-2. Trouvez le dépôt `ma-bibliotheque` dans la liste, cliquez **« Import »**
-3. Vercel détecte automatiquement Vite. **Ne touchez à rien**, cliquez juste **« Deploy »**
-4. Attendez ~1 minute. Une URL apparaît, du type `ma-bibliotheque-xyz123.vercel.app`
-
-### Étape 5 — Ouvrir sur iPhone et installer comme app
-
-1. Sur votre iPhone, ouvrez **Safari** (pas Chrome ni autre, Safari obligatoire pour l'installation)
-2. Allez sur l'URL Vercel obtenue à l'étape précédente
-3. Touchez le bouton **Partage** (carré avec flèche en bas de l'écran)
-4. Faites défiler et touchez **« Sur l'écran d'accueil »**
-5. Donnez le nom que vous voulez et touchez **« Ajouter »**
-
-L'app apparaît sur votre écran d'accueil avec son icône, et s'ouvre en plein écran sans la barre Safari, comme une vraie app.
-
-### Étape 6 — Autoriser la caméra
-
-Au premier scan, iOS demandera l'autorisation d'accéder à la caméra. Acceptez.
-
-Si vous l'avez refusée par erreur :
-- **Réglages iOS** → **Safari** → **Caméra** → choisissez **« Demander »** ou **« Autoriser »**
-- Puis rechargez l'app
+Conçue pour s'utiliser comme une vraie application sur iPhone, via l'ajout à
+l'écran d'accueil.
 
 ---
 
-## 💾 Où sont stockées les données ?
+## Comment ça marche
 
-Toutes vos données (livres, structure de bibliothèques, dispositions) sont stockées dans le **stockage local du navigateur** sur votre iPhone (`localStorage`). 
+L'application est un client React déployé sur Vercel. Les données vivent dans
+une base **Supabase** partagée : chaque membre du foyer se connecte avec son
+compte et voit la même bibliothèque, synchronisée en temps réel.
 
-**Cela signifie :**
-- ✅ Les données restent privées, rien n'est envoyé sur internet
-- ✅ Fonctionne hors ligne (sauf le scan des couvertures via ISBN qui interroge Open Library)
-- ⚠️ Les données sont liées à ce navigateur sur cet appareil. Si vous effacez les données Safari ou désinstallez l'app, vous perdez votre catalogue.
-- ⚠️ Pas de synchronisation automatique entre plusieurs iPhones
+```
+Navigateur (React + Vite)
+    │
+    ├── Supabase ............ base de données, authentification, temps réel
+    ├── /api/isbn ........... fonction serverless Vercel : interroge Google Books,
+    │                         Open Library, la BnF et Open Food Facts
+    └── IndexedDB ........... cache local des couvertures
+```
 
-> Une future version pourra ajouter export/import JSON pour sauvegarder votre catalogue.
+Un **mode local** de secours existe : le bouton « Continuer sans compte » stocke
+tout dans le navigateur, sans réseau. C'est un dépannage, pas le mode nominal —
+les données restent sur l'appareil et ne sont pas synchronisées.
+
+### Pourquoi un cache de couvertures
+
+Les couvertures sont stockées en base64 dans la base. Les retélécharger à chaque
+démarrage représente des centaines de Mo par jour et épuise le quota Supabase
+gratuit — c'est déjà arrivé. Elles sont donc mises en cache dans IndexedDB, et
+seules les couvertures absentes ou modifiées depuis la dernière synchro sont
+récupérées. Pour la même raison, les abonnements temps réel appliquent le delta
+reçu et ne rechargent jamais la liste complète.
 
 ---
 
-## 🔄 Mettre à jour l'app plus tard
+## Installation
 
-Si je vous fournis une version mise à jour du code :
-1. Sur GitHub, ouvrez le dépôt
-2. Pour chaque fichier modifié : ouvrez-le, cliquez le **crayon** ✏️, collez le nouveau contenu, **« Commit changes »**
-3. Vercel redéploie automatiquement en ~1 minute
-4. Sur votre iPhone, fermez et rouvrez l'app — la nouvelle version est chargée
+Pour installer sur des comptes neufs (GitHub + Supabase + Vercel), suivre le
+guide détaillé : **`Claude/INSTALLATION-NOUVEAU-COMPTE.md`**. Il contient le SQL
+de création des tables, les politiques de sécurité et la configuration pas-à-pas.
+
+Deux variables d'environnement sont nécessaires côté Vercel :
+
+| Variable | Valeur |
+|---|---|
+| `VITE_SUPABASE_URL` | l'URL du projet Supabase |
+| `VITE_SUPABASE_ANON_KEY` | la clé `anon public` |
+
+La clé `anon` est prévue pour figurer côté navigateur ; la sécurité repose sur
+les politiques RLS de Supabase. La clé `service_role`, elle, ne doit jamais
+apparaître dans ce dépôt ni dans les variables du client.
+
+Sans ces variables, l'application démarre quand même, en mode local.
 
 ---
 
-## 🛠️ Tester en local (optionnel, nécessite Node.js)
-
-Si jamais vous voulez bricoler le code sur votre ordinateur :
+## Développement
 
 ```bash
 npm install
 npm run dev
 ```
 
-Ouvrez l'URL affichée dans le terminal (par défaut http://localhost:5173).
+Créer un fichier `.env.local` (ignoré par git) avec les deux variables ci-dessus.
+Attention : il pointera vers la base **réellement utilisée** — travailler sur un
+projet Supabase de test évite de modifier les vraies fiches par accident.
+
+La fonction `api/isbn.js` est une fonction serverless Vercel : `vite` seul ne la
+sert pas en local, la recherche par code-barres passe donc par la version
+déployée.
 
 ---
 
-## 📦 Technologies utilisées
+## Installer sur iPhone
 
-- **React 18** + **Vite** : framework et build
-- **Tailwind CSS** : styles
-- **Lucide React** : icônes
-- **ZXing** (chargé via CDN) : scan de code-barres ISBN universel
-- **Open Library API** : récupération automatique des métadonnées de livres
-- **localStorage** : persistance des données sur l'appareil
+1. Ouvrir l'URL de l'application dans **Safari** (obligatoire pour l'installation)
+2. Se connecter
+3. Bouton **Partage** → **« Sur l'écran d'accueil »** → **Ajouter**
+
+Au premier scan, iOS demande l'accès à la caméra. En cas de refus accidentel :
+**Réglages → Safari → Caméra → « Demander »**, puis recharger.
+
+---
+
+## Sauvegarde
+
+Le menu Paramètres permet d'exporter tout le catalogue en JSON.
+
+⚠️ L'import ne se comporte pas de la même façon selon le mode :
+
+- **Mode cloud** : l'import n'écrit **rien** dans la base. Il charge la
+  sauvegarde à l'écran ; pour l'envoyer dans la base, utiliser ensuite
+  « Migrer vers le cloud », qui ajoute les livres absents sans rien supprimer.
+- **Mode local** : l'import remplace réellement et intégralement les données
+  stockées sur l'appareil.
+
+---
+
+## Technologies
+
+- **React 18** + **Vite** — framework et build
+- **Tailwind CSS** — styles
+- **Lucide React** — icônes
+- **ZXing** — scan de code-barres, intégré au bundle (et non chargé depuis un
+  CDN : il doit fonctionner hors ligne et malgré les bloqueurs)
+- **Supabase** — base de données, authentification, temps réel
+- **Google Books, Open Library, BnF, Open Food Facts** — métadonnées

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, forwardRef, useImperativeHandle } from "react";
+import React, { useState, useEffect, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
 import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload, LogOut, Cloud, CloudOff, Sparkles } from "lucide-react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
 import { BarcodeFormat, DecodeHintType } from "@zxing/library";
@@ -186,6 +186,48 @@ const ICON_CHOICES = ["🍽️", "🛋️", "🛏️", "📚", "🚪", "🪑", "
 
 // Génère un ID unique
 const genId = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+// ============================================================
+// RECHERCHE : NORMALISATION ET INDEX
+// ============================================================
+// Une bibliothèque française est pleine d'accents. Chercher « éco » sans
+// trouver « Eco » — ou l'inverse — rend la recherche inutilisable. On retire
+// donc les diacritiques avant de comparer : NFD décompose « é » en « e » +
+// accent combinant, et la plage U+0300–U+036F élimine ces accents.
+// Les échappements \u sont écrits explicitement : une plage de caractères
+// combinants tapée littéralement serait invisible à la relecture et cassée
+// par le moindre incident d'encodage.
+function normalizeForSearch(s) {
+  return (s || "")
+    .toString()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+// Texte de recherche d'un livre : tous les champs interrogeables concaténés
+// et normalisés une seule fois.
+//
+// Le cache est une WeakMap indexée par l'OBJET livre lui-même, et c'est ce
+// qui rend l'opération gratuite en pratique. Les mises à jour d'état passent
+// par `prev.map(b => condition ? {...b, champ} : b)` : les livres non modifiés
+// conservent leur identité, donc leur entrée de cache. Seuls les objets
+// réellement recréés sont renormalisés — typiquement 30 lors d'un lot de
+// couvertures, pas les 3 000. Une WeakMap n'empêche pas la libération mémoire
+// des livres supprimés.
+const searchTextCache = new WeakMap();
+function bookSearchText(book) {
+  let text = searchTextCache.get(book);
+  if (text === undefined) {
+    text = normalizeForSearch(
+      [book.title, book.subtitle, book.author, book.notes, book.description, book.isbn]
+        .filter(Boolean)
+        .join(" ")
+    );
+    searchTextCache.set(book, text);
+  }
+  return text;
+}
 
 // ============================================================
 // PLACEMENT INTELLIGENT DES OBJETS SUR UNE ÉTAGÈRE
@@ -1726,18 +1768,37 @@ export default function App() {
     }
   };
 
-  const filteredBooks = books.filter((b) => {
-    const matchSearch = !searchQuery ||
-      b.title?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      b.author?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      b.isbn?.includes(searchQuery);
+  // Mots de la recherche, normalisés une fois par frappe (et non par livre).
+  // Découper en mots permet « hugo miserables » : chaque mot doit être présent,
+  // dans n'importe quel ordre et n'importe quel champ.
+  const searchTerms = useMemo(
+    () => normalizeForSearch(searchQuery).split(/\s+/).filter(Boolean),
+    [searchQuery]
+  );
+
+  // Index bibliothèque → pièce, construit une fois par changement de structure.
+  // Auparavant, un `.find()` sur toutes les bibliothèques était refait POUR
+  // CHAQUE LIVRE à chaque frappe au clavier.
+  const pieceOfBib = useMemo(() => {
+    const m = new Map();
+    for (const bib of structure.bibliotheques) m.set(bib.id, bib.pieceId);
+    return m;
+  }, [structure.bibliotheques]);
+
+  const filteredBooks = useMemo(() => books.filter((b) => {
+    // Tous les mots doivent être trouvés, sur titre / sous-titre / auteur /
+    // notes / description / ISBN, accents ignorés des deux côtés.
+    const matchSearch =
+      searchTerms.length === 0 ||
+      (() => {
+        const hay = bookSearchText(b);
+        return searchTerms.every((t) => hay.includes(t));
+      })();
 
     // Filtre PIÈCE : trouve la pièce de la bibliothèque du livre
-    let matchPiece = filterPiece === "all";
-    if (!matchPiece && b.bibliotheque) {
-      const bib = structure.bibliotheques.find((x) => x.id === b.bibliotheque);
-      matchPiece = bib?.pieceId === filterPiece;
-    }
+    const matchPiece =
+      filterPiece === "all" ||
+      (!!b.bibliotheque && pieceOfBib.get(b.bibliotheque) === filterPiece);
 
     const matchBib = filterBib === "all" || b.bibliotheque === filterBib;
     const matchEtagere = filterEtagere === "all" || Number(b.etagere) === Number(filterEtagere);
@@ -1752,7 +1813,7 @@ export default function App() {
           ? !b.title || !b.title.trim()
           : itemType === filterType;
     return matchSearch && matchPiece && matchBib && matchEtagere && matchType;
-  });
+  }), [books, searchTerms, pieceOfBib, filterPiece, filterBib, filterEtagere, filterType]);
 
   // === EXPORT / IMPORT ===
   const handleExport = () => {
