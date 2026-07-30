@@ -43,6 +43,14 @@ export async function fetchBooks() {
       .from("books")
       .select(LIGHT_COLUMNS)
       .order("created_at", { ascending: false })
+      // Second critère INDISPENSABLE : `created_at` seul ne suffit pas à
+      // départager les livres insérés dans la même transaction (import en
+      // masse, migration), qui partagent la même valeur à la microseconde.
+      // Postgres est alors libre de renvoyer les ex æquo dans un ordre
+      // différent d'une requête à l'autre — donc d'une PAGE à l'autre : un
+      // même livre peut apparaître deux fois, et un autre être sauté sans
+      // aucune erreur. Trier aussi sur l'id (unique) fige l'ordre.
+      .order("id", { ascending: false })
       .range(from, to);
     if (error) throw error;
     if (!data || data.length === 0) break;

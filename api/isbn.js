@@ -7,15 +7,26 @@
 // Renvoie : { title, author, cover, publisher, year, source } ou { error: "not-found" }
 
 export default async function handler(req, res) {
+  // CORS posé AVANT toute sortie : placé plus bas, il manquait sur la réponse
+  // 400 du cas "code invalide", que le navigateur bloquait donc au lieu de
+  // laisser l'app lire le message d'erreur.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // Requête de pré-vol : on répond sans rien interroger.
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   const code = (req.query.code || "").replace(/[^0-9X]/gi, "");
   const type = (req.query.type || "").toLowerCase();
   if (!code || code.length < 10) {
     return res.status(400).json({ error: "code-invalid" });
   }
 
-  // CORS pour usage depuis l'app
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Cache-Control", "public, max-age=2592000, s-maxage=2592000"); // cache 30 jours
+  // Cache 30 jours — uniquement sur les réponses utiles, pas sur les erreurs.
+  res.setHeader("Cache-Control", "public, max-age=2592000, s-maxage=2592000");
 
   // On lance toutes les sources en parallèle. Coût quasi nul, et la fusion
   // saura choisir la bonne réponse selon le type.

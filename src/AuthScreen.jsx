@@ -49,6 +49,10 @@ export default function AuthScreen({ onAuthSuccess, onSkip }) {
       const msg = e.message || "Erreur";
       if (msg.includes("Invalid login credentials")) {
         setError("Email ou mot de passe incorrect");
+      } else if (msg.includes("Signups not allowed") || msg.includes("signup_disabled")) {
+        // Cas normal depuis que l'inscription libre est fermée côté Supabase :
+        // la bibliothèque est privée, les comptes sont créés par l'administrateur.
+        setError("La création de compte est fermée. Demandez à l'administrateur de la bibliothèque de vous créer un accès.");
       } else if (msg.includes("User already registered")) {
         setError("Un compte existe déjà avec cet email. Connectez-vous.");
       } else if (msg.includes("Email not confirmed")) {

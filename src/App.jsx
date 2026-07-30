@@ -1794,8 +1794,35 @@ export default function App() {
         showToast("Fichier invalide", "error");
         return;
       }
-      // Confirmation simple via window.confirm
-      const summary = `Importer ${data.books.length} livres et ${data.structure?.bibliotheques?.length || 0} bibliothèques ?\n\nCela REMPLACERA toutes les données actuelles.`;
+      // ⚠️ L'import se comporte DIFFÉREMMENT selon le mode, et c'est voulu.
+      //
+      // En mode cloud, `saveBooks` ne fait qu'un setBooks : il n'écrit rien
+      // dans Supabase. En revanche `saveStructure` et `saveLayout`, eux,
+      // écrivent bel et bien en base. Enchaîner les trois comme avant
+      // produisait le pire résultat possible : les livres n'étaient remplacés
+      // qu'à l'écran (un rechargement les faisait revenir) pendant que la
+      // structure et le plan étaient réellement écrasés en base, sans retour
+      // arrière — alors que la confirmation annonçait un remplacement complet.
+      //
+      // On sépare donc franchement les deux cas.
+      if (isCloudMode) {
+        const msg =
+          `Charger ${data.books.length} livre${data.books.length > 1 ? "s" : ""} depuis cette sauvegarde ?\n\n` +
+          `⚠️ RIEN ne sera écrit dans la base partagée : les livres seront seulement affichés dans l'application, ` +
+          `et la structure ainsi que le plan resteront inchangés.\n\n` +
+          `Pour envoyer ensuite ces livres dans la base, utilisez « Migrer vers le cloud » : ` +
+          `il ajoute les livres absents sans jamais supprimer ni modifier l'existant.\n\n` +
+          `Un rechargement de la page annule ce chargement.`;
+        if (!window.confirm(msg)) return;
+        setBooks(data.books);
+        showToast(`${data.books.length} livres chargés (pas encore enregistrés)`);
+        setShowSettings(false);
+        return;
+      }
+
+      // Mode local : là, le remplacement est réel et complet, puisque tout
+      // est stocké sur l'appareil.
+      const summary = `Importer ${data.books.length} livres et ${data.structure?.bibliotheques?.length || 0} bibliothèques ?\n\nCela REMPLACERA toutes les données stockées sur cet appareil.`;
       if (!window.confirm(summary)) return;
 
       await saveBooks(data.books);
