@@ -8,7 +8,6 @@ import {
   saveStructureRemote,
   saveLayoutRemote,
   fetchBooks as fetchBooksRemote,
-  fetchBookCovers as fetchBookCoversRemote,
   fetchStructure as fetchStructureRemote,
   fetchLayout as fetchLayoutRemote,
   insertBook as insertBookRemote,
@@ -21,13 +20,6 @@ import {
 } from "./db";
 import AuthScreen from "./AuthScreen";
 import { ITEM_TYPES, ITEM_TYPES_LIST, guessTypeFromBarcode, FIELDS_BY_TYPE, recognizeMagazine, recognizeGame, recognizePressPublisher } from "./itemTypes";
-import {
-  getCachedCovers,
-  setCachedCovers,
-  deleteCachedCover,
-  clearCoverCache,
-  getCachedCoverIds,
-} from "./coverCache";
 
 // ============================================================
 // COUVERTURE ADAPTATIVE (portrait livre / paysage jeu)
@@ -1251,93 +1243,15 @@ export default function App() {
           if (cancelled) return;
           setBooks(remoteBooks);
 
-          // === CHARGEMENT DES COUVERTURES AVEC CACHE LOCAL ===
-          // fetchBooksRemote() ne charge pas la colonne `cover` (trop lourde
-          // pour 800+ livres). Pour économiser massivement la bande passante
-          // Supabase, on utilise un cache IndexedDB local :
-          //   1. On lit d'abord toutes les couvertures déjà en cache (instant)
-          //   2. On affiche immédiatement les livres avec leurs covers cachées
-          //   3. On ne télécharge depuis Supabase QUE les ids non cachés
-          //      (typiquement : zéro, sauf au tout premier démarrage ou
-          //      quand de nouveaux livres ont été ajoutés depuis)
-          //   4. On met le cache à jour avec les nouvelles couvertures
-          (async () => {
-            const ids = remoteBooks.map((b) => b.id).filter(Boolean);
+          // Les couvertures arrivent maintenant avec les livres : ce ne
+          // sont plus que des URL, servies ensuite par le CDN. Tout le
+          // dispositif qui se trouvait ici — lecture d'un cache IndexedDB,
+          // détection des couvertures périmées par comparaison de dates,
+          // retéléchargement par lots de 30, borne de synchronisation — n'a
+          // plus d'objet. Il existait parce qu'une image en base64 dans la
+          // base coûtait des centaines de Mo de bande passante à chaque
+          // démarrage.
 
-            // 1. Lecture du cache local
-            let cached = new Map();
-            try {
-              cached = await getCachedCovers(ids);
-            } catch (e) {
-              console.warn("Cache de couvertures non lisible:", e?.message);
-            }
-            if (cancelled) return;
-            if (cached.size > 0) {
-              setBooks((prev) => prev.map((b) =>
-                cached.has(b.id) ? { ...b, cover: cached.get(b.id) } : b
-              ));
-            }
-
-            // 2. Détermine les couvertures à (re)télécharger :
-            //    - celles ABSENTES du cache
-            //    - ET celles dont le livre a été MODIFIÉ depuis la dernière
-            //      synchro. Sans ce second point, une couverture changée sur un
-            //      AUTRE appareil restait masquée à jamais par le cache local
-            //      périmé (bug « recadré sur le PC → ancien sur le téléphone »).
-            let sinceStr = null;
-            try {
-              sinceStr = (await window.storage.get("coverSyncSince"))?.value || null;
-            } catch (e) { /* ignore */ }
-            // Marge de sécurité (10 min) contre les petits décalages d'horloge
-            // entre appareils (updated_at est posé côté client à l'écriture).
-            const boundary = (sinceStr ? Date.parse(sinceStr) : 0) - 10 * 60 * 1000;
-
-            const missingIds = ids.filter((id) => !cached.has(id));
-            const staleIds = remoteBooks
-              .filter((b) => b.id && cached.has(b.id) && b.updatedAt && Date.parse(b.updatedAt) > boundary)
-              .map((b) => b.id);
-            const refetch = Array.from(new Set([...missingIds, ...staleIds]));
-
-            // Nouvelle borne de synchro (maintenant), mémorisée en fin de passe.
-            const syncStamp = new Date().toISOString();
-
-            if (refetch.length === 0) {
-              window.storage.set("coverSyncSince", syncStamp).catch(() => {});
-              return; // tout est déjà à jour
-            }
-
-            console.log(`Couvertures à synchroniser : ${refetch.length} (${missingIds.length} manquantes, ${staleIds.length} modifiées) sur ${ids.length} livres`);
-            const COVER_BATCH = 30;
-            for (let i = 0; i < refetch.length; i += COVER_BATCH) {
-              if (cancelled) return;
-              const slice = refetch.slice(i, i + COVER_BATCH);
-              try {
-                const covers = await fetchBookCoversRemote(slice);
-                if (cancelled) return;
-                if (covers.size > 0) {
-                  // Met à jour le state ET le cache pour les prochains démarrages
-                  setBooks((prev) => prev.map((b) =>
-                    covers.has(b.id) ? { ...b, cover: covers.get(b.id) } : b
-                  ));
-                  setCachedCovers(covers).catch(() => {});
-                }
-                // Ids demandés mais SANS couverture renvoyée = couverture
-                // supprimée sur un autre appareil → on purge cache + état local.
-                const removed = slice.filter((id) => !covers.has(id) && cached.has(id));
-                if (removed.length > 0) {
-                  setBooks((prev) => prev.map((b) =>
-                    removed.includes(b.id) && b.cover ? { ...b, cover: "" } : b
-                  ));
-                  removed.forEach((id) => deleteCachedCover(id).catch(() => {}));
-                }
-              } catch (e) {
-                console.warn("Lot de couvertures non chargé:", e?.message);
-              }
-              await new Promise((r) => setTimeout(r, 50));
-            }
-            // Passe terminée : on avance la borne de synchro.
-            window.storage.set("coverSyncSince", syncStamp).catch(() => {});
-          })();
           if (remoteStructure && (remoteStructure.pieces?.length || 0) > 0) {
             setStructure({
               pieces: remoteStructure.pieces || INITIAL_PIECES,
@@ -1465,10 +1379,6 @@ export default function App() {
             if (prev.some((b) => b.id === newBook.id)) return prev;
             return [newBook, ...prev];
           });
-          // Met en cache la couverture du nouveau livre pour les prochaines sessions
-          if (newBook.cover && newBook.id) {
-            setCachedCovers({ [newBook.id]: newBook.cover }).catch(() => {});
-          }
         } else if (eventType === "UPDATE" && payload.new) {
           const updatedBook = dbToBook(payload.new);
           setBooks((prev) => prev.map((b) => {
@@ -1481,19 +1391,9 @@ export default function App() {
             }
             return merged;
           }));
-          // Synchronise le cache : la couverture a peut-être changé
-          if (updatedBook.id) {
-            if (updatedBook.cover) {
-              setCachedCovers({ [updatedBook.id]: updatedBook.cover }).catch(() => {});
-            } else {
-              deleteCachedCover(updatedBook.id).catch(() => {});
-            }
-          }
         } else if (eventType === "DELETE" && payload.old) {
           const deletedId = payload.old.id;
           setBooks((prev) => prev.filter((b) => b.id !== deletedId));
-          // Nettoie le cache pour libérer de la place
-          deleteCachedCover(deletedId).catch(() => {});
         }
       } catch (e) { /* ignore */ }
     });
@@ -1632,34 +1532,18 @@ export default function App() {
     }
   };
 
-  // Garde le cache IndexedDB des couvertures aligné avec ce qu'on enregistre,
-  // pour tout `updates` contenant la clé `cover`. Non bloquant.
-  const syncCoverCache = (id, updates) => {
-    if (!id || !updates || !Object.prototype.hasOwnProperty.call(updates, "cover")) return;
-    if (updates.cover) {
-      setCachedCovers({ [id]: updates.cover }).catch(() => {});
-    } else {
-      deleteCachedCover(id).catch(() => {});
-    }
-  };
-
   const updateBook = async (id, updates) => {
     if (isCloudMode) {
       try {
+        // ⚠️ On applique la réponse du SERVEUR telle quelle, sans y
+        // réinjecter `updates`. Quand la modification porte sur une
+        // couverture, `updates.cover` contient l'image en data URL, que
+        // la couche db.js vient de déposer dans le Storage : c'est donc
+        // le serveur qui détient la bonne valeur, l'URL définitive.
+        // Forcer `updates.cover` ici laisserait l'image lourde dans
+        // l'état local, et masquerait le suffixe anti-cache.
         const updated = await updateBookRemote(id, updates);
-        // On force la nouvelle couverture dans le state local même si le retour
-        // serveur ne renvoie pas la colonne `cover` (allégée au chargement).
-        const localPatch = { ...updated };
-        if (Object.prototype.hasOwnProperty.call(updates, "cover")) {
-          localPatch.cover = updates.cover;
-        }
-        setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, ...localPatch } : b)));
-        // ⚠️ Synchronise le CACHE LOCAL de couvertures. Au démarrage, les
-        // couvertures sont lues depuis ce cache IndexedDB et le serveur n'est
-        // PAS re-sollicité pour un id déjà en cache. Sans cette synchro, une
-        // couverture recadrée/enregistrée réapparaît à l'ancienne après un
-        // redémarrage (le cache masque la version en base).
-        syncCoverCache(id, updates);
+        setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, ...updated } : b)));
         showToast("Livre mis à jour");
       } catch (e) {
         showToast(`Erreur : ${e.message}`, "error");
@@ -1670,7 +1554,6 @@ export default function App() {
         window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
         return next;
       });
-      syncCoverCache(id, updates);
       showToast("Livre mis à jour");
     }
   };
@@ -1733,9 +1616,11 @@ export default function App() {
   const persistBookUpdate = async (id, updates) => {
     if (isCloudMode) {
       try {
-        await updateBookRemote(id, updates);
-        setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, ...updates } : b)));
-        syncCoverCache(id, updates);
+        // Comme dans updateBook : on applique la réponse du serveur, qui
+        // porte l'URL de la couverture déposée dans le Storage, et non
+        // l'image en data URL qu'on vient d'envoyer.
+        const updated = await updateBookRemote(id, updates);
+        setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, ...updated } : b)));
       } catch (e) { /* ignore */ }
     } else {
       setBooks((prev) => {
@@ -1743,7 +1628,6 @@ export default function App() {
         window.storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
         return next;
       });
-      syncCoverCache(id, updates);
     }
   };
 
@@ -8139,25 +8023,12 @@ function SettingsModal({
                   <LogOut className="w-4 h-4" /> Se déconnecter
                 </button>
 
-                {/* Vidage du cache local des couvertures.
-                    Le cache économise la bande passante Supabase en stockant
-                    les images dans IndexedDB côté navigateur. Si jamais elles
-                    apparaissent corrompues ou obsolètes, ce bouton force un
-                    rechargement complet depuis la base au prochain démarrage. */}
-                <button
-                  onClick={async () => {
-                    try {
-                      await clearCoverCache();
-                      showToast?.("Cache vidé — rechargez l'app pour retélécharger les couvertures");
-                    } catch (e) {
-                      showToast?.(`Erreur : ${e.message}`, "error");
-                    }
-                  }}
-                  className="w-full py-2 rounded-lg text-xs font-medium border flex items-center justify-center gap-1.5 mb-2"
-                  style={{ borderColor: "var(--gold)", color: "var(--leather-dark)" }}
-                >
-                  Vider le cache local des couvertures
-                </button>
+                {/* Le bouton « Vider le cache local des couvertures » se
+                    trouvait ici. Il n'a plus d'objet : les couvertures sont
+                    servies par le CDN à partir d'URL, et c'est le navigateur
+                    qui gère leur cache. Un remplacement d'image reste visible
+                    immédiatement grâce au suffixe de version ajouté à l'URL
+                    au moment de l'envoi (voir materialiserCover dans db.js). */}
 
                 {/* Bouton de migration des livres locaux vers la base partagée.
                     Affiché si window.storage contient des livres, OU si le

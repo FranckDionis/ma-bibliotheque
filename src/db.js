@@ -9,13 +9,23 @@ import { supabase } from "./supabase";
 
 // === BOOKS ===
 
-// Liste des colonnes "légères" (toutes sauf `cover` qui peut peser
-// plusieurs centaines de Ko en base64). Charger 800+ livres avec
-// leurs couvertures peut représenter des dizaines de Mo et faire
-// échouer la requête HTTP avec un 500. Les couvertures sont donc
-// chargées séparément, à la demande, via fetchBookCovers().
+// Nom du bucket de stockage des couvertures (voir le schéma SQL).
+const BUCKET_COUVERTURES = "couvertures";
+
+// Toutes les colonnes, couverture comprise.
+//
+// Historiquement, `cover` contenait l'image entière encodée en base64 —
+// jusqu'à plusieurs centaines de Ko par livre. La charger pour 3 000
+// fiches représentait des centaines de Mo, d'où un chargement séparé par
+// lots, un cache IndexedDB et une machinerie de synchronisation.
+//
+// Depuis la migration vers le Storage, `cover` ne contient plus qu'une
+// URL d'une centaine d'octets. Tout tient donc dans la requête normale :
+// plus de second aller-retour, plus de cache à tenir à jour, et les
+// couvertures s'affichent dès le premier rendu.
 const LIGHT_COLUMNS = [
   "id", "type", "isbn", "title", "subtitle", "author",
+  "cover", "cover_path",
   "bibliotheque", "etagere", "position",
   "notes", "pages", "language", "description", "categories",
   "rating", "ratings_count", "info_link",
@@ -26,8 +36,8 @@ const LIGHT_COLUMNS = [
   "created_at", "updated_at",
 ].join(",");
 
-// Lit tous les livres de la base (SANS les couvertures pour rester léger).
-// Les couvertures sont chargées à la demande par fetchBookCovers().
+// Lit tous les livres de la base, couvertures comprises — ce ne sont
+// plus que des URL.
 //
 // IMPORTANT : Supabase plafonne par défaut chaque requête à 1000 lignes.
 // On boucle donc avec .range(from, to) pour récupérer toute la table,
@@ -62,52 +72,106 @@ export async function fetchBooks() {
   return allRows.map(dbToBook);
 }
 
-// Charge les couvertures de plusieurs livres en une requête.
-// Renvoie un Map<id, coverDataUrl>. Les ids absents = pas de cover en base.
-// Si l'appelant fournit un grand nombre d'ids, on découpe pour rester sous
-// la limite de 1000 lignes par requête.
-export async function fetchBookCovers(ids) {
-  if (!supabase) return new Map();
-  if (!Array.isArray(ids) || ids.length === 0) return new Map();
-  const map = new Map();
-  const CHUNK = 500; // marge confortable sous la limite Supabase
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const slice = ids.slice(i, i + CHUNK);
-    const { data, error } = await supabase
-      .from("books")
-      .select("id,cover")
-      .in("id", slice);
-    if (error) throw error;
-    for (const row of data || []) {
-      if (row.cover) map.set(row.id, row.cover);
-    }
-  }
-  return map;
+// ============================================================
+// COUVERTURES : ENVOI VERS LE STORAGE
+// ============================================================
+// La base ne doit plus JAMAIS recevoir d'image encodée en base64 : c'est
+// ce qui l'avait amenée à 84 % de la limite du plan gratuit, et à un
+// premier projet mis en défaut pour dépassement de quota.
+//
+// Ce garde-fou est volontairement placé ici, dans la couche d'accès aux
+// données, et non dans les composants : tout enregistrement de livre
+// passe par insertBook, updateBook ou insertBooksBulk. Une image
+// arrivant par un chemin nouveau — scan, recadrage, photo de secours,
+// enrichissement — sera donc déposée dans le Storage sans que le code
+// appelant ait à s'en préoccuper, ni à y penser.
+
+// Convertit une data URL en Blob, sans passer par fetch() : plus direct
+// et surtout synchrone.
+function dataUrlToBlob(dataUrl) {
+  const virgule = dataUrl.indexOf(",");
+  const entete = dataUrl.slice(0, virgule);
+  const type = entete.match(/data:([^;]+)/)?.[1] || "image/jpeg";
+  const binaire = atob(dataUrl.slice(virgule + 1));
+  const octets = new Uint8Array(binaire.length);
+  for (let i = 0; i < binaire.length; i++) octets[i] = binaire.charCodeAt(i);
+  return new Blob([octets], { type });
+}
+
+// Dépose l'image dans le Storage et renvoie son URL publique.
+// Laisse passer sans rien faire ce qui est déjà une URL, ou vide.
+async function materialiserCover(bookId, cover) {
+  if (!cover || typeof cover !== "string") return cover;
+  if (!cover.startsWith("data:")) return cover; // déjà une URL
+  if (!bookId) return cover;                     // sans id, pas de chemin stable
+
+  const chemin = `${bookId}.jpg`;
+  const { error } = await supabase.storage
+    .from(BUCKET_COUVERTURES)
+    .upload(chemin, dataUrlToBlob(cover), {
+      contentType: "image/jpeg",
+      cacheControl: "31536000", // un an : une couverture ne change quasiment jamais
+      upsert: true,             // un recadrage remplace l'image en place
+    });
+  if (error) throw new Error(`Envoi de la couverture : ${error.message}`);
+
+  const { data } = supabase.storage.from(BUCKET_COUVERTURES).getPublicUrl(chemin);
+  // Le suffixe ?v= est INDISPENSABLE : le chemin ne changeant pas d'une
+  // version à l'autre, et le CDN gardant l'image un an, un recadrage
+  // resterait invisible sans lui — l'ancienne image serait resservie.
+  return `${data.publicUrl}?v=${Date.now()}`;
+}
+
+// Supprime l'image d'un livre. Sans erreur si elle n'existe pas.
+async function supprimerCover(bookId) {
+  if (!supabase || !bookId) return;
+  await supabase.storage.from(BUCKET_COUVERTURES).remove([`${bookId}.jpg`]);
 }
 
 // Insère un nouveau livre
 export async function insertBook(book) {
   if (!supabase) throw new Error("Supabase non configuré");
-  const dbRow = bookToDb(book);
-  // L'id est auto-généré côté Supabase ; on le retire si présent
-  delete dbRow.id;
+  // L'id est engendré ici plutôt que par la base : le nom du fichier de
+  // couverture en dépend, et il faut donc le connaître AVANT l'insertion
+  // pour tout écrire en une seule requête.
+  const id = crypto.randomUUID();
+  const cover = await materialiserCover(id, book.cover);
+
+  const dbRow = bookToDb({ ...book, cover });
+  dbRow.id = id;
+  if (cover && cover.includes(`/${id}.jpg`)) dbRow.cover_path = `${id}.jpg`;
+
   const { data, error } = await supabase
     .from("books")
     .insert(dbRow)
     .select()
     .single();
-  if (error) throw error;
+  if (error) {
+    // L'image a peut-être déjà été déposée : ne pas laisser d'orphelin.
+    await supprimerCover(id).catch(() => {});
+    throw error;
+  }
   return dbToBook(data);
 }
 
 // Met à jour un livre existant
 export async function updateBook(id, updates) {
   if (!supabase) throw new Error("Supabase non configuré");
-  const dbUpdates = bookToDb(updates);
+
+  const majuscules = { ...updates };
+  if ("cover" in majuscules) {
+    majuscules.cover = await materialiserCover(id, majuscules.cover);
+    majuscules.coverPath = majuscules.cover ? `${id}.jpg` : null;
+    // Couverture retirée : on libère aussi le fichier.
+    if (!majuscules.cover) await supprimerCover(id).catch(() => {});
+  }
+
+  const dbUpdates = bookToDb(majuscules);
   delete dbUpdates.id;
   delete dbUpdates.created_at;
   delete dbUpdates.created_by;
-  dbUpdates.updated_at = new Date().toISOString();
+  // updated_at est désormais posé par un déclencheur de la base, dont
+  // l'horloge fait autorité — celle d'un téléphone peut dériver.
   const { data, error } = await supabase
     .from("books")
     .update(dbUpdates)
@@ -118,25 +182,43 @@ export async function updateBook(id, updates) {
   return dbToBook(data);
 }
 
-// Supprime un livre
+// Supprime un livre, et sa couverture avec lui
 export async function deleteBook(id) {
   if (!supabase) throw new Error("Supabase non configuré");
   const { error } = await supabase.from("books").delete().eq("id", id);
   if (error) throw error;
+  // Après la suppression de la fiche : une image orpheline occuperait le
+  // quota pour rien, mais son échec ne doit pas faire échouer l'opération.
+  await supprimerCover(id).catch(() => {});
 }
 
-// Insertion en masse (utile pour la migration depuis le local)
-// Insère par lots pour respecter les limites du serveur
+// Insertion en masse (migration depuis le mode local, restauration)
 export async function insertBooksBulk(books, onProgress) {
   if (!supabase) throw new Error("Supabase non configuré");
   const BATCH_SIZE = 50;
   let inserted = 0;
   for (let i = 0; i < books.length; i += BATCH_SIZE) {
-    const batch = books.slice(i, i + BATCH_SIZE).map((b) => {
-      const row = bookToDb(b);
-      delete row.id; // laisser Supabase générer un nouvel UUID
-      return row;
-    });
+    const tranche = books.slice(i, i + BATCH_SIZE);
+
+    // Les couvertures partent d'abord vers le Storage : une insertion en
+    // masse d'images base64 remplirait la base aussi sûrement qu'avant.
+    const batch = [];
+    for (const b of tranche) {
+      const id = crypto.randomUUID();
+      let cover = b.cover;
+      try {
+        cover = await materialiserCover(id, b.cover);
+      } catch (e) {
+        // Une image qui échoue ne doit pas faire perdre la fiche.
+        console.warn(`Couverture non transférée (${b.title || "sans titre"}) : ${e.message}`);
+        cover = null;
+      }
+      const row = bookToDb({ ...b, cover });
+      row.id = id;
+      if (cover && cover.includes(`/${id}.jpg`)) row.cover_path = `${id}.jpg`;
+      batch.push(row);
+    }
+
     const { error } = await supabase.from("books").insert(batch);
     if (error) throw error;
     inserted += batch.length;
@@ -256,6 +338,7 @@ function dbToBook(row) {
     subtitle: row.subtitle || "",
     author: row.author || "",
     cover: row.cover || "",
+    coverPath: row.cover_path || "",
     bibliotheque: row.bibliotheque || "",
     etagere: row.etagere || 1,
     position: row.position || 1,
@@ -304,6 +387,7 @@ function bookToDb(book) {
   if ("subtitle" in book) out.subtitle = book.subtitle || null;
   if ("author" in book) out.author = book.author || null;
   if ("cover" in book) out.cover = book.cover || null;
+  if ("coverPath" in book) out.cover_path = book.coverPath || null;
   if ("bibliotheque" in book) out.bibliotheque = book.bibliotheque || null;
   if ("etagere" in book) out.etagere = typeof book.etagere === "number" ? book.etagere : parseInt(book.etagere) || 1;
   if ("position" in book) out.position = typeof book.position === "number" ? book.position : parseInt(book.position) || 1;

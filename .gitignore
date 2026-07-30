@@ -3,5 +3,7 @@ dist
 .DS_Store
 *.log
 .vite
-.env
-.env.local
+# Ce depot est PUBLIC. Le motif couvre volontairement toute variante
+# (.env.local, .env.production, .env.local.sauvegarde...) : lister les
+# noms un par un laisse passer le fichier auquel on n'avait pas pense.
+.env*
