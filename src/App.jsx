@@ -1167,6 +1167,16 @@ export default function App() {
   const [enrichProgress, setEnrichProgress] = useState(null);
   const enrichCancelRef = useRef(false);
 
+  // Détecte, au tout premier rendu, qu'on arrive depuis un lien de
+  // récupération de mot de passe. Lu une seule fois : le jeton est ensuite
+  // effacé de la barre d'adresse, et relire l'URL donnerait faux.
+  const [recoveryMode, setRecoveryMode] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return /type=recovery|token_hash=/.test(
+      (window.location.hash || "") + (window.location.search || "")
+    );
+  });
+
   // === ÉTAT D'AUTHENTIFICATION ===
   // null = pas encore vérifié | { user, session } = connecté | "skipped" = mode local choisi
   const [authState, setAuthState] = useState(null);
@@ -2275,6 +2285,21 @@ export default function App() {
       <div className="min-h-screen flex items-center justify-center" style={{ background: "#f4ecd8" }}>
         <Loader2 className="w-8 h-8 animate-spin" style={{ color: "#6b3410" }} />
       </div>
+    );
+  }
+
+  // Retour d'un lien « mot de passe oublié ». Ce cas passe AVANT le reste :
+  // il doit s'imposer même si une session existe déjà sur l'appareil, sans
+  // quoi la bibliothèque s'afficherait et le lien resterait sans effet.
+  if (isSupabaseConfigured && recoveryMode) {
+    return (
+      <AuthScreen
+        recovery
+        onAuthSuccess={(session) => {
+          setRecoveryMode(false);
+          if (session) setAuthState({ session, user: session.user });
+        }}
+      />
     );
   }
 
