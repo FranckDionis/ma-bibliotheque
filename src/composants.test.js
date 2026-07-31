@@ -65,6 +65,94 @@ describe("Résolution des composants JSX", () => {
   }
 });
 
+// ============================================================
+// SECOND VOLET : les appels de fonctions
+// ============================================================
+// Le test ci-dessus ne voit que le JSX. Un module extrait qui appelle
+// une fonction restée dans App.jsx — un utilitaire de compression, un
+// helper de tri — compile tout aussi bien et échoue à l'exécution.
+//
+// Les commentaires sont retirés avant analyse : sans cela, une simple
+// mention comme « recompressé via compressImageDataUrl (…) » ressemble
+// à un appel et déclenche une fausse alerte. C'est arrivé.
+
+function sansCommentaires(texte) {
+  return texte
+    // Normaliser les fins de ligne AVANT tout : en expression régulière
+    // JavaScript, « . » ne franchit pas \r, qui est un terminateur de
+    // ligne. Sur un fichier en CRLF, /\/\/.*$/ ne peut donc jamais
+    // atteindre la fin de la ligne et ne retire rien. Le test croyait
+    // nettoyer les commentaires et les analysait en réalité tels quels.
+    .replace(/\r\n?/g, "\n")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .map((l) => l.replace(/\/\/[^\n]*$/, ""))
+    .join("\n");
+}
+
+function declarationsDeHautNiveau(source) {
+  return new Set(
+    [...source.matchAll(/^(?:export\s+)?(?:async\s+)?(?:function|const|let)\s+([a-zA-Z_][A-Za-z0-9_]*)/gm)]
+      .map((m) => m[1])
+  );
+}
+
+describe("Indépendance des modules extraits", () => {
+  const appSource = sansCommentaires(readFileSync(join(ICI, "App.jsx"), "utf8"));
+  const definisDansApp = declarationsDeHautNiveau(appSource);
+
+  const modules = readdirSync(ICI).filter(
+    (f) => (f.endsWith(".js") || f.endsWith(".jsx")) &&
+           !f.endsWith(".test.js") && f !== "App.jsx" && f !== "main.jsx"
+  );
+
+  it("App.jsx expose bien des déclarations à surveiller", () => {
+    expect(definisDansApp.size).toBeGreaterThan(10);
+  });
+
+  for (const fichier of modules) {
+    it(`${fichier} n'appelle aucune fonction restée dans App.jsx`, () => {
+      const brut = readFileSync(join(ICI, fichier), "utf8");
+      const source = sansCommentaires(brut);
+      const locales = declarationsDeHautNiveau(source);
+      const importes = new Set(
+        [...brut.matchAll(/import\s+\{([^}]*)\}/g)]
+          .flatMap((m) => m[1].split(",").map((p) => p.split(" as ").pop().trim()))
+      );
+
+      const fuites = [...definisDansApp].filter(
+        (nom) =>
+          !locales.has(nom) &&
+          !importes.has(nom) &&
+          new RegExp(`\\b${nom}\\s*\\(`).test(source)
+      );
+
+      expect(fuites).toEqual([]);
+    });
+  }
+});
+
+describe("Nettoyage des commentaires", () => {
+  // Sans ces cas, une fonction de nettoyage inopérante rendrait le test
+  // d'indépendance ci-dessus complaisant : il analyserait les
+  // commentaires comme du code et n'y verrait que du feu.
+  it("retire un commentaire de fin de ligne", () => {
+    expect(sansCommentaires("const a = 1; // appelle truc()")).not.toContain("truc");
+  });
+
+  it("le fait aussi sur des fins de ligne Windows", () => {
+    expect(sansCommentaires("const a = 1;\r\n// appelle truc()\r\n")).not.toContain("truc");
+  });
+
+  it("retire un commentaire de bloc", () => {
+    expect(sansCommentaires("/* appelle truc() */\nconst a = 1;")).not.toContain("truc");
+  });
+
+  it("préserve le code", () => {
+    expect(sansCommentaires("const a = truc();")).toContain("truc()");
+  });
+});
+
 describe("Analyseur", () => {
   // Sans ces deux cas, un analyseur cassé déclarerait tout conforme.
   it("repère un composant non résolu", () => {
