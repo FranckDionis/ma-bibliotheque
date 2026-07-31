@@ -98,12 +98,50 @@ function dataUrlToBlob(dataUrl) {
   return new Blob([octets], { type });
 }
 
+// Une couverture est-elle déjà chez nous ?
+function estDejaInterne(cover) {
+  return cover.includes(`/storage/v1/object/public/${BUCKET_COUVERTURES}/`);
+}
+
+// Demande au serveur de rapatrier une image hébergée chez un tiers.
+//
+// Le navigateur ne peut pas lire les octets d'une image servie par un
+// autre domaine — c'est précisément ce que la politique d'origine
+// interdit. Une fonction Edge le fait donc à sa place.
+//
+// ⚠️ Un échec ne doit JAMAIS faire échouer l'enregistrement du livre :
+// on retombe sur l'URL distante, qui fonctionne. La fiche reste
+// simplement suspendue à un serveur tiers, exactement comme avant —
+// et `etat-couvertures.mjs --rapatrier` la reprendra plus tard.
+async function rapatrierCoverDistante(bookId, cover) {
+  try {
+    const { data, error } = await supabase.functions.invoke("deposer-couverture", {
+      body: { bookId, url: cover },
+    });
+    if (error) throw error;
+    if (data?.url) return data.url;
+    if (data?.erreur) throw new Error(data.erreur);
+  } catch (e) {
+    console.warn(
+      `Couverture non rapatriée (${e?.message || e}) — l'URL distante est conservée.`
+    );
+  }
+  return cover;
+}
+
 // Dépose l'image dans le Storage et renvoie son URL publique.
-// Laisse passer sans rien faire ce qui est déjà une URL, ou vide.
 async function materialiserCover(bookId, cover) {
   if (!cover || typeof cover !== "string") return cover;
-  if (!cover.startsWith("data:")) return cover; // déjà une URL
-  if (!bookId) return cover;                     // sans id, pas de chemin stable
+  if (!bookId) return cover; // sans id, pas de chemin stable
+
+  // Image locale (photo, recadrage) : envoi direct depuis le navigateur.
+  if (!cover.startsWith("data:")) {
+    // Déjà dans notre bucket : rien à faire.
+    if (estDejaInterne(cover)) return cover;
+    // URL distante : on la rapatrie côté serveur.
+    if (/^https?:\/\//i.test(cover)) return rapatrierCoverDistante(bookId, cover);
+    return cover;
+  }
 
   const chemin = `${bookId}.jpg`;
   const { error } = await supabase.storage
