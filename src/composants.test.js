@@ -76,18 +76,69 @@ describe("Résolution des composants JSX", () => {
 // mention comme « recompressé via compressImageDataUrl (…) » ressemble
 // à un appel et déclenche une fausse alerte. C'est arrivé.
 
-function sansCommentaires(texte) {
-  return texte
-    // Normaliser les fins de ligne AVANT tout : en expression régulière
-    // JavaScript, « . » ne franchit pas \r, qui est un terminateur de
-    // ligne. Sur un fichier en CRLF, /\/\/.*$/ ne peut donc jamais
-    // atteindre la fin de la ligne et ne retire rien. Le test croyait
-    // nettoyer les commentaires et les analysait en réalité tels quels.
-    .replace(/\r\n?/g, "\n")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .split("\n")
-    .map((l) => l.replace(/\/\/[^\n]*$/, ""))
-    .join("\n");
+// Retire les commentaires — en PARCOURANT le texte, pas par expression
+// régulière.
+//
+// Deux pièges ont fait échouer les versions naïves de cette fonction :
+//
+//   1. En expression régulière JavaScript, « . » ne franchit pas \r, qui
+//      est un terminateur de ligne. Sur un fichier en CRLF, /\/\/.*$/
+//      n'atteint jamais la fin de la ligne et ne retire donc rien.
+//
+//   2. Surtout : /\/\*[\s\S]*?\*\//g prend le « /* » de accept="image/*"
+//      pour une ouverture de commentaire et avale tout jusqu'au « */ »
+//      suivant. Sur App.jsx, un seul de ces faux blocs effaçait 4 874
+//      caractères de code réel, et 25 % du fichier disparaissait avant
+//      analyse — rendant des identifiants bel et bien utilisés
+//      invisibles, donc « inutilisés ».
+//
+// D'où ce parcours caractère par caractère, qui sait qu'un « /* » entre
+// guillemets n'est pas un commentaire.
+export function sansCommentaires(source) {
+  const t = source.replace(/\r\n?/g, "\n");
+  let sortie = "";
+  let i = 0;
+
+  while (i < t.length) {
+    const c = t[i];
+    const suivant = t[i + 1];
+
+    if (c === "/" && suivant === "/") {
+      while (i < t.length && t[i] !== "\n") i++;
+      continue;
+    }
+
+    if (c === "/" && suivant === "*") {
+      i += 2;
+      while (i < t.length && !(t[i] === "*" && t[i + 1] === "/")) i++;
+      i += 2;
+      sortie += " "; // sépare ce que le commentaire séparait
+      continue;
+    }
+
+    // Chaînes et gabarits : recopiés tels quels, sans y chercher de
+    // commentaire.
+    if (c === '"' || c === "'" || c === "`") {
+      sortie += c;
+      i++;
+      while (i < t.length) {
+        if (t[i] === "\\") {
+          sortie += t[i] + (t[i + 1] ?? "");
+          i += 2;
+          continue;
+        }
+        sortie += t[i];
+        if (t[i] === c) { i++; break; }
+        i++;
+      }
+      continue;
+    }
+
+    sortie += c;
+    i++;
+  }
+
+  return sortie;
 }
 
 function declarationsDeHautNiveau(source) {
@@ -132,6 +183,41 @@ describe("Indépendance des modules extraits", () => {
   }
 });
 
+// ============================================================
+// TROISIÈME VOLET : les imports devenus inutiles
+// ============================================================
+// À chaque composant déplacé, les imports qu'il était seul à utiliser
+// deviennent morts dans le fichier d'origine. Ils ne gênent pas
+// l'exécution — le bundler les élimine — mais ils font croire à une
+// dépendance qui n'existe plus, et brouillent l'analyse du découpage
+// suivant.
+
+describe("Imports effectivement utilisés", () => {
+  const fichiers = readdirSync(ICI).filter(
+    (f) => (f.endsWith(".js") || f.endsWith(".jsx")) && !f.endsWith(".test.js")
+  );
+
+  for (const fichier of fichiers) {
+    it(`${fichier} n'a pas d'import inutilisé`, () => {
+      const brut = readFileSync(join(ICI, fichier), "utf8");
+      const source = sansCommentaires(brut);
+
+      const inutilises = [];
+      for (const m of brut.matchAll(/import\s+\{([^}]*)\}\s+from\s+["'][^"']+["']/g)) {
+        for (const partie of m[1].split(",")) {
+          const nom = partie.split(" as ").pop().trim();
+          if (!nom) continue;
+          // On compte les occurrences hors de la ligne d'import elle-même.
+          const sansImports = source.replace(/import\s+[^;]+?from\s+["'][^"']+["'];?/g, "");
+          if (!new RegExp(`\\b${nom}\\b`).test(sansImports)) inutilises.push(nom);
+        }
+      }
+
+      expect(inutilises).toEqual([]);
+    });
+  }
+});
+
 describe("Nettoyage des commentaires", () => {
   // Sans ces cas, une fonction de nettoyage inopérante rendrait le test
   // d'indépendance ci-dessus complaisant : il analyserait les
@@ -150,6 +236,24 @@ describe("Nettoyage des commentaires", () => {
 
   it("préserve le code", () => {
     expect(sansCommentaires("const a = truc();")).toContain("truc()");
+  });
+
+  // Le piège qui a coûté 25 % d'App.jsx : le « /* » d'un type MIME.
+  it("ne prend pas le /* d'un type MIME pour un commentaire", () => {
+    const src = 'const a = <input accept="image/*" />;\nconst b = garder();\nconst c = "x*/y";';
+    const net = sansCommentaires(src);
+    expect(net).toContain("garder()");
+    expect(net).toContain('accept="image/*"');
+  });
+
+  it("ne touche pas à un // situé dans une chaîne", () => {
+    expect(sansCommentaires('const u = "https://exemple.fr"; const v = garder();'))
+      .toContain("garder()");
+  });
+
+  it("ne supprime rien quand il n'y a aucun commentaire", () => {
+    const src = 'const a = 1;\nconst b = "texte";\n';
+    expect(sansCommentaires(src)).toBe(src);
   });
 });
 

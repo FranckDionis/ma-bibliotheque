@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from "react";
-import { GENRE_COLORS, getGenreColor } from "./genres";
+import { getGenreColor } from "./genres";
 
 // ============================================================
 // VUE « BIBLIOTHÈQUE VIRTUELLE »
