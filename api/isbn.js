@@ -6,17 +6,83 @@
 //
 // Renvoie : { title, author, cover, publisher, year, source } ou { error: "not-found" }
 
+// ============================================================
+// GARDE-FOUS
+// ============================================================
+// Cet endpoint est public et interroge quatre services tiers à chaque
+// appel. Sans limite, n'importe qui peut s'en servir comme passerelle
+// gratuite, aux frais du quota Vercel du propriétaire.
+//
+// Ce qu'on peut faire, et ce qu'on ne peut pas :
+//   - restreindre les origines coupe l'usage depuis un autre site web,
+//     le navigateur refusant alors de livrer la réponse ;
+//   - une limite par IP, gardée en mémoire, bride un script un peu
+//     insistant.
+// Une limite RÉELLE demanderait un compteur partagé (Vercel KV, Redis) :
+// une fonction serverless est sans mémoire commune, et chaque instance
+// froide repart de zéro. Pour une bibliothèque familiale, la dépense ne
+// se justifie pas — mais il ne faut pas croire la protection étanche.
+
+export const ORIGINES_AUTORISEES = [
+  "https://ma-bibliotheque-dionis.vercel.app",
+  "https://ma-bibliotheque-psi.vercel.app",
+  "http://localhost:5173",
+  "http://localhost:5180",
+];
+
+const FENETRE_MS = 60 * 1000;
+const MAX_PAR_FENETRE = 30; // large : un scan en série enchaîne les appels
+
+// Compteur par IP, valable pour la durée de vie de l'instance.
+const compteurs = new Map();
+
+export function tropDAppels(ip) {
+  const maintenant = Date.now();
+  const entree = compteurs.get(ip);
+  if (!entree || maintenant > entree.finFenetre) {
+    compteurs.set(ip, { nb: 1, finFenetre: maintenant + FENETRE_MS });
+    // Purge opportuniste : sans elle, la Map grossirait indéfiniment sur
+    // une instance qui reste chaude longtemps.
+    if (compteurs.size > 500) {
+      for (const [cle, val] of compteurs) {
+        if (maintenant > val.finFenetre) compteurs.delete(cle);
+      }
+    }
+    return false;
+  }
+  entree.nb += 1;
+  return entree.nb > MAX_PAR_FENETRE;
+}
+
 export default async function handler(req, res) {
-  // CORS posé AVANT toute sortie : placé plus bas, il manquait sur la réponse
-  // 400 du cas "code invalide", que le navigateur bloquait donc au lieu de
-  // laisser l'app lire le message d'erreur.
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const origine = req.headers.origin;
+
+  // Une requête de même origine — le cas normal depuis l'application —
+  // n'envoie pas d'en-tête Origin. On ne peut donc pas exiger sa présence
+  // sans casser l'usage légitime ; on n'en refuse que les valeurs connues
+  // comme étrangères.
+  if (origine && !ORIGINES_AUTORISEES.includes(origine)) {
+    return res.status(403).json({ error: "origin-not-allowed" });
+  }
+  if (origine) {
+    res.setHeader("Access-Control-Allow-Origin", origine);
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   // Requête de pré-vol : on répond sans rien interroger.
   if (req.method === "OPTIONS") {
     return res.status(204).end();
+  }
+
+  const ip =
+    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+    req.socket?.remoteAddress ||
+    "inconnu";
+  if (tropDAppels(ip)) {
+    res.setHeader("Retry-After", "60");
+    return res.status(429).json({ error: "too-many-requests" });
   }
 
   const code = (req.query.code || "").replace(/[^0-9X]/gi, "");
