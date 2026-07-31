@@ -376,7 +376,9 @@ function dbToBook(row) {
 // (INSERT/UPDATE/DELETE) localement sans re-fetcher toute la liste.
 export { dbToBook };
 
-function bookToDb(book) {
+// Exportée pour être testable : c'est la fonction la plus piégeuse du
+// fichier (voir le commentaire ci-dessous sur les mises à jour partielles).
+export function bookToDb(book) {
   // IMPORTANT : on ne mappe QUE les champs présents dans l'objet d'entrée.
   // Si on faisait `isbn: book.isbn || null` pour un patch comme {cover: "..."},
   // tous les autres champs seraient mis à NULL et écraseraient la base.

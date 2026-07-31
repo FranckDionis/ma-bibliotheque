@@ -136,7 +136,7 @@ async function fetchBNF(isbn) {
 // === Source produits (jeux Switch, jeux de société, etc.) ===
 
 // UPC-A (12 chiffres) → EAN-13 (préfixé d'un 0) pour maximiser le match OFF
-function eanFromUpc(code) {
+export function eanFromUpc(code) {
   const clean = (code || "").replace(/\D/g, "");
   if (clean.length === 12) return "0" + clean;
   return clean;
@@ -169,7 +169,7 @@ async function fetchOpenFoodFacts(code) {
   };
 }
 
-function mergeResults(results, type) {
+export function mergeResults(results, type) {
   const wantsProduct = type && type !== "livre";
 
   // Tri principal : la bonne famille en tête, puis titre le plus long
