@@ -4,6 +4,12 @@
 // Extrait d'App.jsx. Encapsule ZXing et le repli sur BarcodeDetector,
 // et surtout le chargement differe du module de decodage.
 
+// Module memorise apres le premier chargement : les scans suivants
+// n'attendent rien. Sans cette declaration, loadZXing leve une
+// ReferenceError, createBarcodeReader bascule sur le repli natif —
+// absent de Safari iOS — et le scan se retrouve « non disponible ».
+let _zxing = null;
+
 export async function loadZXing() {
   if (!_zxing) {
     const [navigateur, bibliotheque] = await Promise.all([

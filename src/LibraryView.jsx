@@ -6,6 +6,7 @@ import {
 } from "./modalesStructure";
 import { DraggableCanvas } from "./DraggableCanvas";
 import { SmartImg } from "./images";
+import { DEFAULT_LAYOUT } from "./structureParDefaut";
 
 // ============================================================
 // VUE PLAN : pieces -> bibliotheques -> etageres
