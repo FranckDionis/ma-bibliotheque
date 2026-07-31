@@ -383,3 +383,46 @@ export function CoverScanner({ onCancel, onCapture }) {
   );
 }
 
+
+// ============================================================
+// COMPRESSION D'IMAGE (couvertures et photos d'objets)
+// ============================================================
+// Les photos prises au smartphone pèsent souvent 2 à 8 Mo en HD. Stocker ça
+// brut dans Supabase coûte très cher en bande passante, en quota, et alourdit
+// l'export JSON. On compresse à ~600 px de large + JPEG qualité 0.7
+// ⇒ typiquement 50–100 Ko, suffisant pour afficher une couverture sans perte
+// visible. Cohérent avec la taille des couvertures Open Library / Google Books.
+//
+// Renvoie une data URL JPEG compressée, ou la source originale si quoi que
+// ce soit échoue (on ne bloque jamais l'utilisateur en cas d'erreur image).
+export async function compressImageDataUrl(srcDataUrl, opts = {}) {
+  const maxWidth = opts.maxWidth || 600;
+  const quality = opts.quality ?? 0.7;
+  if (!srcDataUrl || typeof srcDataUrl !== "string") return srcDataUrl;
+  // Si ce n'est pas une data URL ni un blob/objet local, on ne touche pas
+  // (par ex. couverture distante https://covers.openlibrary.org…)
+  if (!srcDataUrl.startsWith("data:") && !srcDataUrl.startsWith("blob:")) {
+    return srcDataUrl;
+  }
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = reject;
+      im.src = srcDataUrl;
+    });
+    // Calcule la taille cible en respectant le ratio ; ne jamais agrandir
+    const ratio = img.width > 0 ? maxWidth / img.width : 1;
+    const targetW = ratio < 1 ? maxWidth : img.width;
+    const targetH = ratio < 1 ? Math.round(img.height * ratio) : img.height;
+    const canvas = document.createElement("canvas");
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return srcDataUrl;
+    ctx.drawImage(img, 0, 0, targetW, targetH);
+    return canvas.toDataURL("image/jpeg", quality);
+  } catch (e) {
+    return srcDataUrl;
+  }
+}
