@@ -184,6 +184,119 @@ describe("Indépendance des modules extraits", () => {
 });
 
 // ============================================================
+// VOLET DÉCISIF : les identifiants libres
+// ============================================================
+// Les deux volets précédents ne surveillaient que ce qu'App.jsx DÉFINIT.
+// Ils ont laissé passer une régression réelle : SettingsModal, extraite,
+// utilisait ITEM_TYPES_LIST — un nom qu'App.jsx ne définit pas mais
+// IMPORTE depuis itemTypes.js. Le module compilait, et la modale
+// plantait à l'ouverture avec « can't find variable ».
+//
+// Ce volet-ci raisonne à l'envers : il part de tous les noms exportés
+// par le projet ou importés de bibliothèques tierces, et vérifie qu'un
+// module qui les emploie les a bien à sa disposition.
+//
+// Les chaînes sont retirées en plus des commentaires : sans cela, le mot
+// « Library » d'une phrase comme « Open Library » passe pour un
+// composant manquant.
+
+function sansChainesNiCommentaires(source) {
+  const t = sansCommentaires(source);
+  let sortie = "", i = 0;
+  while (i < t.length) {
+    const c = t[i];
+    if (c === '"' || c === "'" || c === "`") {
+      i++;
+      while (i < t.length) {
+        if (t[i] === "\\") { i += 2; continue; }
+        if (t[i] === c) { i++; break; }
+        i++;
+      }
+      sortie += '""';
+      continue;
+    }
+    sortie += c;
+    i++;
+  }
+  return sortie;
+}
+
+// Noms rendus disponibles par une déstructuration : props d'un
+// composant, ou `const { a, b } = ...`.
+function nomsDestructures(source) {
+  const noms = new Set();
+  for (const m of source.matchAll(/(?:function\s+[A-Za-z0-9_]*\s*\(|=>\s*|=\s*)?\{([^{}]*)\}/g)) {
+    for (const p of m[1].split(",")) {
+      const n = p.split(":").pop().split("=")[0].trim();
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(n)) noms.add(n);
+    }
+  }
+  return noms;
+}
+
+describe("Identifiants libres", () => {
+  const fichiers = readdirSync(ICI).filter(
+    (f) => /\.jsx?$/.test(f) && !f.endsWith(".test.js")
+  );
+
+  // Tout ce que le projet exporte, plus ce qu'il importe de tiers.
+  const nomsConnus = new Set();
+  for (const f of fichiers) {
+    const s = readFileSync(join(ICI, f), "utf8");
+    for (const m of s.matchAll(/export\s+(?:async\s+)?(?:function|const|class)\s+([A-Za-z_][A-Za-z0-9_]*)/g)) {
+      nomsConnus.add(m[1]);
+    }
+    for (const m of s.matchAll(/import\s+\{([^}]*)\}\s+from\s+["']([^"']+)["']/g)) {
+      if (m[2].startsWith(".")) continue;
+      for (const p of m[1].split(",")) {
+        const n = p.split(" as ").pop().trim();
+        if (n) nomsConnus.add(n);
+      }
+    }
+  }
+
+  it("suit un nombre plausible de noms", () => {
+    expect(nomsConnus.size).toBeGreaterThan(30);
+  });
+
+  for (const fichier of fichiers) {
+    it(`${fichier} : aucun identifiant du projet employé sans être disponible`, () => {
+      const brut = readFileSync(join(ICI, fichier), "utf8");
+      // On retire les lignes d'import : un alias y fait apparaître le nom
+      // d'origine (`fetchBooks as fetchBooksRemote`) sans qu'il soit utilisé.
+      //
+      // ⚠️ Le motif du chemin accepte une chaîne VIDE. Les chaînes ayant
+      // déjà été neutralisées juste avant, `from "./db"` est devenu
+      // `from ""` : exiger au moins un caractère entre les guillemets
+      // faisait échouer le retrait, et les quatre noms aliasés du module
+      // db ressortaient comme des identifiants libres.
+      const source = sansChainesNiCommentaires(brut)
+        .replace(/import\s+[^;]+?from\s+["'][^"']*["'];?/g, "");
+
+      const disponibles = new Set([
+        ...[...source.matchAll(/(?:^|\s)(?:export\s+)?(?:async\s+)?(?:function|const|let|var|class)\s+([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]),
+        ...nomsDestructures(source),
+        ...[...brut.matchAll(/import\s+([^;]+?)\s+from\s+["'][^"']+["']/g)].flatMap((m) => {
+          const clause = m[1];
+          const res = [];
+          const nommes = clause.match(/\{([^}]*)\}/s);
+          if (nommes) for (const p of nommes[1].split(",")) { const n = p.split(" as ").pop().trim(); if (n) res.push(n); }
+          const parDefaut = clause.replace(/\{[^}]*\}/s, "").replace(/,/g, "").trim();
+          if (parDefaut) res.push(parDefaut);
+          return res;
+        }),
+      ]);
+
+      const libres = [...nomsConnus].filter(
+        (n) => !disponibles.has(n) && new RegExp(`\\b${n}\\b`).test(source)
+      ).sort();
+
+      expect(libres).toEqual([]);
+    });
+  }
+});
+
+// ============================================================
 // TROISIÈME VOLET : les imports devenus inutiles
 // ============================================================
 // À chaque composant déplacé, les imports qu'il était seul à utiliser

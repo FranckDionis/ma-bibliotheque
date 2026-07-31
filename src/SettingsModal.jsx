@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { X, Download, Upload, Trash2, RotateCcw, LogOut, Cloud, CloudOff } from "lucide-react";
 import { STORAGE_KEY } from "./stockageLocal";
+import { ITEM_TYPES_LIST } from "./itemTypes";
 
 // ============================================================
 // MODALE PARAMETRES
