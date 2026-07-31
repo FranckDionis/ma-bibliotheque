@@ -1,7 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
 import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Home, Zap, ArrowRight, Pause, Layers, Move, Save, RotateCcw, AlertTriangle, Settings, Download, Upload, LogOut, Cloud, CloudOff, Sparkles } from "lucide-react";
-import { BrowserMultiFormatReader } from "@zxing/browser";
-import { BarcodeFormat, DecodeHintType } from "@zxing/library";
 import { supabase, isSupabaseConfigured } from "./supabase";
 import {
   insertBooksBulk,
@@ -259,21 +257,46 @@ async function compressImageDataUrl(srcDataUrl, opts = {}) {
 
 // ============================================================
 // Module unifié de scan code-barres (ZXing + fallback natif)
-// Charge ZXing dynamiquement depuis CDN une seule fois.
 // ZXing fonctionne dans Safari iOS, contrairement à BarcodeDetector.
 // ============================================================
-// ZXing est importé statiquement (bundle inclus dans l'app).
-// Plus aucun chargement réseau, fonctionne avec bloqueurs/VPN.
-// ============================================================
+// CHARGEMENT DIFFÉRÉ — et pourquoi c'est acceptable aujourd'hui.
+//
+// ZXing pèse à lui seul une bonne part du bundle. Importé statiquement,
+// il était téléchargé par tout le monde, y compris par qui consulte sa
+// bibliothèque sans jamais scanner.
+//
+// Une version antérieure le chargeait depuis un CDN, ce qui avait été
+// abandonné : un bloqueur ou un VPN suffisait à empêcher le scan. Un
+// `import()` dynamique est différent — le morceau est servi par notre
+// propre domaine, comme le reste de l'application, et le service worker
+// le met en cache dès le premier usage. Il n'est donc téléchargé qu'une
+// fois, puis disponible même hors ligne.
+//
+// Le module est mémorisé après le premier chargement : les scans
+// suivants n'attendent rien.
+let _zxing = null;
+
 async function loadZXing() {
-  return { BrowserMultiFormatReader };
+  if (!_zxing) {
+    const [navigateur, bibliotheque] = await Promise.all([
+      import("@zxing/browser"),
+      import("@zxing/library"),
+    ]);
+    _zxing = {
+      BrowserMultiFormatReader: navigateur.BrowserMultiFormatReader,
+      BarcodeFormat: bibliotheque.BarcodeFormat,
+      DecodeHintType: bibliotheque.DecodeHintType,
+    };
+  }
+  return _zxing;
 }
 
 // Crée un reader ZXing configuré pour les formats de codes-barres produit.
 // On précise explicitement les formats pour que ZXing soit plus rapide et plus
 // fiable sur iOS, notamment pour UPC-A (codes nord-américains 12 chiffres
 // utilisés sur les boîtes Nintendo Switch).
-function createConfiguredReader() {
+async function createConfiguredReader() {
+  const { BrowserMultiFormatReader, BarcodeFormat, DecodeHintType } = await loadZXing();
   const hints = new Map();
   const formats = [
     BarcodeFormat.EAN_13,    // Livres (978/979), revues, jeux européens
@@ -954,8 +977,9 @@ async function lookupISBN(isbn) {
 async function createBarcodeReader() {
   // Tentative ZXing en priorité (fonctionne sur Safari iOS)
   try {
-    const ZX = await loadZXing();
-    const reader = createConfiguredReader();
+    // createConfiguredReader charge le module au premier appel : l'attente
+    // est donc ici, avant toute demande d'accès à la caméra.
+    const reader = await createConfiguredReader();
     let controls = null;
     let stream = null;
     return {
@@ -3306,21 +3330,23 @@ function BarcodeScanner({ onCancel, onScan, searching }) {
       }
 
       // À ce stade, si on voit la caméra c'est gagné. Maintenant ZXing.
-      log("Initialisation de ZXing (intégré, hors-ligne)…");
-      let ZX;
+      // Le module est chargé ici plutôt que dans le bloc suivant : on veut
+      // distinguer, dans le journal de diagnostic, un échec de
+      // TÉLÉCHARGEMENT du module d'un échec de démarrage du décodage.
+      log("Initialisation de ZXing…");
       try {
-        ZX = await loadZXing();
+        await loadZXing();
         log("✅ ZXing prêt");
       } catch (e) {
         log(`❌ ZXing échoue: ${e.message}`);
-        setError(`ZXing: ${e.message}`);
+        setError(`Lecteur de codes-barres indisponible : ${e.message}`);
         setStarting(false);
         return;
       }
 
       // Test 6: Démarrer ZXing sur la vidéo déjà active
       try {
-        const reader = createConfiguredReader();
+        const reader = await createConfiguredReader();
         const controls = reader.decodeFromVideoElement(videoRef.current, (result) => {
           if (result) {
             const code = result.getText();
