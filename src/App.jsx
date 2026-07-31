@@ -21,6 +21,7 @@ import {
 import AuthScreen from "./AuthScreen";
 import { ITEM_TYPES, ITEM_TYPES_LIST, guessTypeFromBarcode, FIELDS_BY_TYPE, recognizeMagazine, recognizeGame, recognizePressPublisher } from "./itemTypes";
 import { termesDeRecherche, correspondAlaRecherche } from "./recherche";
+import { upgradeGoogleCover, isbn13ToIsbn10, upcToEan } from "./codesBarres";
 
 // ============================================================
 // COUVERTURE ADAPTATIVE (portrait livre / paysage jeu)
@@ -307,16 +308,6 @@ async function fetchWithTimeout(url, ms = 5000) {
   }
 }
 
-// Améliore une URL de couverture Google Books
-// Google renvoie souvent zoom=1 ; en passant à zoom=0 ou en supprimant edge=curl, on a plus grand
-function upgradeGoogleCover(url) {
-  if (!url) return "";
-  return url
-    .replace(/^http:/, "https:")
-    .replace(/&edge=curl/, "")
-    .replace(/zoom=\d/, "zoom=0");
-}
-
 // Google Books — excellent sur les livres français, gratuit, sans clé
 async function lookupGoogleBooks(isbn) {
   // On essaie deux requêtes : isbn:NNNN (strict) puis NNNN simple (plus permissif)
@@ -441,25 +432,6 @@ async function lookupOpenLibrary(isbn) {
   } catch (e) {
     return null;
   }
-}
-
-// Couverture Open Library directe (souvent dispo même quand metadata absente)
-function openLibraryCoverUrl(isbn) {
-  return `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`;
-}
-
-// Convertit ISBN-13 (978...) en ISBN-10 (utile pour Amazon)
-function isbn13ToIsbn10(isbn13) {
-  const clean = isbn13.replace(/\D/g, "");
-  if (clean.length !== 13 || !clean.startsWith("978")) return null;
-  const core = clean.substring(3, 12); // 9 chiffres
-  let sum = 0;
-  for (let i = 0; i < 9; i++) {
-    sum += parseInt(core[i], 10) * (10 - i);
-  }
-  let check = (11 - (sum % 11)) % 11;
-  const checkChar = check === 10 ? "X" : check.toString();
-  return core + checkChar;
 }
 
 // Vérifie qu'une URL d'image se charge effectivement.
@@ -721,15 +693,6 @@ async function lookupBGGCover(title, type) {
   } catch (e) {
     return "";
   }
-}
-
-// Stratégie pour les jeux Switch en UPC-A (12 chiffres) :
-// On préfixe d'un 0 pour obtenir un EAN-13 valide, ce qui maximise les chances
-// de match dans Open Food Facts.
-function upcToEan(code) {
-  const clean = (code || "").replace(/\D/g, "");
-  if (clean.length === 12) return "0" + clean;
-  return clean;
 }
 
 // Wikidata SPARQL — recherche un objet par GTIN (P3962) puis par EAN-13/UPC
