@@ -238,10 +238,6 @@ export async function findCoverFor(isbn) {
   return "";
 }
 
-// Ancienne fonction conservée pour compatibilité — utilise la nouvelle
-async function probeOpenLibraryCover(isbn) {
-  return findCoverFor(isbn);
-}
 
 // BNF SRU — la Bibliothèque nationale de France, exhaustive sur le fonds français
 // ATTENTION : sujette à des problèmes CORS — peut échouer en navigateur

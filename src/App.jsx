@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { Search, Camera, BookOpen, Plus, X, Edit2, Trash2, MapPin, BookMarked, Library, ScanLine, Loader2, Check, ChevronRight, Zap, Layers, Save, Settings, Cloud, CloudOff, Sparkles } from "lucide-react";
 import { supabase, isSupabaseConfigured } from "./supabase";
 import {
