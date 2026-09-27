@@ -1,0 +1,49 @@
+# Garde le projet Supabase éveillé.
+#
+# Supabase met en pause les projets gratuits après une semaine sans
+# activité. Cette tâche lit une ligne de la table « books » deux fois par
+# semaine (lundi et jeudi, 6 h UTC), ce qui compte comme une activité.
+#
+# Secrets à renseigner dans GitHub (Settings → Secrets and variables →
+# Actions) — les mêmes valeurs que les variables Vercel :
+#   SUPABASE_URL       = VITE_SUPABASE_URL
+#   SUPABASE_ANON_KEY  = VITE_SUPABASE_ANON_KEY
+#
+# On peut aussi la lancer à la main : onglet Actions → « Réveil Supabase »
+# → « Run workflow ».
+
+name: Réveil Supabase
+
+on:
+  schedule:
+    - cron: "0 6 * * 1,4"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  reveil:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Interroge la base
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::error::Secrets SUPABASE_URL et SUPABASE_ANON_KEY manquants."
+            exit 1
+          fi
+          # Réponse HTTP 200 attendue (liste vide si les règles RLS
+          # filtrent : la base a quand même été sollicitée).
+          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            --retry 3 --retry-delay 10 \
+            "${SUPABASE_URL%/}/rest/v1/books?select=id&limit=1" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY")
+          echo "Réponse de Supabase : HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::Supabase n'a pas répondu normalement (HTTP $code). Le projet est peut-être déjà en pause."
+            exit 1
+          fi
