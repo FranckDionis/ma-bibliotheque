@@ -60,6 +60,10 @@ export default function AuthScreen({ onAuthSuccess, onSkip, recovery = false }) 
   // l'utilisateur.
   const traduire = (message) => {
     const msg = (message || "Erreur").toLowerCase();
+    // Le serveur n'a pas répondu du tout : « Load failed » (Safari),
+    // « Failed to fetch » (Chrome), « NetworkError… » (Firefox).
+    if (msg.includes("load failed") || msg.includes("failed to fetch") || msg.includes("networkerror"))
+      return "Le serveur de la bibliothèque ne répond pas. Vérifiez votre connexion ; si elle fonctionne, le projet Supabase est peut-être en pause (tableau de bord Supabase → « Restore project »).";
     if (msg.includes("invalid login credentials")) return "Email ou mot de passe incorrect";
     if (msg.includes("signups not allowed") || msg.includes("signup_disabled"))
       return "La création de compte est fermée. Demandez à l'administrateur de la bibliothèque de vous créer un accès.";
